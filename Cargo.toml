@@ -1,0 +1,79 @@
+[package]
+name = "tachyon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A GPU-accelerated terminal emulator for Windows"
+authors = ["Tachyon contributors"]
+license = "MIT"
+build = "build.rs"
+
+# The platform-independent core (terminal state, parser, config) lives in a
+# library so it can be unit-tested on any host, including from WSL.
+[lib]
+name = "tachyon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tachyon"
+path = "src/main.rs"
+
+[dependencies]
+# Alacritty's battle-tested VT state machine. We put a SIMD fast path in front
+# of it (see src/term/parser.rs) so it only ever sees escape sequences.
+vte = "0.15"
+unicode-width = "0.2"
+rustc-hash = "2.1"
+bitflags = "2.13"
+parking_lot = "0.12"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Ole",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+# Fast iteration profile: optimized enough to feel real, quick to link.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

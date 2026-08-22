@@ -1,0 +1,125 @@
+# Tachyon configuration
+#
+# Copy to %APPDATA%\Tachyon\tachyon.conf
+#
+# Format is `dotted.key = value`, one per line. `#` starts a comment unless it
+# begins a colour literal. Unknown keys and out-of-range values are reported in
+# a dialog on startup rather than being silently ignored.
+
+# ---------------------------------------------------------------------------
+# Font
+# ---------------------------------------------------------------------------
+
+font.family      = "Cascadia Mono"
+font.size        = 12.0
+
+# subpixel  - ClearType-style RGB coverage, sharpest on a normal desktop LCD
+# grayscale - single-channel coverage; use on rotated or non-RGB-stripe panels
+font.antialias   = subpixel
+
+# Blending gamma. 1.0 is physically linear; a little above renders stems fuller,
+# which most people prefer for terminal text. Range 0.5 - 3.0.
+font.gamma       = 1.2
+
+# Stem darkening applied to coverage before blending. Lifts the low end so
+# antialiased edges do not disappear against a dark background. Range 0.0 - 1.0.
+font.contrast    = 0.15
+
+# Multipliers on the font's natural metrics.
+font.line_height = 1.0
+font.cell_width  = 1.0
+
+# Use the family's real bold/italic faces. Turn off to keep a single face.
+font.bold        = true
+font.italic      = true
+
+# ---------------------------------------------------------------------------
+# Window
+# ---------------------------------------------------------------------------
+
+window.cols      = 120
+window.rows      = 32
+window.padding_x = 8.0
+window.padding_y = 6.0
+
+# Frosted glass. The compositor draws a backdrop behind the window and the
+# translucent terminal background lets it through.
+#
+#   acrylic  live blur of the windows behind this one -- "frosted glass"
+#   blur     the same, without acrylic's noise and tint (cheaper)
+#   mica     tinted from the desktop wallpaper; calm, and it does not shimmer
+#   tabbed   mica's slightly more opaque variant
+#   none     opaque (default)
+#
+# Setting any backdrop switches antialiasing to grayscale, because subpixel
+# coverage cannot be blended correctly against a background the compositor
+# chooses after we have drawn.
+# window.backdrop = acrylic
+
+# How opaque the terminal background is. Only meaningful with a backdrop.
+# Defaults to 0.82 when a backdrop is set, 1.0 otherwise. Text is always fully
+# opaque regardless.
+# window.opacity = 0.82
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+# Synchronise presentation to the display refresh. Turning this off permits
+# tearing in exchange for the lowest possible latency, on adapters that support
+# it.
+render.vsync           = true
+
+# 0 means "follow the display refresh".
+render.max_fps         = 0
+
+# How long to hold a synchronised-output batch (mode 2026) before drawing
+# anyway, in milliseconds. Guards against an application that starts a batch and
+# never ends it.
+render.sync_timeout_ms = 150
+
+# ---------------------------------------------------------------------------
+# Theme
+# ---------------------------------------------------------------------------
+
+theme.background     = #0B0E14
+theme.foreground     = #C4CBD8
+theme.cursor         = #7DF9C4
+theme.cursor_text    = #0B0E14
+theme.selection_bg   = #2A3A52
+# theme.selection_fg = #FFFFFF
+
+# Render SGR-bold text with the bright palette variant of its colour.
+theme.bold_is_bright = false
+
+# Palette slots 0-15. Anything not set keeps the built-in default.
+# theme.ansi0  = #14181F
+# theme.ansi1  = #F2606B
+# theme.ansi2  = #6FD08C
+# theme.ansi3  = #E8C16B
+# theme.ansi4  = #63A8F0
+# theme.ansi5  = #B084EB
+# theme.ansi6  = #5ED2D8
+# theme.ansi7  = #C4CBD8
+# theme.ansi8  = #465062
+# theme.ansi9  = #FF7A85
+# theme.ansi10 = #89E8A6
+# theme.ansi11 = #FFD985
+# theme.ansi12 = #82BFFF
+# theme.ansi13 = #C99CFF
+# theme.ansi14 = #7AECF2
+# theme.ansi15 = #E8EEF7
+
+# ---------------------------------------------------------------------------
+# Shell
+# ---------------------------------------------------------------------------
+
+# Leave empty to pick the best available: pwsh, then powershell, then %COMSPEC%.
+# shell.program = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+# shell.args    = "-NoLogo"
+#
+# For WSL:
+# shell.program = "wsl.exe"
+
+# Lines of scrollback retained above the viewport.
+scrollback = 10000
