@@ -111,6 +111,16 @@ theme.bold_is_bright = false
 # theme.ansi15 = #E8EEF7
 
 # ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
+
+# Which Option keys act as Meta, sending ESC + key (what zsh and bash bind
+# ⌥B/⌥F word motion to): false, left, right, or true for both. With false,
+# Option types the keyboard layout's special characters, as in other Mac apps.
+# A common choice is `left`, which keeps right Option for characters like é.
+# macos.option_as_meta = false
+
+# ---------------------------------------------------------------------------
 # Shell
 # ---------------------------------------------------------------------------
 

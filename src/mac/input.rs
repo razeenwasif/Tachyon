@@ -158,6 +158,102 @@ pub fn encode(
     (!text.is_empty()).then(|| text.into_bytes())
 }
 
+/// Mouse buttons we report to applications.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    /// No button held: motion that mode 1003 reports anyway.
+    None,
+    WheelUp,
+    WheelDown,
+}
+
+impl MouseButton {
+    fn code(self) -> u8 {
+        match self {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            MouseButton::None => 3,
+            MouseButton::WheelUp => 64,
+            MouseButton::WheelDown => 65,
+        }
+    }
+
+    fn is_wheel(self) -> bool {
+        matches!(self, MouseButton::WheelUp | MouseButton::WheelDown)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseEventKind {
+    Press,
+    Release,
+    Move,
+}
+
+/// Encode a mouse event for an application that turned on mouse reporting, in
+/// SGR (1006) form when it asked for that and X10 form otherwise. Same rules as
+/// the Windows backend: 1000 is presses and releases, 1002 adds motion with a
+/// button held (tmux and nvim split dragging), 1003 adds bare motion.
+pub fn encode_mouse(
+    button: MouseButton,
+    kind: MouseEventKind,
+    col: usize,
+    row: usize,
+    mods: Mods,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    if !mode.intersects(TermMode::ANY_MOUSE) {
+        return None;
+    }
+    if button.is_wheel() && kind != MouseEventKind::Press {
+        return None;
+    }
+    match kind {
+        MouseEventKind::Move => {
+            if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+                return None;
+            }
+            if button == MouseButton::None && !mode.contains(TermMode::MOUSE_MOTION) {
+                return None;
+            }
+        }
+        _ if button == MouseButton::None => return None,
+        _ => {}
+    }
+
+    let base = button.code();
+    let mut code = base;
+    if kind == MouseEventKind::Move {
+        code += 32;
+    }
+    if mods.shift {
+        code += 4;
+    }
+    if mods.option {
+        code += 8;
+    }
+    if mods.ctrl {
+        code += 16;
+    }
+    let (cx, cy) = (col + 1, row + 1);
+
+    if mode.contains(TermMode::MOUSE_SGR) {
+        let final_byte = if kind == MouseEventKind::Release { 'm' } else { 'M' };
+        Some(format!("\x1b[<{code};{cx};{cy}{final_byte}").into_bytes())
+    } else {
+        if cx > 223 || cy > 223 {
+            return None;
+        }
+        // X10 cannot say which button was released; it is always button 3.
+        let code = if kind == MouseEventKind::Release { code - base + 3 } else { code };
+        Some(vec![0x1b, b'[', b'M', 32 + code as u8, 32 + cx as u8, 32 + cy as u8])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +285,32 @@ mod tests {
         let opt = Mods { option: true, ..Mods::default() };
         assert_eq!(encode(0x0B, "∫", "b", opt, TermMode::default(), true).unwrap(), b"\x1bb");
         assert_eq!(encode(0x0B, "∫", "b", opt, TermMode::default(), false).unwrap(), "∫".as_bytes());
+    }
+
+    #[test]
+    fn mouse_reports_only_what_the_app_asked_for() {
+        let none = Mods::default();
+        let sgr = TermMode::MOUSE_CLICK | TermMode::MOUSE_SGR;
+        assert_eq!(
+            encode_mouse(MouseButton::Left, MouseEventKind::Press, 4, 2, none, sgr).unwrap(),
+            b"\x1b[<0;5;3M"
+        );
+        assert_eq!(
+            encode_mouse(MouseButton::Left, MouseEventKind::Release, 4, 2, none, sgr).unwrap(),
+            b"\x1b[<0;5;3m"
+        );
+        // 1000 alone does not want drags; 1002 does.
+        assert!(encode_mouse(MouseButton::Left, MouseEventKind::Move, 4, 2, none, sgr).is_none());
+        let drag = sgr | TermMode::MOUSE_DRAG;
+        assert_eq!(
+            encode_mouse(MouseButton::Left, MouseEventKind::Move, 4, 2, none, drag).unwrap(),
+            b"\x1b[<32;5;3M"
+        );
+        assert!(encode_mouse(MouseButton::Left, MouseEventKind::Press, 0, 0, none, TermMode::default()).is_none());
+        assert_eq!(
+            encode_mouse(MouseButton::WheelUp, MouseEventKind::Press, 0, 0, none, sgr).unwrap(),
+            b"\x1b[<64;1;1M"
+        );
     }
 
     #[test]

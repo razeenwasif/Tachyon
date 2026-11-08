@@ -20,6 +20,7 @@ mod font;
 mod input;
 mod pty;
 mod renderer;
+mod selection;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -29,25 +30,35 @@ use std::time::{Duration, Instant};
 
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject, Sel};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSImage, NSMenu, NSMenuItem, NSPasteboard,
+    NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuItem, NSPasteboard,
     NSPasteboardTypeString, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
     NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop,
+    NSArray, NSData, NSUserDefaults, NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop,
     NSRunLoopCommonModes, NSSize, NSString,
 };
-use objc2_quartz_core::{CADisplayLink, CALayer, CAMetalLayer};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_graphics::{
+    kCGColorSpaceSRGB, CGBitmapContextCreate, CGBitmapContextCreateImage, CGColor, CGColorSpace,
+    CGImageAlphaInfo,
+};
+use objc2_quartz_core::{
+    kCAAnimationDiscrete, CADisplayLink, CAKeyframeAnimation, CALayer, CAMediaTiming, CAMetalLayer,
+    CATransaction,
+};
 use parking_lot::Mutex;
 
-use crate::config::Config;
+use crate::config::{Config, OptionAsMeta};
 use crate::term::{Processor, Term, TermMode};
 use pty::Pty;
-use renderer::{Gpu, Renderer};
+use input::{MouseButton, MouseEventKind};
+use renderer::{CursorOverlay, Gpu, Renderer};
+use selection::{Pos, Selection, Unit};
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/icon/tachyon.svg");
 
@@ -119,10 +130,99 @@ define_class!(
             true
         }
 
-        // Lets a drag in the (invisible) title bar strip move the window.
+        // Clicks are for selecting text. The window moves with a ⌃⌘-drag
+        // anywhere or a drag along the top edge; see `mouse_down`.
         #[unsafe(method(mouseDownCanMoveWindow))]
         fn mouse_down_can_move_window(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
             true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_down(event, MouseButton::Left));
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_dragged(event, MouseButton::Left));
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_up(event, MouseButton::Left));
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_down(event, MouseButton::Right));
+        }
+
+        #[unsafe(method(rightMouseDragged:))]
+        fn right_mouse_dragged(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_dragged(event, MouseButton::Right));
+        }
+
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_up(event, MouseButton::Right));
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_down(event, MouseButton::Middle));
+        }
+
+        #[unsafe(method(otherMouseDragged:))]
+        fn other_mouse_dragged(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_dragged(event, MouseButton::Middle));
+        }
+
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, event: &NSEvent) {
+            with_window(self.id(), |w| w.mouse_up(event, MouseButton::Middle));
+        }
+
+        #[unsafe(method(copy:))]
+        fn copy(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::copy);
+        }
+
+        #[unsafe(method(selectAll:))]
+        fn select_all(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::select_all);
+        }
+
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> Bool {
+            let f = event.modifierFlags();
+            let plain_command = f.contains(NSEventModifierFlags::Command)
+                && !f.intersects(NSEventModifierFlags::Control | NSEventModifierFlags::Option);
+            let is_equals = event.charactersIgnoringModifiers().is_some_and(|c| c.to_string() == "=");
+            if plain_command && is_equals {
+                with_window(self.id(), |w| w.zoom_font(1.0));
+                return Bool::YES;
+            }
+            unsafe { msg_send![super(self), performKeyEquivalent: event] }
+        }
+
+        #[unsafe(method(tachyonBiggerFont:))]
+        fn bigger_font(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.zoom_font(1.0));
+        }
+
+        #[unsafe(method(tachyonSmallerFont:))]
+        fn smaller_font(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.zoom_font(-1.0));
+        }
+
+        #[unsafe(method(tachyonResetFont:))]
+        fn reset_font(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.zoom_font(0.0));
         }
 
         #[unsafe(method(setFrameSize:))]
@@ -149,7 +249,10 @@ define_class!(
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             let p = event.locationInWindow();
-            with_window(self.id(), |w| w.hover(Some(p)));
+            with_window(self.id(), |w| {
+                w.hover(Some(p));
+                w.mouse_moved(event);
+            });
         }
 
         #[unsafe(method(mouseExited:))]
@@ -169,6 +272,60 @@ define_class!(
         }
     }
 );
+
+define_class!(
+    /// The terminal window. Beyond NSWindow, it routes left-button events
+    /// inside the terminal straight to the terminal view, so the (transparent)
+    /// title bar strip over the top rows cannot claim a click on the text.
+    /// Clicks on the revealed window buttons and along the edges, where the
+    /// window is resized, take the normal path.
+    #[unsafe(super(NSWindow, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TachyonWindow"]
+    struct TachyonWindow;
+
+    impl TachyonWindow {
+        #[unsafe(method(sendEvent:))]
+        fn send_event(&self, event: &NSEvent) {
+            let t = event.r#type();
+            let left = t == NSEventType::LeftMouseDown
+                || t == NSEventType::LeftMouseDragged
+                || t == NSEventType::LeftMouseUp;
+            if left {
+                if let Some(view) = self.contentView() {
+                    // An inactive window lets AppKit take the click, so it can
+                    // activate the window first.
+                    if self.isKeyWindow() && self.owns_click(&view, event.locationInWindow()) {
+                        match t {
+                            NSEventType::LeftMouseDown => view.mouseDown(event),
+                            NSEventType::LeftMouseDragged => view.mouseDragged(event),
+                            _ => view.mouseUp(event),
+                        }
+                        return;
+                    }
+                }
+            }
+            unsafe { msg_send![super(self), sendEvent: event] }
+        }
+    }
+);
+
+impl TachyonWindow {
+    /// Margin along the window edges left to AppKit for resizing, in points.
+    const RESIZE_MARGIN: f64 = 4.0;
+
+    fn owns_click(&self, view: &NSView, p: NSPoint) -> bool {
+        let size = view.frame().size;
+        let m = Self::RESIZE_MARGIN;
+        let inside = p.x > m && p.x < size.width - m && p.y > m && p.y < size.height - m;
+        // The window buttons, while revealed, take their own clicks.
+        let buttons_showing = self
+            .standardWindowButton(NSWindowButton::CloseButton)
+            .is_some_and(|b| !b.isHidden());
+        let over_buttons = buttons_showing && p.x < BUTTON_ZONE.0 && p.y > size.height - BUTTON_ZONE.1;
+        inside && !over_buttons
+    }
+}
 
 impl TachyonView {
     fn new(mtm: MainThreadMarker, frame: NSRect, id: u64) -> Retained<Self> {
@@ -294,6 +451,19 @@ struct TermWindow {
     title_rev: u64,
     buttons_visible: bool,
     focused: bool,
+
+    selection: Option<Selection>,
+    /// A button an application is tracking: it is owed motion and a release.
+    mouse_held: Option<MouseButton>,
+    /// Last cell reported to the application, so motion is sent per cell.
+    mouse_cell: (usize, usize),
+    option_as_meta: OptionAsMeta,
+    base_font_size: f32,
+
+    /// Draws the focused, blinking cursor. Core Animation runs the blink in
+    /// the window server, so a blinking cursor costs the app no wake-ups.
+    cursor_layer: Retained<CALayer>,
+    cursor_shown: Option<CursorOverlay>,
     _delegate: Retained<WindowDelegate>,
 }
 
@@ -352,7 +522,12 @@ impl TermWindow {
             self.needs_redraw = false;
             self.idle_ticks = 0;
             let term = self.term.lock();
-            self.renderer.draw(&term, self.focused);
+            let blink = self.focused && term.cursor_state().blinking;
+            let selection = self.selection.and_then(|s| s.range(&term));
+            self.renderer.draw(&term, self.focused, selection, blink);
+            let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
+            drop(term);
+            self.update_cursor_layer(overlay);
         } else {
             // Nothing changed for a few refreshes: stop the display link. The
             // next byte from the shell or key press resumes it.
@@ -378,6 +553,7 @@ impl TermWindow {
 
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
+            crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
             self.grid = grid;
             self.term.lock().resize(grid.0, grid.1);
             self.pty.resize(grid.0 as u16, grid.1 as u16);
@@ -423,11 +599,26 @@ impl TermWindow {
             .charactersIgnoringModifiers()
             .map(|s| s.to_string())
             .unwrap_or_default();
+        // Device-dependent modifier bits tell the two Option keys apart.
+        const LEFT_OPTION: usize = 0x20;
+        const RIGHT_OPTION: usize = 0x40;
+        let raw = flags.0 as usize;
+        let meta = match self.option_as_meta {
+            OptionAsMeta::Off => false,
+            OptionAsMeta::Both => true,
+            OptionAsMeta::Left => raw & LEFT_OPTION != 0,
+            OptionAsMeta::Right => raw & RIGHT_OPTION != 0,
+        };
         let mode = self.term.lock().mode;
-        if let Some(bytes) = input::encode(event.keyCode(), &chars, &bare, mods, mode, false) {
+        if let Some(bytes) = input::encode(event.keyCode(), &chars, &bare, mods, mode, meta) {
             self.term.lock().scroll_to_bottom();
             let _ = self.pty.write(&bytes);
             NSCursor::setHiddenUntilMouseMoves(true);
+            if self.selection.take().is_some() {
+                self.request_redraw();
+            }
+            // Typing restarts the blink in its visible phase.
+            self.cursor_shown = None;
         }
     }
 
@@ -472,6 +663,14 @@ impl TermWindow {
         }
 
         let mode = self.term.lock().mode;
+        if mode.intersects(TermMode::ANY_MOUSE) {
+            let (_, cell) = self.cell_at(event);
+            let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+            for _ in 0..lines.unsigned_abs() {
+                self.report(button, MouseEventKind::Press, cell, event);
+            }
+            return;
+        }
         if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALT_SCROLL) {
             // Full-screen apps without mouse reporting get arrow keys, so the
             // wheel scrolls less, man pages and the like.
@@ -495,12 +694,264 @@ impl TermWindow {
         let show = location.is_some_and(|p| p.x < BUTTON_ZONE.0 && p.y > height - BUTTON_ZONE.1);
         if show != self.buttons_visible {
             self.buttons_visible = show;
-            set_buttons_hidden(&self.window, !show);
+            set_titlebar_hidden(&self.window, !show);
         }
     }
 }
 
-fn set_buttons_hidden(window: &NSWindow, hidden: bool) {
+impl TermWindow {
+    /// The grid position under a mouse event: the selection position (with
+    /// an absolute line) and the screen cell an application would be told.
+    fn cell_at(&self, event: &NSEvent) -> (Pos, (usize, usize)) {
+        let p = self.view.convertPoint_fromView(event.locationInWindow(), None);
+        let scale = self.scale() as f32;
+        let height = self.view.bounds().size.height as f32;
+        let (x, y) = (p.x as f32 * scale, (height - p.y as f32) * scale);
+        let m = self.renderer.metrics();
+        let (pad_x, pad_y) = self.renderer.padding();
+        let fx = (x - pad_x) / m.width;
+        let fy = (y - pad_y) / m.height;
+
+        let term = self.term.lock();
+        let (cols, rows) = (term.cols(), term.rows());
+        let row = (fy.floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        let cell = (fx.floor().max(0.0) as usize).min(cols.saturating_sub(1));
+        let edge = (fx.round().max(0.0) as usize).min(cols);
+        let first = term.grid().history_len().saturating_sub(term.grid().display_offset());
+        (Pos { line: first + row, cell, edge }, (cell, row))
+    }
+
+    fn mods_of(event: &NSEvent) -> input::Mods {
+        let f = event.modifierFlags();
+        input::Mods {
+            shift: f.contains(NSEventModifierFlags::Shift),
+            ctrl: f.contains(NSEventModifierFlags::Control),
+            option: f.contains(NSEventModifierFlags::Option),
+        }
+    }
+
+    fn report(&mut self, button: MouseButton, kind: MouseEventKind, cell: (usize, usize), event: &NSEvent) {
+        let mode = self.term.lock().mode;
+        if let Some(bytes) = input::encode_mouse(button, kind, cell.0, cell.1, Self::mods_of(event), mode) {
+            let _ = self.pty.write(&bytes);
+        }
+        self.mouse_cell = cell;
+    }
+
+    /// Whether the mouse belongs to the application. Shift takes it back for
+    /// selecting, except mid-drag: the app is owed the release.
+    fn mouse_for_app(&self, event: &NSEvent) -> bool {
+        if self.mouse_held.is_some() {
+            return true;
+        }
+        let shift = event.modifierFlags().contains(NSEventModifierFlags::Shift);
+        self.term.lock().mode.intersects(TermMode::ANY_MOUSE) && !shift
+    }
+
+    fn mouse_down(&mut self, event: &NSEvent, button: MouseButton) {
+        // Moving the window: ⌃⌘-drag anywhere, or a drag on the top edge.
+        if button == MouseButton::Left {
+            let f = event.modifierFlags();
+            let p = self.view.convertPoint_fromView(event.locationInWindow(), None);
+            let top_edge = self.view.bounds().size.height - p.y
+                < (self.renderer.padding().1 / self.scale() as f32) as f64;
+            if top_edge || f.contains(NSEventModifierFlags::Control | NSEventModifierFlags::Command) {
+                self.window.performWindowDragWithEvent(event);
+                return;
+            }
+        }
+
+        let (pos, cell) = self.cell_at(event);
+        if self.mouse_for_app(event) {
+            self.mouse_held = Some(button);
+            self.report(button, MouseEventKind::Press, cell, event);
+            return;
+        }
+        if button != MouseButton::Left {
+            return;
+        }
+
+        let shift = event.modifierFlags().contains(NSEventModifierFlags::Shift);
+        match (&mut self.selection, shift) {
+            // Shift-click extends the existing selection.
+            (Some(sel), true) => {
+                sel.extend(pos);
+                sel.dragging = true;
+            }
+            _ => self.selection = Some(Selection::new(pos, Unit::from_clicks(event.clickCount() as isize))),
+        }
+        self.request_redraw();
+    }
+
+    fn mouse_dragged(&mut self, event: &NSEvent, button: MouseButton) {
+        let (pos, cell) = self.cell_at(event);
+        if self.mouse_held == Some(button) {
+            if cell != self.mouse_cell {
+                self.report(button, MouseEventKind::Move, cell, event);
+            }
+            return;
+        }
+        if let Some(sel) = self.selection.as_mut().filter(|s| s.dragging) {
+            sel.extend(pos);
+            self.request_redraw();
+        }
+    }
+
+    fn mouse_up(&mut self, event: &NSEvent, button: MouseButton) {
+        if self.mouse_held == Some(button) {
+            self.mouse_held = None;
+            let (_, cell) = self.cell_at(event);
+            self.report(button, MouseEventKind::Release, cell, event);
+            return;
+        }
+        if let Some(sel) = &mut self.selection {
+            sel.dragging = false;
+            // A click with no drag selects nothing.
+            let empty = sel.range(&self.term.lock()).is_none();
+            if empty {
+                self.selection = None;
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Bare motion, for applications that asked for every move (mode 1003).
+    fn mouse_moved(&mut self, event: &NSEvent) {
+        if self.mouse_held.is_some() || !self.term.lock().mode.contains(TermMode::MOUSE_MOTION) {
+            return;
+        }
+        let (_, cell) = self.cell_at(event);
+        if cell != self.mouse_cell {
+            self.report(MouseButton::None, MouseEventKind::Move, cell, event);
+        }
+    }
+
+    fn copy(&mut self) {
+        let text = {
+            let term = self.term.lock();
+            let Some(r) = self.selection.and_then(|s| s.range(&term)) else {
+                return;
+            };
+            term.text_range(r.start.0, r.start.1, r.end.0, r.end.1)
+        };
+        // Trailing blanks at a line end are screen padding, not text.
+        let text = text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
+        if text.is_empty() {
+            return;
+        }
+        let board = NSPasteboard::generalPasteboard();
+        board.clearContents();
+        board.setString_forType(&NSString::from_str(&text), unsafe { NSPasteboardTypeString });
+    }
+
+    fn select_all(&mut self) {
+        self.selection = Some(Selection::all(&self.term.lock()));
+        self.request_redraw();
+    }
+
+    /// ⌘+ and ⌘- step the font by a point; `0.0` returns to the configured
+    /// size. The window keeps its size and the grid gains or loses cells.
+    fn zoom_font(&mut self, step: f32) {
+        let size = if step == 0.0 {
+            self.base_font_size
+        } else {
+            (self.renderer.font_size() + step).clamp(6.0, 72.0)
+        };
+        if (size - self.renderer.font_size()).abs() < f32::EPSILON {
+            return;
+        }
+        self.renderer.set_font_size(size);
+        self.cursor_shown = None;
+        self.layout();
+    }
+
+    /// Show, move or hide the cursor layer to match `overlay`, restarting the
+    /// blink whenever the cursor changes so it is visible right after a move.
+    fn update_cursor_layer(&mut self, overlay: Option<CursorOverlay>) {
+        if overlay == self.cursor_shown {
+            return;
+        }
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        let layer = &self.cursor_layer;
+        match &overlay {
+            None => layer.setHidden(true),
+            Some(o) => {
+                let scale = self.scale();
+                let height = self.view.bounds().size.height;
+                let [x, y, w, h] = o.rect.map(|v| v as f64 / scale);
+                layer.setFrame(CGRect::new(CGPoint::new(x, height - y - h), CGSize::new(w, h)));
+                layer.setContentsScale(scale);
+                match &o.image {
+                    Some((iw, ih, pixels)) => {
+                        let image = rgba_image(*iw as usize, *ih as usize, pixels);
+                        unsafe {
+                            layer.setContents(image.as_deref().map(|i| &*(i as *const _ as *const AnyObject)));
+                        }
+                        layer.setBackgroundColor(None);
+                    }
+                    None => {
+                        unsafe { layer.setContents(None) };
+                        let c = o.color.map(|v| v as f64 / 255.0);
+                        layer.setBackgroundColor(Some(&CGColor::new_srgb(c[0], c[1], c[2], 1.0)));
+                    }
+                }
+                layer.setHidden(false);
+                restart_blink(layer);
+            }
+        }
+        CATransaction::commit();
+        self.cursor_shown = overlay;
+    }
+}
+
+/// On for 530 ms, off for 530 ms, forever -- the same rhythm as before, now
+/// run by the window server.
+fn restart_blink(layer: &CALayer) {
+    let key = NSString::from_str("blink");
+    layer.removeAnimationForKey(&key);
+    let anim = CAKeyframeAnimation::animationWithKeyPath(Some(&NSString::from_str("opacity")));
+    let values = NSArray::from_retained_slice(&[NSNumber::new_f32(1.0), NSNumber::new_f32(0.0)]);
+    // Discrete keyframes need one more key time than values: each value holds
+    // from its time to the next, and the last interval ends at 1.
+    let times = NSArray::from_retained_slice(&[
+        NSNumber::new_f32(0.0),
+        NSNumber::new_f32(0.5),
+        NSNumber::new_f32(1.0),
+    ]);
+    unsafe {
+        anim.setValues(Some(&*(Retained::as_ptr(&values) as *const NSArray)));
+    }
+    anim.setKeyTimes(Some(&times));
+    anim.setCalculationMode(unsafe { kCAAnimationDiscrete });
+    anim.setDuration(1.06);
+    anim.setRepeatCount(f32::INFINITY);
+    layer.addAnimation_forKey(&anim, Some(&key));
+}
+
+/// A CGImage from straight-alpha-free RGBA8 rows (every pixel opaque).
+fn rgba_image(w: usize, h: usize, pixels: &[u8]) -> Option<objc2_core_foundation::CFRetained<objc2_core_graphics::CGImage>> {
+    let mut data = pixels.to_vec();
+    let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))?;
+    let ctx = unsafe {
+        CGBitmapContextCreate(
+            data.as_mut_ptr().cast(),
+            w,
+            h,
+            8,
+            w * 4,
+            Some(&space),
+            CGImageAlphaInfo::PremultipliedLast.0,
+        )
+    }?;
+    CGBitmapContextCreateImage(Some(&ctx))
+}
+
+/// Show or hide the window buttons together with the transparent title bar
+/// strip they sit in. While hidden, the strip is gone entirely, so clicks on
+/// the top rows of text reach the terminal; hovering the top-left corner brings
+/// the native buttons back.
+fn set_titlebar_hidden(window: &NSWindow, hidden: bool) {
     for b in [
         NSWindowButton::CloseButton,
         NSWindowButton::MiniaturizeButton,
@@ -509,6 +960,15 @@ fn set_buttons_hidden(window: &NSWindow, hidden: bool) {
         if let Some(button) = window.standardWindowButton(b) {
             button.setHidden(hidden);
         }
+    }
+    // Button -> NSTitlebarView -> NSTitlebarContainerView.
+    let container = window
+        .standardWindowButton(NSWindowButton::CloseButton)
+        // SAFETY: plain view-hierarchy reads on the main thread.
+        .and_then(|b| unsafe { b.superview() })
+        .and_then(|v| unsafe { v.superview() });
+    if let Some(container) = container {
+        container.setHidden(hidden);
     }
 }
 
@@ -537,15 +997,16 @@ impl App {
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable
             | NSWindowStyleMask::FullSizeContentView;
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                NSRect::new(NSPoint::new(0.0, 0.0), content),
-                style,
-                NSBackingStoreType::Buffered,
-                false,
-            )
+        let window: Retained<TachyonWindow> = unsafe {
+            msg_send![
+                super(TachyonWindow::alloc(mtm).set_ivars(())),
+                initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), content),
+                styleMask: style,
+                backing: NSBackingStoreType::Buffered,
+                defer: false,
+            ]
         };
+        let window: Retained<NSWindow> = Retained::into_super(window);
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str("Tachyon"));
         // Edge-to-edge: no visible title bar, content runs to the top edge.
@@ -568,6 +1029,9 @@ impl App {
         let layer = view.layer().ok_or("the view has no layer")?;
         // SAFETY: makeBackingLayer always returns a CAMetalLayer.
         let layer: Retained<CAMetalLayer> = unsafe { Retained::cast_unchecked(layer) };
+        let cursor_layer = CALayer::new();
+        cursor_layer.setHidden(true);
+        layer.addSublayer(&cursor_layer);
         let renderer = Renderer::new(Rc::clone(&self.gpu), layer, cfg, scale as f32)?;
 
         let tracking = unsafe {
@@ -587,7 +1051,7 @@ impl App {
         window.setContentView(Some(&view));
         let delegate = WindowDelegate::new(mtm, id);
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-        set_buttons_hidden(&window, true);
+        set_titlebar_hidden(&window, true);
 
         // The first window is centred; later ones cascade down and right.
         if self.windows.is_empty() {
@@ -621,6 +1085,13 @@ impl App {
             title_rev: u64::MAX,
             buttons_visible: false,
             focused: true,
+            selection: None,
+            mouse_held: None,
+            mouse_cell: (usize::MAX, usize::MAX),
+            option_as_meta: cfg.macos.option_as_meta,
+            base_font_size: cfg.font.size,
+            cursor_layer,
+            cursor_shown: None,
             _delegate: delegate,
         });
         Ok((window, view, id))
@@ -693,8 +1164,18 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     submenu(&main, &file);
 
     let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Edit"));
+    item(&edit, "Copy", sel!(copy:), "c");
     item(&edit, "Paste", sel!(paste:), "v");
+    item(&edit, "Select All", sel!(selectAll:), "a");
     submenu(&main, &edit);
+
+    let view = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("View"));
+    // ⌘= (the same key without Shift) is handled by the view; a hidden menu
+    // item's shortcut does not fire.
+    item(&view, "Bigger", sel!(tachyonBiggerFont:), "+");
+    item(&view, "Smaller", sel!(tachyonSmallerFont:), "-");
+    item(&view, "Actual Size", sel!(tachyonResetFont:), "0");
+    submenu(&main, &view);
 
     let window = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Window"));
     item(&window, "Minimize", sel!(performMiniaturize:), "m");
@@ -777,6 +1258,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Native window tabs would merge our windows behind a tab bar we hide;
     // Tachyon's own tabs come later.
     NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
+    // A double-click on a title bar fills the screen (or zooms, or
+    // minimises), per the system setting. Tachyon's title bar is invisible and
+    // sits over the top rows of text, where a double-click selects a word, so
+    // turn the action off for this app only; System Settings is untouched.
+    // SAFETY: storing an NSString value under an NSString key.
+    unsafe {
+        NSUserDefaults::standardUserDefaults().setObject_forKey(
+            Some(&NSString::from_str("None")),
+            &NSString::from_str("AppleActionOnDoubleClick"),
+        );
+    }
     build_menu(mtm, &app);
 
     let delegate = AppDelegate::new(mtm);
