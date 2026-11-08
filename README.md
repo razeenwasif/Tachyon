@@ -82,6 +82,32 @@ The terminal core is platform-independent so it can be tested anywhere:
 cargo test                    # 52 tests on Windows, 39 on Linux
 ```
 
+### macOS (Apple silicon)
+
+The Mac backend lives in `src/mac/`: an AppKit window with a Metal layer,
+Core Text glyphs, and a `forkpty` session running your login shell. It is new
+and less complete than the Windows build -- see [docs/NEXT.md](docs/NEXT.md).
+
+```bash
+cargo run                            # run from the source tree
+scripts/bundle-macos.sh              # build dist/Tachyon.app
+scripts/bundle-macos.sh --install    # ...and install it to /Applications
+```
+
+The window is edge-to-edge: no title bar, and the window buttons appear when
+the pointer reaches the top-left corner. Drawing is paced by a display link
+that pauses when nothing changes, so an idle window uses no CPU. Box drawing
+and block elements are drawn as rectangles, so borders and progress bars meet
+exactly. Nerd Font icons come from any installed Nerd Font. The font defaults
+to Cascadia Mono and falls back to SF Mono when it is not installed.
+
+Configuration is read from `~/.config/Tachyon/tachyon.conf`, in the same format
+as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
+
+Not yet on the Mac: selection and copy, mouse reporting, IME and dead keys,
+tabs, cursor blink, translucency, ligatures, and emoji sequences that need
+shaping (skin tones, ZWJ families).
+
 ## Installing and pinning to the taskbar
 
 ```powershell

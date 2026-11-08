@@ -98,9 +98,49 @@ fn main() {
     tachyon::log!("--- exit ---");
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn main() {
-    eprintln!("Tachyon targets Windows. Run `cargo test` to exercise the portable core.");
+    tachyon::log::install_panic_hook();
+    tachyon::log!("--- tachyon {} starting (macOS) ---", tachyon::APP_VERSION);
+
+    let mut cfg = tachyon::config::Config::load_default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                if let Some(path) = args.next() {
+                    cfg = tachyon::config::Config::load(std::path::Path::new(&path));
+                }
+            }
+            "-e" | "--command" => {
+                let rest: Vec<String> = args.by_ref().collect();
+                if let Some((program, params)) = rest.split_first() {
+                    cfg.shell.program = program.clone();
+                    cfg.shell.args = params.to_vec();
+                }
+                break;
+            }
+            "--version" | "-V" => {
+                println!("{} {}", tachyon::APP_NAME, tachyon::APP_VERSION);
+                return;
+            }
+            _ => {}
+        }
+    }
+    for w in &cfg.warnings {
+        eprintln!("tachyon: config: {w}");
+    }
+
+    if let Err(e) = tachyon::mac::run(cfg) {
+        tachyon::log::force(&format!("FATAL: {e}"));
+        eprintln!("tachyon: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn main() {
+    eprintln!("Tachyon runs on macOS and Windows. Run `cargo test` to exercise the portable core.");
     std::process::exit(1);
 }
 

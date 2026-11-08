@@ -64,6 +64,21 @@ features = [
     "Win32_System_Ole",
 ]
 
+# macOS backend: AppKit window, Metal renderer, Core Text glyphs, Unix PTY.
+# The objc2 framework crates enable every header by default; that costs some
+# compile time on the first build and nothing at runtime.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-text = "0.3"
+dispatch2 = "0.3"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
