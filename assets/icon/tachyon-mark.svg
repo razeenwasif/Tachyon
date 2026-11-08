@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Tachyon mark (Icon Composer foreground layer)</title>
+  <defs>
+    <linearGradient id="trail" x1="212" y1="0" x2="582" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F2F4F8" stop-opacity="0"/>
+      <stop offset=".7" stop-color="#F2F4F8" stop-opacity=".07"/>
+      <stop offset="1" stop-color="#F2F4F8" stop-opacity=".30"/>
+    </linearGradient>
+  </defs>
+  <rect x="212" y="384.0" width="390" height="256" fill="url(#trail)"/>
+  <rect x="582" y="384.0" width="150" height="256" rx="20" fill="#F2F4F8"/>
+</svg>

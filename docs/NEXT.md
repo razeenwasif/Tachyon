@@ -203,6 +203,23 @@ on by itself while the PTY has echo off, ⌘↑/⌘↓ to jump between commands,
 independent left and right Option keys. These are expected on a Mac rather than
 new.
 
+### Icon
+
+A block cursor on a near-black squircle, with a motion trail fading off to the
+left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
+
+- `assets/icon/tachyon.svg`: the 1024 pt master on Apple's 824 pt icon grid
+  (superellipse, exponent 5).
+- `assets/icon/tachyon-small.svg`: for 16–32 pt. The trail and glow are
+  dropped and the cursor grows.
+- `assets/icon/tachyon-mark.svg`: the foreground layer for Icon Composer. On
+  macOS 26 and later, shipping the squircle and the mark as separate layers
+  lets the system generate the Clear and Tinted appearances. The icon is dark
+  by design, so Default and Dark are the same.
+- `build.rs` draws the same mark for the Windows `.ico`. Its trail and glow
+  weights are scaled because it blends in linear light, where the SVG's sRGB
+  opacities would come out about three times brighter.
+
 ---
 
 ## 3. The pipeline on Apple silicon

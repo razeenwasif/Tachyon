@@ -141,54 +141,51 @@ fn sd_round_box(px: f32, py: f32, bx: f32, by: f32, r: f32) -> f32 {
     (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - r
 }
 
-/// Signed distance from `p` to the capsule (thick line segment) `a`..`b`.
-fn sd_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32, r: f32) -> f32 {
-    let pax = px - ax;
-    let pay = py - ay;
-    let bax = bx - ax;
-    let bay = by - ay;
-    let denom = bax * bax + bay * bay;
-    let h = if denom > 0.0 {
-        ((pax * bax + pay * bay) / denom).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let dx = pax - bax * h;
-    let dy = pay - bay * h;
-    (dx * dx + dy * dy).sqrt() - r
-}
-
 /// Coverage of a shape whose signed distance is `d`, antialiased over `aa` units.
 fn cover(d: f32, aa: f32) -> f32 {
     (0.5 - d / aa).clamp(0.0, 1.0)
 }
 
-/// The mark: a dark rounded tile carrying a prompt chevron and a cursor bar,
-/// with a speed streak trailing off the chevron. Drawn in normalised [-1, 1]
-/// space and supersampled, so it stays crisp at every size.
+/// Approximate signed distance to a superellipse ("squircle") of half-extent
+/// `h` and exponent `e`. Not a true Euclidean distance, but its gradient is
+/// close to 1 along the edge, which is all the antialiasing needs.
+fn sd_squircle(px: f32, py: f32, h: f32, e: f32) -> f32 {
+    (px.abs().powf(e) + py.abs().powf(e)).powf(1.0 / e) - h
+}
+
+/// The mark: a block cursor on a near-black squircle, with a motion trail
+/// fading off to the left and a faint blue glow behind it. Drawn in normalised
+/// [-1, 1] space and supersampled, so it stays crisp at every size. At 32 px
+/// and below the trail and glow are dropped and the cursor grows, because they
+/// turn to mush at that scale.
+///
+/// Matches `assets/icon/tachyon.svg` (the 1024 pt master, 412 pt half-extent),
+/// rescaled to the tile half-extent below.
 fn draw_icon(size: u32) -> IconImage {
     // Supersample harder at small sizes where each pixel carries more weight.
     let ss: u32 = if size <= 32 { 4 } else { 3 };
     let n = size as f32;
+    let small = size <= 32;
 
-    let bg_top = hex(0x1C2534);
-    let bg_bot = hex(0x090C12);
-    let accent_a = hex(0x5EE7FF); // cyan
-    let accent_b = hex(0xA97BFF); // violet
-    let cursor = hex(0x7DF9C4); // mint
+    let bg_top = hex(0x1C1D22);
+    let bg_bot = hex(0x08080A);
+    let glow = hex(0x2F7CFF);
+    let cursor = hex(0xF2F4F8);
 
     // Geometry, in normalised units where the tile spans [-1, 1].
     let tile_half = 0.94;
-    let tile_radius = 0.42;
-    let stroke = 0.135;
+    let k = tile_half / 412.0; // master-SVG units -> normalised units
 
-    // Chevron ">" vertices.
-    let (cx0, cy0) = (-0.50, -0.42);
-    let (cx1, cy1) = (-0.03, 0.00);
-    let (cx2, cy2) = (-0.50, 0.42);
-    // Cursor bar.
-    let (bx0, by0) = (0.22, 0.42);
-    let (bx1, by1) = (0.62, 0.42);
+    // Block cursor: centre, half-extents, corner radius.
+    let (bcx, bhw, bhh, br) = if small {
+        (40.0 * k, 95.0 * k, 165.0 * k, 26.0 * k)
+    } else {
+        (145.0 * k, 75.0 * k, 128.0 * k, 20.0 * k)
+    };
+    // Trail runs from here to the cursor's left edge.
+    let trail_x0 = -300.0 * k;
+    let block_left = bcx - bhw;
+    let glow_r = 330.0 * k;
 
     let mut rgba_lin = vec![0f32; (size * size * 4) as usize];
 
@@ -206,7 +203,7 @@ fn draw_icon(size: u32) -> IconImage {
                     let aa = 2.0 / n * 1.1;
 
                     // --- tile ---
-                    let d_tile = sd_round_box(x, y, tile_half, tile_half, tile_radius);
+                    let d_tile = sd_squircle(x, y, tile_half, 5.0);
                     let a_tile = cover(d_tile, aa);
                     if a_tile <= 0.0 {
                         continue;
@@ -215,34 +212,49 @@ fn draw_icon(size: u32) -> IconImage {
                     let t = (y * 0.5 + 0.5).clamp(0.0, 1.0);
                     let mut col = mix(bg_top, bg_bot, t);
 
-                    // Subtle inner top highlight so the tile reads as a surface.
-                    let rim = cover(-(d_tile + 0.055), aa) * (1.0 - cover(-d_tile, aa));
-                    col = mix(col, hex(0x39506B), rim * 0.55 * (1.0 - t));
-
-                    // --- speed streak (behind the chevron) ---
-                    let d_streak = sd_segment(x, y, -0.86, 0.0, -0.30, 0.0, stroke * 0.42);
-                    let a_streak = cover(d_streak, aa) * 0.55;
-                    if a_streak > 0.0 {
-                        // Fade the streak out towards the left edge.
-                        let fade = ((x + 0.86) / 0.56).clamp(0.0, 1.0);
-                        col = mix(col, accent_a, a_streak * fade);
+                    // Hairline highlight along the top edge so the tile reads
+                    // as a surface against a dark Dock or taskbar.
+                    if !small {
+                        let rim = cover(-(d_tile + 0.012), aa) * (1.0 - cover(-d_tile, aa));
+                        let fade = (1.0 - t / 0.35).clamp(0.0, 1.0);
+                        col = mix(col, hex(0xFFFFFF), rim * 0.16 * fade);
                     }
 
-                    // --- chevron ---
-                    let d_ch = sd_segment(x, y, cx0, cy0, cx1, cy1, stroke)
-                        .min(sd_segment(x, y, cx1, cy1, cx2, cy2, stroke));
-                    let a_ch = cover(d_ch, aa);
-                    if a_ch > 0.0 {
-                        // Gradient along the chevron, cyan at the tip.
-                        let g = ((x + 0.55) / 0.60).clamp(0.0, 1.0);
-                        col = mix(col, mix(accent_b, accent_a, g), a_ch);
+                    if !small {
+                        // --- glow behind the cursor ---
+                        let gd = ((x - bcx).powi(2) + y * y).sqrt() / glow_r;
+                        let g = (1.0 - gd).clamp(0.0, 1.0);
+                        // Weights here are in linear light. The SVG's 0.34 glow
+                        // and 0.07..0.30 trail opacities blend in sRGB, and over
+                        // a near-black tile they land at roughly a third of
+                        // that in linear terms, so these are scaled to match.
+                        col = mix(col, glow, 0.10 * g * g);
+
+                        // --- motion trail ---
+                        let d_trail = sd_round_box(
+                            x - (trail_x0 + block_left) * 0.5,
+                            y,
+                            (block_left - trail_x0) * 0.5,
+                            bhh,
+                            0.0,
+                        );
+                        let a_trail = cover(d_trail, aa);
+                        if a_trail > 0.0 {
+                            let s = ((x - trail_x0) / (block_left - trail_x0)).clamp(0.0, 1.0);
+                            let o = if s < 0.7 {
+                                0.012 * s / 0.7
+                            } else {
+                                0.012 + 0.078 * (s - 0.7) / 0.3
+                            };
+                            col = mix(col, cursor, a_trail * o);
+                        }
                     }
 
-                    // --- cursor bar ---
-                    let d_bar = sd_segment(x, y, bx0, by0, bx1, by1, stroke * 0.80);
-                    let a_bar = cover(d_bar, aa);
-                    if a_bar > 0.0 {
-                        col = mix(col, cursor, a_bar);
+                    // --- block cursor ---
+                    let d_block = sd_round_box(x - bcx, y, bhw, bhh, br);
+                    let a_block = cover(d_block, aa);
+                    if a_block > 0.0 {
+                        col = mix(col, cursor, a_block);
                     }
 
                     acc[0] += col.0 * a_tile;
