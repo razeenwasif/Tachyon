@@ -12,6 +12,7 @@
 //!   dual-source subpixel path.
 
 use std::mem::size_of;
+use std::rc::Rc;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
@@ -187,12 +188,38 @@ struct Slot {
     in_flight: Option<Retained<CommandBuffer>>,
 }
 
-pub struct Renderer {
+/// Metal objects shared by every window: one device, one queue, and the two
+/// pipelines, so opening a window does not recompile the shaders.
+pub struct Gpu {
     device: Retained<Device>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    layer: Retained<CAMetalLayer>,
     rect_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     glyph_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+}
+
+impl Gpu {
+    pub fn new() -> Result<Rc<Gpu>, String> {
+        let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+        let queue = device.newCommandQueue().ok_or("could not create a command queue")?;
+        let source = NSString::from_str(SHADERS);
+        let library = device
+            .newLibraryWithSource_options_error(&source, None)
+            .map_err(|e| format!("shader compile failed: {}", e.localizedDescription()))?;
+        let rect_pso = pipeline(&device, &*library, "vs_rect", "fs_rect")?;
+        let glyph_pso = pipeline(&device, &*library, "vs_glyph", "fs_glyph")?;
+        Ok(Rc::new(Gpu {
+            device,
+            queue,
+            rect_pso,
+            glyph_pso,
+        }))
+    }
+}
+
+/// One window's renderer: its layer, glyph atlas, fonts and frame buffers.
+pub struct Renderer {
+    gpu: Rc<Gpu>,
+    layer: Retained<CAMetalLayer>,
     atlas: Atlas,
     slots: [Slot; FRAMES_IN_FLIGHT],
     frame: usize,
@@ -209,11 +236,8 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(layer: Retained<CAMetalLayer>, cfg: &Config, scale: f32) -> Result<Renderer, String> {
-        let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
-        let queue = device.newCommandQueue().ok_or("could not create a command queue")?;
-
-        layer.setDevice(Some(&device));
+    pub fn new(gpu: Rc<Gpu>, layer: Retained<CAMetalLayer>, cfg: &Config, scale: f32) -> Result<Renderer, String> {
+        layer.setDevice(Some(&gpu.device));
         layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
         layer.setFramebufferOnly(true);
         // Two drawables: the lowest latency that still lets the GPU work while
@@ -226,22 +250,12 @@ impl Renderer {
         }
         layer.setContentsScale(scale as f64);
 
-        let source = NSString::from_str(SHADERS);
-        let library = device
-            .newLibraryWithSource_options_error(&source, None)
-            .map_err(|e| format!("shader compile failed: {}", e.localizedDescription()))?;
-        let rect_pso = pipeline(&device, &*library, "vs_rect", "fs_rect")?;
-        let glyph_pso = pipeline(&device, &*library, "vs_glyph", "fs_glyph")?;
-
-        let atlas = Atlas::new(&device)?;
+        let atlas = Atlas::new(&gpu.device)?;
         let fonts = FontSet::new(&cfg.font, scale);
 
         Ok(Renderer {
-            device,
-            queue,
+            gpu,
             layer,
-            rect_pso,
-            glyph_pso,
             atlas,
             slots: Default::default(),
             frame: 0,
@@ -342,7 +356,7 @@ impl Renderer {
             cb.waitUntilCompleted();
         }
 
-        let device = &self.device;
+        let device = &self.gpu.device;
         let slot = &mut self.slots[slot_idx];
         let bg = upload(device, &mut slot.bg, &self.bg);
         let glyphs = upload(device, &mut slot.glyphs, &self.glyphs);
@@ -373,7 +387,7 @@ impl Renderer {
         attachment.setStoreAction(MTLStoreAction::Store);
         attachment.setClearColor(clear);
 
-        let Some(cb) = self.queue.commandBuffer() else {
+        let Some(cb) = self.gpu.queue.commandBuffer() else {
             return;
         };
         let Some(enc) = cb.renderCommandEncoderWithDescriptor(&pass) else {
@@ -412,10 +426,10 @@ impl Renderer {
             }
         };
 
-        draw(&self.rect_pso, bg, self.bg.len());
+        draw(&self.gpu.rect_pso, bg, self.bg.len());
         unsafe { enc.setFragmentTexture_atIndex(Some(&self.atlas.texture), 0) };
-        draw(&self.glyph_pso, glyphs, self.glyphs.len());
-        draw(&self.rect_pso, overlay, self.overlay.len());
+        draw(&self.gpu.glyph_pso, glyphs, self.glyphs.len());
+        draw(&self.gpu.rect_pso, overlay, self.overlay.len());
         enc.endEncoding();
 
         let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
@@ -716,4 +730,10 @@ fn srgb(c: [u8; 3]) -> [f32; 4] {
 fn is_invisible(ch: char) -> bool {
     matches!(ch, '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}')
         || ('\u{E0100}'..='\u{E01EF}').contains(&ch)
+}
+
+/// Cell size for a font configuration at a given scale, for sizing a window
+/// before its renderer exists.
+pub fn grid_metrics(cfg: &crate::config::FontConfig, scale: f32) -> CellMetrics {
+    FontSet::new(cfg, scale).metrics
 }

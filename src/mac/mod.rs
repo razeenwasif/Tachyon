@@ -1,15 +1,19 @@
-//! macOS backend: an AppKit window with a Metal layer, driven by a display
-//! link, talking to a shell over a Unix PTY.
+//! macOS backend: AppKit windows with Metal layers, each driven by its own
+//! display link and talking to its own shell over a Unix PTY.
 //!
-//! Threading follows the Windows backend. The reader thread owns parsing: it
-//! blocks in `read`, feeds the bytes to the terminal under its lock, and wakes
-//! the main thread. The main thread handles input and draws.
+//! Threading follows the Windows backend. Each window's reader thread owns
+//! parsing: it blocks in `read`, feeds the bytes to that window's terminal
+//! under its lock, and wakes the main thread. The main thread handles input
+//! and draws.
 //!
-//! Drawing is paced by the view's `CADisplayLink`, and the link is paused
-//! whenever nothing changed for a couple of refreshes. An idle Tachyon makes no
-//! frames and takes no wake-ups until the shell prints or a key arrives. The
-//! cursor does not blink yet, so idle really is idle; blinking moves to Core
-//! Animation in a later step.
+//! Drawing is paced by each view's `CADisplayLink`, and a link is paused
+//! whenever its window had nothing to draw for a couple of refreshes. An idle
+//! window makes no frames and takes no wake-ups until its shell prints or a key
+//! arrives.
+//!
+//! Windows behave like Terminal.app's: ⌘N opens another, each with its own
+//! shell; closing one ends only that shell; the app keeps running with no
+//! windows, and clicking the Dock icon opens a fresh one.
 
 mod boxdraw;
 mod font;
@@ -17,20 +21,21 @@ mod input;
 mod pty;
 mod renderer;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
+use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSCursor, NSEvent,
-    NSEventModifierFlags, NSImage, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
-    NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowButton,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSImage, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop,
@@ -42,7 +47,7 @@ use parking_lot::Mutex;
 use crate::config::Config;
 use crate::term::{Processor, Term, TermMode};
 use pty::Pty;
-use renderer::Renderer;
+use renderer::{Gpu, Renderer};
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/icon/tachyon.svg");
 
@@ -51,28 +56,41 @@ const ICON_SVG: &[u8] = include_bytes!("../../assets/icon/tachyon.svg");
 const BUTTON_ZONE: (f64, f64) = (84.0, 34.0);
 
 thread_local! {
-    /// All main-thread state. AppKit calls into the view and the window
-    /// delegate; both forward here.
+    /// All main-thread state. AppKit calls into the views and delegates; each
+    /// carries its window's id and forwards here.
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-/// Run `f` against the app state, unless it is already borrowed further up
-/// the stack (AppKit can re-enter us from inside a call we made).
-fn with_app(f: impl FnOnce(&mut App)) {
+/// Run `f` against the app state, unless it is already borrowed further up the
+/// stack (AppKit can re-enter us from inside a call we made).
+fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|cell| {
-        if let Ok(mut guard) = cell.try_borrow_mut() {
-            if let Some(app) = guard.as_mut() {
-                f(app);
-            }
+        let mut guard = cell.try_borrow_mut().ok()?;
+        guard.as_mut().map(f)
+    })
+}
+
+/// Run `f` against one window's state.
+fn with_window(id: u64, f: impl FnOnce(&mut TermWindow)) {
+    with_app(|app| {
+        if let Some(w) = app.windows.iter_mut().find(|w| w.id == id) {
+            f(w);
         }
     });
 }
 
+/// Per-instance storage for the Objective-C classes: which window they serve.
+#[derive(Default)]
+struct WindowId {
+    id: Cell<u64>,
+}
+
 define_class!(
-    /// The terminal surface. Layer-backed by a `CAMetalLayer`.
+    /// A terminal surface. Layer-backed by a `CAMetalLayer`.
     #[unsafe(super(NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "TachyonView"]
+    #[ivars = WindowId]
     struct TachyonView;
 
     impl TachyonView {
@@ -88,7 +106,7 @@ define_class!(
 
         #[unsafe(method(updateLayer))]
         fn update_layer(&self) {
-            with_app(|a| a.needs_redraw = true);
+            with_window(self.id(), |w| w.needs_redraw = true);
         }
 
         #[unsafe(method(isOpaque))]
@@ -110,52 +128,56 @@ define_class!(
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, size: NSSize) {
             unsafe { msg_send![super(self), setFrameSize: size] }
-            with_app(|a| a.layout());
+            with_window(self.id(), TermWindow::layout);
         }
 
         #[unsafe(method(viewDidChangeBackingProperties))]
         fn view_did_change_backing_properties(&self) {
-            with_app(|a| a.rescale());
+            with_window(self.id(), TermWindow::rescale);
         }
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            with_app(|a| a.key_down(event));
+            with_window(self.id(), |w| w.key_down(event));
         }
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            with_app(|a| a.scroll(event));
+            with_window(self.id(), |w| w.scroll(event));
         }
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             let p = event.locationInWindow();
-            with_app(|a| a.hover(Some(p)));
+            with_window(self.id(), |w| w.hover(Some(p)));
         }
 
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &NSEvent) {
-            with_app(|a| a.hover(None));
+            with_window(self.id(), |w| w.hover(None));
         }
 
         #[unsafe(method(paste:))]
         fn paste(&self, _sender: Option<&AnyObject>) {
-            with_app(|a| a.paste());
+            with_window(self.id(), TermWindow::paste);
         }
 
         /// Display link callback: one per refresh while the link runs.
         #[unsafe(method(tick:))]
         fn tick(&self, _link: &CADisplayLink) {
-            with_app(|a| a.tick());
+            with_window(self.id(), TermWindow::tick);
         }
     }
 );
 
 impl TachyonView {
-    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(());
+    fn new(mtm: MainThreadMarker, frame: NSRect, id: u64) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(WindowId { id: Cell::new(id) });
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    fn id(&self) -> u64 {
+        self.ivars().id.get()
     }
 }
 
@@ -163,6 +185,7 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "TachyonWindowDelegate"]
+    #[ivars = WindowId]
     struct WindowDelegate;
 
     unsafe impl NSObjectProtocol for WindowDelegate {}
@@ -170,40 +193,89 @@ define_class!(
     unsafe impl NSWindowDelegate for WindowDelegate {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _n: &NSNotification) {
-            // One window is the whole app for now. Terminate after this event
-            // has unwound, not from inside AppKit's close sequence.
-            DispatchQueue::main().exec_async(terminate);
+            // Retire the session after AppKit's close sequence has unwound.
+            let id = self.ivars().id.get();
+            DispatchQueue::main().exec_async(move || remove_window(id));
         }
 
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _n: &NSNotification) {
-            with_app(|a| a.set_focused(true));
+            with_window(self.ivars().id.get(), |w| w.set_focused(true));
         }
 
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _n: &NSNotification) {
-            with_app(|a| a.set_focused(false));
+            with_window(self.ivars().id.get(), |w| w.set_focused(false));
         }
     }
 );
 
 impl WindowDelegate {
+    fn new(mtm: MainThreadMarker, id: u64) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(WindowId { id: Cell::new(id) });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+define_class!(
+    /// App-level behaviour: New Window, and what happens with no windows. It is
+    /// the last stop in the responder chain, so ⌘N reaches it even when no
+    /// window is open.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TachyonAppDelegate"]
+    struct AppDelegate;
+
+    unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
+        fn should_terminate_after_last_window_closed(&self, _app: &NSApplication) -> bool {
+            // Stay running with no windows, like Terminal.app.
+            false
+        }
+
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn should_handle_reopen(&self, _app: &NSApplication, has_visible_windows: bool) -> bool {
+            // Clicking the Dock icon with no windows open starts a fresh one.
+            if !has_visible_windows {
+                open_window();
+            }
+            true
+        }
+    }
+
+    impl AppDelegate {
+        #[unsafe(method(newWindow:))]
+        fn new_window(&self, _sender: Option<&AnyObject>) {
+            open_window();
+        }
+    }
+);
+
+impl AppDelegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
         unsafe { msg_send![super(this), init] }
     }
 }
 
-fn terminate() {
-    if let Some(mtm) = MainThreadMarker::new() {
-        NSApplication::sharedApplication(mtm).terminate(None);
-    }
+struct App {
+    cfg: Config,
+    gpu: Rc<Gpu>,
+    windows: Vec<TermWindow>,
+    next_id: u64,
+    /// Where the next window's top-left corner goes, so new windows cascade.
+    cascade: NSPoint,
+    _delegate: Retained<AppDelegate>,
 }
 
-struct App {
+/// One window: its AppKit objects, renderer, and shell session.
+struct TermWindow {
+    id: u64,
     window: Retained<NSWindow>,
     view: Retained<TachyonView>,
-    link: Option<Retained<CADisplayLink>>,
+    link: Retained<CADisplayLink>,
     renderer: Renderer,
 
     term: Arc<Mutex<Term>>,
@@ -225,7 +297,17 @@ struct App {
     _delegate: Retained<WindowDelegate>,
 }
 
-impl App {
+impl Drop for TermWindow {
+    fn drop(&mut self) {
+        // A display link retains its target; invalidate it or the view leaks.
+        self.link.invalidate();
+        // The reader thread holds the PTY too, so dropping ours does not end
+        // the session; hanging up does.
+        self.pty.hangup();
+    }
+}
+
+impl TermWindow {
     fn scale(&self) -> f64 {
         self.window.backingScaleFactor()
     }
@@ -233,9 +315,7 @@ impl App {
     /// Wake from idle. Called on the main queue by the reader thread.
     fn resume(&mut self) {
         self.idle_ticks = 0;
-        if let Some(link) = &self.link {
-            link.setPaused(false);
-        }
+        self.link.setPaused(false);
     }
 
     fn tick(&mut self) {
@@ -252,6 +332,8 @@ impl App {
             self.title_rev = title_rev;
             let title = self.term.lock().title.clone().unwrap_or_default();
             let title = if title.is_empty() { "Tachyon".to_string() } else { title };
+            // Hidden in the title bar, but it names the window in the Window
+            // menu, Mission Control and the ⌘` cycle.
             self.window.setTitle(&NSString::from_str(&title));
         }
 
@@ -276,9 +358,7 @@ impl App {
             // next byte from the shell or key press resumes it.
             self.idle_ticks += 1;
             if self.idle_ticks >= 3 {
-                if let Some(link) = &self.link {
-                    link.setPaused(true);
-                }
+                self.link.setPaused(true);
             }
         }
     }
@@ -432,10 +512,172 @@ fn set_buttons_hidden(window: &NSWindow, hidden: bool) {
     }
 }
 
+impl App {
+    /// Build a window and its session, and add it to the list. Ordering it on
+    /// screen is left to the caller, outside the app-state borrow, because
+    /// AppKit calls back into the delegate while it does that.
+    fn create_window(&mut self, mtm: MainThreadMarker) -> Result<(Retained<NSWindow>, Retained<TachyonView>, u64), String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let cfg = &self.cfg;
+
+        // Size from the configured grid, at the main screen's scale until
+        // the window knows which display it is on.
+        let scale = NSScreen::mainScreen(mtm).map(|s| s.backingScaleFactor()).unwrap_or(2.0);
+        let probe = renderer::grid_metrics(&cfg.font, scale as f32);
+        let pad_x = (cfg.window.padding_x as f64 * scale).round();
+        let pad_y = (cfg.window.padding_y as f64 * scale).round();
+        let content = NSSize::new(
+            (cfg.window.cols as f64 * probe.width as f64 + 2.0 * pad_x) / scale,
+            (cfg.window.rows as f64 * probe.height as f64 + 2.0 * pad_y) / scale,
+        );
+
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::FullSizeContentView;
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), content),
+                style,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(&NSString::from_str("Tachyon"));
+        // Edge-to-edge: no visible title bar, content runs to the top edge.
+        window.setTitlebarAppearsTransparent(true);
+        window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        let bg = cfg.theme.background;
+        window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+            bg[0] as f64 / 255.0,
+            bg[1] as f64 / 255.0,
+            bg[2] as f64 / 255.0,
+            1.0,
+        )));
+        window.setContentMinSize(NSSize::new(
+            (20.0 * probe.width as f64) / scale,
+            (4.0 * probe.height as f64) / scale,
+        ));
+
+        let view = TachyonView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), content), id);
+        view.setWantsLayer(true);
+        let layer = view.layer().ok_or("the view has no layer")?;
+        // SAFETY: makeBackingLayer always returns a CAMetalLayer.
+        let layer: Retained<CAMetalLayer> = unsafe { Retained::cast_unchecked(layer) };
+        let renderer = Renderer::new(Rc::clone(&self.gpu), layer, cfg, scale as f32)?;
+
+        let tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                NSTrackingAreaOptions::MouseMoved
+                    | NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::ActiveAlways
+                    | NSTrackingAreaOptions::InVisibleRect,
+                Some(&view),
+                None,
+            )
+        };
+        view.addTrackingArea(&tracking);
+
+        window.setContentView(Some(&view));
+        let delegate = WindowDelegate::new(mtm, id);
+        window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        set_buttons_hidden(&window, true);
+
+        // The first window is centred; later ones cascade down and right.
+        if self.windows.is_empty() {
+            window.center();
+            self.cascade = window.cascadeTopLeftFromPoint(NSPoint::new(0.0, 0.0));
+        } else {
+            self.cascade = window.cascadeTopLeftFromPoint(self.cascade);
+        }
+
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let (term, pty) = start_session(id, cfg, cfg.window.cols, cfg.window.rows, Arc::clone(&wake_pending))?;
+
+        let link = unsafe { view.displayLinkWithTarget_selector(&view, sel!(tick:)) };
+        unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
+
+        self.windows.push(TermWindow {
+            id,
+            window: window.clone(),
+            view: view.clone(),
+            link,
+            renderer,
+            term,
+            pty,
+            wake_pending,
+            needs_redraw: true,
+            idle_ticks: 0,
+            sync_since: None,
+            sync_timeout: Duration::from_millis(cfg.render.sync_timeout_ms),
+            grid: (0, 0),
+            scroll_accum: 0.0,
+            title_rev: u64::MAX,
+            buttons_visible: false,
+            focused: true,
+            _delegate: delegate,
+        });
+        Ok((window, view, id))
+    }
+}
+
+/// Open a new terminal window and bring it to the front.
+fn open_window() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    match with_app(|app| app.create_window(mtm)) {
+        Some(Ok((window, view, id))) => {
+            with_window(id, TermWindow::layout);
+            window.makeKeyAndOrderFront(None);
+            window.makeFirstResponder(Some(&view));
+            NSApplication::sharedApplication(mtm).activate();
+        }
+        Some(Err(e)) => {
+            crate::log::force(&format!("could not open a window: {e}"));
+            eprintln!("tachyon: could not open a window: {e}");
+        }
+        None => {}
+    }
+}
+
+/// Close a window whose shell exited, the way Terminal.app does by default.
+fn close_window(id: u64) {
+    let window = APP.with(|cell| {
+        let guard = cell.try_borrow().ok()?;
+        guard.as_ref()?.windows.iter().find(|w| w.id == id).map(|w| w.window.clone())
+    });
+    // `close` sends windowWillClose:, which removes the session.
+    if let Some(window) = window {
+        window.close();
+    }
+}
+
+/// Drop a window's state: its display link, renderer, and PTY. Dropping the
+/// PTY hangs up the shell.
+fn remove_window(id: u64) {
+    let removed = with_app(|app| {
+        let i = app.windows.iter().position(|w| w.id == id)?;
+        Some(app.windows.remove(i))
+    });
+    drop(removed);
+}
+
 fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let ns = NSString::from_str;
-    let item = |menu: &NSMenu, title: &str, action: objc2::runtime::Sel, key: &str| unsafe {
+    let item = |menu: &NSMenu, title: &str, action: Sel, key: &str| unsafe {
         menu.addItemWithTitle_action_keyEquivalent(&ns(title), Some(action), &ns(key))
+    };
+    let submenu = |main: &NSMenu, menu: &NSMenu| {
+        let holder = NSMenuItem::new(mtm);
+        holder.setSubmenu(Some(menu));
+        main.addItem(&holder);
     };
 
     let main = NSMenu::new(mtm);
@@ -443,30 +685,29 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let app_menu = NSMenu::new(mtm);
     item(&app_menu, "Hide Tachyon", sel!(hide:), "h");
     item(&app_menu, "Quit Tachyon", sel!(terminate:), "q");
-    let app_item = NSMenuItem::new(mtm);
-    app_item.setSubmenu(Some(&app_menu));
-    main.addItem(&app_item);
+    submenu(&main, &app_menu);
+
+    let file = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Shell"));
+    item(&file, "New Window", sel!(newWindow:), "n");
+    item(&file, "Close Window", sel!(performClose:), "w");
+    submenu(&main, &file);
 
     let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Edit"));
     item(&edit, "Paste", sel!(paste:), "v");
-    let edit_item = NSMenuItem::new(mtm);
-    edit_item.setSubmenu(Some(&edit));
-    main.addItem(&edit_item);
+    submenu(&main, &edit);
 
     let window = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Window"));
     item(&window, "Minimize", sel!(performMiniaturize:), "m");
     item(&window, "Zoom", sel!(performZoom:), "");
-    item(&window, "Close", sel!(performClose:), "w");
-    let window_item = NSMenuItem::new(mtm);
-    window_item.setSubmenu(Some(&window));
-    main.addItem(&window_item);
+    submenu(&main, &window);
     app.setWindowsMenu(Some(&window));
 
     app.setMainMenu(Some(&main));
 }
 
-/// Start the session on its reader thread. Returns the shared terminal.
+/// Start a shell on a PTY and the reader thread that feeds its terminal.
 fn start_session(
+    id: u64,
     cfg: &Config,
     cols: usize,
     rows: usize,
@@ -477,7 +718,7 @@ fn start_session(
     } else {
         (cfg.shell.program.clone(), false)
     };
-    crate::log!("spawning `{program}` {:?} at {cols}x{rows}", cfg.shell.args);
+    crate::log!("window {id}: spawning `{program}` {:?} at {cols}x{rows}", cfg.shell.args);
     let pty = Arc::new(
         Pty::spawn(cols as u16, rows as u16, &program, &cfg.shell.args, login)
             .map_err(|e| format!("could not start {program}: {e}"))?,
@@ -487,7 +728,7 @@ fn start_session(
     let reader_term = Arc::clone(&term);
     let reader_pty = Arc::clone(&pty);
     std::thread::Builder::new()
-        .name("tachyon-pty-reader".into())
+        .name(format!("tachyon-pty-reader-{id}"))
         .spawn(move || {
             let mut processor = Processor::new();
             let mut dump = std::env::var_os("TACHYON_DUMP").and_then(|p| std::fs::File::create(p).ok());
@@ -499,7 +740,7 @@ fn start_session(
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
-                        crate::log!("pty: read failed: {e}");
+                        crate::log!("window {id}: pty read failed: {e}");
                         break;
                     }
                 };
@@ -516,11 +757,10 @@ fn start_session(
                     let _ = reader_pty.write(&replies);
                 }
                 if !wake_pending.swap(true, Ordering::AcqRel) {
-                    DispatchQueue::main().exec_async(|| with_app(App::resume));
+                    DispatchQueue::main().exec_async(move || with_window(id, TermWindow::resume));
                 }
             }
-            // The shell exited: close the window, like Terminal.app's default.
-            DispatchQueue::main().exec_async(terminate);
+            DispatchQueue::main().exec_async(move || close_window(id));
         })
         .map_err(|e| format!("could not start the reader thread: {e}"))?;
 
@@ -534,113 +774,30 @@ pub fn run(cfg: Config) -> Result<(), String> {
     if let Some(icon) = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(ICON_SVG)) {
         unsafe { app.setApplicationIconImage(Some(&icon)) };
     }
+    // Native window tabs would merge our windows behind a tab bar we hide;
+    // Tachyon's own tabs come later.
+    NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
     build_menu(mtm, &app);
 
-    // Size the window from the configured grid, using the main screen's scale
-    // until the window knows which display it is on.
-    let scale = objc2_app_kit::NSScreen::mainScreen(mtm)
-        .map(|s| s.backingScaleFactor())
-        .unwrap_or(2.0);
-    let probe_layer = CAMetalLayer::new();
-    let mut renderer = Renderer::new(probe_layer, &cfg, scale as f32)?;
-    let m = renderer.metrics();
-    let (pad_x, pad_y) = renderer.padding();
-    let content = NSSize::new(
-        (cfg.window.cols as f64 * m.width as f64 + 2.0 * pad_x as f64) / scale,
-        (cfg.window.rows as f64 * m.height as f64 + 2.0 * pad_y as f64) / scale,
-    );
+    let delegate = AppDelegate::new(mtm);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-    let style = NSWindowStyleMask::Titled
-        | NSWindowStyleMask::Closable
-        | NSWindowStyleMask::Miniaturizable
-        | NSWindowStyleMask::Resizable
-        | NSWindowStyleMask::FullSizeContentView;
-    let window = unsafe {
-        NSWindow::initWithContentRect_styleMask_backing_defer(
-            NSWindow::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), content),
-            style,
-            NSBackingStoreType::Buffered,
-            false,
-        )
-    };
-    unsafe { window.setReleasedWhenClosed(false) };
-    window.setTitle(&NSString::from_str("Tachyon"));
-    // Edge-to-edge: no visible title bar, content runs to the top edge.
-    window.setTitlebarAppearsTransparent(true);
-    window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
-    let bg = cfg.theme.background;
-    window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-        bg[0] as f64 / 255.0,
-        bg[1] as f64 / 255.0,
-        bg[2] as f64 / 255.0,
-        1.0,
-    )));
-    window.setContentMinSize(NSSize::new(
-        (20.0 * m.width as f64) / scale,
-        (4.0 * m.height as f64) / scale,
-    ));
-
-    let view = TachyonView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), content));
-    view.setWantsLayer(true);
-    let layer = view.layer().ok_or("the view has no layer")?;
-    // SAFETY: makeBackingLayer above always returns a CAMetalLayer.
-    let layer: Retained<CAMetalLayer> = unsafe { Retained::cast_unchecked(layer) };
-    // Rebuild the renderer on the real layer now that the view exists.
-    renderer = Renderer::new(layer, &cfg, scale as f32)?;
-
-    let tracking = unsafe {
-        NSTrackingArea::initWithRect_options_owner_userInfo(
-            NSTrackingArea::alloc(),
-            NSRect::ZERO,
-            NSTrackingAreaOptions::MouseMoved
-                | NSTrackingAreaOptions::MouseEnteredAndExited
-                | NSTrackingAreaOptions::ActiveAlways
-                | NSTrackingAreaOptions::InVisibleRect,
-            Some(&view),
-            None,
-        )
-    };
-    view.addTrackingArea(&tracking);
-
-    window.setContentView(Some(&view));
-    let delegate = WindowDelegate::new(mtm);
-    window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    set_buttons_hidden(&window, true);
-
-    let wake_pending = Arc::new(AtomicBool::new(false));
-    let (term, pty) = start_session(&cfg, cfg.window.cols, cfg.window.rows, Arc::clone(&wake_pending))?;
-
-    let link = unsafe { view.displayLinkWithTarget_selector(&view, sel!(tick:)) };
-    unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
-
+    let gpu = Gpu::new()?;
     APP.with(|cell| {
         *cell.borrow_mut() = Some(App {
-            sync_timeout: Duration::from_millis(cfg.render.sync_timeout_ms),
-            window: window.clone(),
-            view: view.clone(),
-            link: Some(link),
-            renderer,
-            term,
-            pty,
-            wake_pending,
-            needs_redraw: true,
-            idle_ticks: 0,
-            sync_since: None,
-            grid: (0, 0),
-            scroll_accum: 0.0,
-            title_rev: u64::MAX,
-            buttons_visible: false,
-            focused: true,
+            cfg,
+            gpu,
+            windows: Vec::new(),
+            next_id: 1,
+            cascade: NSPoint::new(0.0, 0.0),
             _delegate: delegate,
         });
     });
 
-    with_app(App::layout);
-    window.center();
-    window.makeKeyAndOrderFront(None);
-    window.makeFirstResponder(Some(&view));
-    app.activate();
+    open_window();
+    if with_app(|a| a.windows.is_empty()).unwrap_or(true) {
+        return Err("could not open the first window".into());
+    }
     app.run();
 
     APP.with(|cell| cell.borrow_mut().take());

@@ -132,14 +132,33 @@ impl Pty {
     }
 }
 
-impl Drop for Pty {
-    fn drop(&mut self) {
-        // Hang up on the session the way closing a real terminal would, then
-        // reap the child so it does not linger as a zombie.
+impl Pty {
+    /// Hang up on the session, the way closing a real terminal does. The shell
+    /// exits, its side of the PTY closes, and the reader thread's blocked
+    /// `read` returns -- which is what finally drops the last reference.
+    pub fn hangup(&self) {
         unsafe {
             libc::kill(self.pid, libc::SIGHUP);
-            let mut status = 0;
-            libc::waitpid(self.pid, &mut status, libc::WNOHANG);
+        }
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // Reap the child so it does not linger as a zombie. Usually it has
+        // already exited; if not, hang up and wait for it off this thread.
+        let pid = self.pid;
+        let mut status = 0;
+        if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGHUP);
+            }
+            let _ = std::thread::Builder::new()
+                .name("tachyon-reaper".into())
+                .spawn(move || unsafe {
+                    let mut status = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                });
         }
     }
 }
