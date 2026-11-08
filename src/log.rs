@@ -20,7 +20,9 @@ fn log_path() -> Option<&'static PathBuf> {
     PATH.get_or_init(|| {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
+            .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))
+            // macOS: ~/Library/Logs/Tachyon, where Console.app looks.
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs")))?;
         let dir = base.join("Tachyon");
         create_dir_all(&dir).ok()?;
         Some(dir.join("tachyon.log"))

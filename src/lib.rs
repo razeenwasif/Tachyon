@@ -19,6 +19,10 @@ pub mod render;
 #[cfg(windows)]
 pub mod win;
 
+/// macOS backend: AppKit, Metal, Core Text and a Unix PTY.
+#[cfg(target_os = "macos")]
+pub mod mac;
+
 /// Identity used for taskbar grouping and jump lists. Must match the
 /// `System.AppUserModel.ID` stamped on the Start menu shortcut by the
 /// installer, or Windows will treat a pinned shortcut and a running window as
