@@ -322,6 +322,11 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    native tabs, menus and shortcuts, accessibility settings. The edge-to-edge
    layout with cell tabs in the status line and hover-reveal window buttons.
    The notch full-screen mode as a prototype.
+   *Tabs done (9 November 2026):* a strip drawn in cells along the bottom
+   edge, shown only with two or more tabs. Tabs are named from OSC 7 (the
+   folder), the command line the zsh integration reports with OSC 133;C, or a
+   title the running program set; a background tab whose command finishes gets
+   a green or red dot. ⌘T, ⌘W, ⌘1–9, ⌘⇧[ ], ⌃⇥, click and middle-click.
 5. **Rewind log and snapshots**, with cell provenance. New `src/rewind/`.
 6. **Shell integration and receipts**: OSC 133 for zsh first, then bash and
    fish. `proc_pid_rusage` receipts, rerun diff, notifications, ⌘↑/⌘↓.

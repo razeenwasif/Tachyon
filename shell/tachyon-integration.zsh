@@ -16,6 +16,8 @@ _tachyon_precmd() {
     unset _tachyon_running
   fi
   builtin print -n "\e]133;A\a"
+  # The working directory, which names the tab while it sits at a prompt.
+  builtin print -rn -- $'\e]7;file://'"${HOST}${PWD//\%/%25}"$'\a'
   # Mark where typing starts: the end of the prompt. Re-added whenever a theme
   # (starship, powerlevel10k) has rebuilt the prompt without it.
   if [[ $PS1 != *$'\e]133;B\a'* ]]; then
@@ -25,7 +27,10 @@ _tachyon_precmd() {
 
 _tachyon_preexec() {
   typeset -g _tachyon_running=1
-  builtin print -n "\e]133;C\a"
+  # The command line (control characters blanked, at most 256 characters)
+  # names the tab while it runs.
+  local cmd=${1//[[:cntrl:]]/ }
+  builtin print -rn -- $'\e]133;C;cmdline='"${cmd[1,256]}"$'\a'
 }
 
 autoload -Uz add-zsh-hook

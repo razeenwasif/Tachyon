@@ -60,7 +60,7 @@ use crate::term::{CommandEvent, CommandState, Processor, RowMark, Term, TermMode
 use rustc_hash::FxHashMap;
 use pty::Pty;
 use input::{MouseButton, MouseEventKind};
-use renderer::{CursorOverlay, Decor, Gpu, Outcome, Renderer};
+use renderer::{CursorOverlay, Decor, Gpu, Outcome, Renderer, Strip};
 use selection::{Pos, Selection, Unit};
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/icon/tachyon.svg");
@@ -89,6 +89,18 @@ fn with_window(id: u64, f: impl FnOnce(&mut TermWindow)) {
     with_app(|app| {
         if let Some(w) = app.windows.iter_mut().find(|w| w.id == id) {
             f(w);
+        }
+    });
+}
+
+/// Run `f` against the window holding a tab, with the tab's index in it.
+fn with_tab(tab: u64, f: impl FnOnce(&mut TermWindow, usize)) {
+    with_app(|app| {
+        for w in &mut app.windows {
+            if let Some(i) = w.tabs.iter().position(|t| t.id == tab) {
+                f(w, i);
+                return;
+            }
         }
     });
 }
@@ -222,12 +234,46 @@ define_class!(
             let f = event.modifierFlags();
             let plain_command = f.contains(NSEventModifierFlags::Command)
                 && !f.intersects(NSEventModifierFlags::Control | NSEventModifierFlags::Option);
-            let is_equals = event.charactersIgnoringModifiers().is_some_and(|c| c.to_string() == "=");
-            if plain_command && is_equals {
+            let shift = f.contains(NSEventModifierFlags::Shift);
+            let chars = event.charactersIgnoringModifiers().map(|c| c.to_string()).unwrap_or_default();
+            if plain_command && chars == "=" {
                 with_window(self.id(), |w| w.zoom_font(1.0));
                 return Bool::YES;
             }
+            // ⌘1 to ⌘8 pick a tab, ⌘9 the last one, as in Safari.
+            if plain_command && !shift {
+                if let Some(n) = chars.parse::<usize>().ok().filter(|n| (1..=9).contains(n)) {
+                    with_window(self.id(), |w| w.select_tab_number(n));
+                    return Bool::YES;
+                }
+            }
+            // ⌃⇥ and ⌃⇧⇥ step through tabs.
+            const TAB_KEY: u16 = 48;
+            if f.contains(NSEventModifierFlags::Control) && !f.contains(NSEventModifierFlags::Command) && event.keyCode() == TAB_KEY {
+                with_window(self.id(), |w| w.cycle_tab(if shift { -1 } else { 1 }));
+                return Bool::YES;
+            }
             unsafe { msg_send![super(self), performKeyEquivalent: event] }
+        }
+
+        #[unsafe(method(newTab:))]
+        fn new_tab(&self, _sender: Option<&AnyObject>) {
+            open_tab(self.id());
+        }
+
+        #[unsafe(method(tachyonCloseTab:))]
+        fn close_tab(&self, _sender: Option<&AnyObject>) {
+            close_active_tab(self.id());
+        }
+
+        #[unsafe(method(tachyonPreviousTab:))]
+        fn previous_tab(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.cycle_tab(-1));
+        }
+
+        #[unsafe(method(tachyonNextTab:))]
+        fn next_tab(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.cycle_tab(1));
         }
 
         #[unsafe(method(tachyonPreviousCommand:))]
@@ -511,6 +557,12 @@ define_class!(
         fn new_window(&self, _sender: Option<&AnyObject>) {
             open_window();
         }
+
+        /// ⌘T with no window open: a window is the first tab.
+        #[unsafe(method(newTab:))]
+        fn new_tab(&self, _sender: Option<&AnyObject>) {
+            open_window();
+        }
     }
 );
 
@@ -526,12 +578,80 @@ struct App {
     gpu: Rc<Gpu>,
     windows: Vec<TermWindow>,
     next_id: u64,
+    next_tab: u64,
     /// Where the next window's top-left corner goes, so new windows cascade.
     cascade: NSPoint,
     _delegate: Retained<AppDelegate>,
 }
 
-/// One window: its AppKit objects, renderer, and shell session.
+/// One shell session in a window.
+struct Tab {
+    id: u64,
+    term: Arc<Mutex<Term>>,
+    pty: Arc<Pty>,
+    /// Set by the reader thread when it has asked the main thread to wake;
+    /// cleared when the main thread handles it. Keeps the main queue from
+    /// filling with redundant wake-ups during a flood of output.
+    wake_pending: Arc<AtomicBool>,
+    /// What the tab is called: the running command, the folder, or a title
+    /// the program set. Refreshed when `Term::title_revision` moves.
+    label: String,
+    title_rev: u64,
+    /// A command finished here while the tab was in the background.
+    unseen: Option<Outcome>,
+    /// The window's per-tab state, kept here while another tab is in front.
+    saved: TabState,
+}
+
+/// Per-tab state the window works on directly while the tab is in front.
+struct TabState {
+    selection: Option<Selection>,
+    preedit: String,
+    mouse_held: Option<MouseButton>,
+    mouse_cell: (usize, usize),
+    scroll_accum: f64,
+    sync_since: Option<Instant>,
+}
+
+impl Default for TabState {
+    fn default() -> Self {
+        TabState {
+            selection: None,
+            preedit: String::new(),
+            mouse_held: None,
+            mouse_cell: (usize::MAX, usize::MAX),
+            scroll_accum: 0.0,
+            sync_since: None,
+        }
+    }
+}
+
+impl Tab {
+    fn start(id: u64, cfg: &Config, cols: usize, rows: usize) -> Result<Tab, String> {
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let (term, pty) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending))?;
+        Ok(Tab {
+            id,
+            term,
+            pty,
+            wake_pending,
+            label: String::new(),
+            title_rev: u64::MAX,
+            unseen: None,
+            saved: TabState::default(),
+        })
+    }
+}
+
+impl Drop for Tab {
+    fn drop(&mut self) {
+        // The reader thread holds the PTY too, so dropping ours does not end
+        // the session; hanging up does.
+        self.pty.hangup();
+    }
+}
+
+/// One window: its AppKit objects, renderer, and tabs.
 struct TermWindow {
     id: u64,
     window: Retained<NSWindow>,
@@ -539,12 +659,13 @@ struct TermWindow {
     link: Retained<CADisplayLink>,
     renderer: Renderer,
 
+    tabs: Vec<Tab>,
+    active: usize,
+    /// The tab in front's terminal and PTY, the same as `tabs[active]`'s.
     term: Arc<Mutex<Term>>,
     pty: Arc<Pty>,
-    /// Set by the reader thread when it has asked the main thread to wake;
-    /// cleared at the start of each tick. Keeps the main queue from filling
-    /// with redundant wake-ups during a flood of output.
-    wake_pending: Arc<AtomicBool>,
+    /// The window title last set, so it changes only when the label does.
+    title_shown: String,
 
     needs_redraw: bool,
     idle_ticks: u32,
@@ -552,7 +673,6 @@ struct TermWindow {
     sync_timeout: Duration,
     grid: (usize, usize),
     scroll_accum: f64,
-    title_rev: u64,
     buttons_visible: bool,
     focused: bool,
 
@@ -576,10 +696,8 @@ struct TermWindow {
 impl Drop for TermWindow {
     fn drop(&mut self) {
         // A display link retains its target; invalidate it or the view leaks.
+        // Dropping the tabs hangs up their shells.
         self.link.invalidate();
-        // The reader thread holds the PTY too, so dropping ours does not end
-        // the session; hanging up does.
-        self.pty.hangup();
     }
 }
 
@@ -595,7 +713,7 @@ impl TermWindow {
     }
 
     fn tick(&mut self) {
-        self.wake_pending.store(false, Ordering::Release);
+        self.tabs[self.active].wake_pending.store(false, Ordering::Release);
 
         let (dirty, syncing, title_rev) = {
             let mut t = self.term.lock();
@@ -604,13 +722,8 @@ impl TermWindow {
         if dirty {
             self.needs_redraw = true;
         }
-        if title_rev != self.title_rev {
-            self.title_rev = title_rev;
-            let title = self.term.lock().title.clone().unwrap_or_default();
-            let title = if title.is_empty() { "Tachyon".to_string() } else { title };
-            // Hidden in the title bar, but it names the window in the Window
-            // menu, Mission Control and the ⌘` cycle.
-            self.window.setTitle(&NSString::from_str(&title));
+        if title_rev != self.tabs[self.active].title_rev {
+            self.refresh_label(self.active);
         }
 
         // Synchronised output (mode 2026): hold the frame while an app is
@@ -632,6 +745,12 @@ impl TermWindow {
             let selection = self.selection.and_then(|s| s.range(&term));
             let mut decor = command_decor(&term);
             decor.preedit = self.preedit.clone();
+            if self.tabs.len() > 1 {
+                decor.strip = Some(Strip {
+                    tabs: self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect(),
+                    active: self.active,
+                });
+            }
             self.renderer.draw(&term, self.focused, selection, blink, &decor);
             let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
             drop(term);
@@ -646,16 +765,21 @@ impl TermWindow {
         }
     }
 
-    /// A command finished. If it ran a while and the window is not in front,
-    /// bounce the Dock icon once.
-    fn command_finished(&mut self, cmd: u32) {
+    /// A command finished in tab `i`. A background tab gets a mark in the
+    /// tab strip; if it ran a while and the window is not in front, the Dock
+    /// icon bounces once.
+    fn command_finished(&mut self, i: usize, cmd: u32) {
+        let (long, outcome) = {
+            let term = self.tabs[i].term.lock();
+            let info = term.command(cmd);
+            let long = info.and_then(|c| c.elapsed()).is_some_and(|d| d >= Duration::from_secs(10));
+            let failed = info.and_then(|c| c.exit).is_some_and(|e| e != 0);
+            (long, if failed { Outcome::Failed } else { Outcome::Succeeded })
+        };
+        if i != self.active {
+            self.tabs[i].unseen = Some(outcome);
+        }
         self.request_redraw();
-        let long = self
-            .term
-            .lock()
-            .command(cmd)
-            .and_then(|c| c.elapsed())
-            .is_some_and(|d| d >= Duration::from_secs(10));
         if long && !self.window.isKeyWindow() {
             if let Some(mtm) = MainThreadMarker::new() {
                 NSApplication::sharedApplication(mtm)
@@ -703,6 +827,131 @@ impl TermWindow {
         self.resume();
     }
 
+    /// Output arrived in a tab that is not in front. Its screen is drawn when
+    /// it comes forward; only its name in the strip may need redrawing now.
+    fn background_output(&mut self, i: usize) {
+        self.tabs[i].wake_pending.store(false, Ordering::Release);
+        let rev = self.tabs[i].term.lock().title_revision;
+        if rev != self.tabs[i].title_rev {
+            self.refresh_label(i);
+        }
+    }
+
+    /// Rename tab `i` from its terminal, and the window if it is in front.
+    fn refresh_label(&mut self, i: usize) {
+        let (label, rev) = {
+            let term = self.tabs[i].term.lock();
+            (tab_label(&term), term.title_revision)
+        };
+        let tab = &mut self.tabs[i];
+        tab.title_rev = rev;
+        if tab.label != label {
+            tab.label = label;
+            if self.tabs.len() > 1 {
+                self.request_redraw();
+            }
+        }
+        if i == self.active && self.tabs[i].label != self.title_shown {
+            self.title_shown = self.tabs[i].label.clone();
+            // Hidden in the title bar, but it names the window in the Window
+            // menu, Mission Control and the ⌘` cycle.
+            self.window.setTitle(&NSString::from_str(&self.title_shown));
+        }
+    }
+
+    /// Bring tab `i` to the front.
+    fn switch_to(&mut self, i: usize) {
+        if i >= self.tabs.len() || i == self.active {
+            return;
+        }
+        self.save_live();
+        self.active = i;
+        self.load_live();
+    }
+
+    /// ⌘1 to ⌘8 pick that tab; ⌘9 picks the last.
+    fn select_tab_number(&mut self, n: usize) {
+        let i = if n == 9 { self.tabs.len() - 1 } else { n - 1 };
+        self.switch_to(i);
+    }
+
+    /// The next (`1`) or previous (`-1`) tab, wrapping around.
+    fn cycle_tab(&mut self, step: isize) {
+        let n = self.tabs.len() as isize;
+        if n > 1 {
+            self.switch_to((self.active as isize + step).rem_euclid(n) as usize);
+        }
+    }
+
+    /// Insert a started tab to the right of the one in front, and show it.
+    fn add_tab(&mut self, tab: Tab) {
+        self.tabs.insert(self.active + 1, tab);
+        self.switch_to(self.active + 1);
+        // The strip appears with the second tab, taking a row from the grid.
+        self.layout();
+    }
+
+    /// Close tab `i`, which must not be the last one. The tab to its right
+    /// comes forward, as in Safari, or the one to its left at the end.
+    fn remove_tab(&mut self, i: usize) {
+        if i == self.active {
+            // Its live state goes with it.
+            self.tabs.remove(i);
+            self.active = i.min(self.tabs.len() - 1);
+            self.load_live();
+        } else {
+            self.tabs.remove(i);
+            if i < self.active {
+                self.active -= 1;
+            }
+        }
+        self.layout();
+    }
+
+    /// Park the per-tab state of the tab in front in it.
+    fn save_live(&mut self) {
+        let saved = TabState {
+            selection: self.selection.take(),
+            preedit: std::mem::take(&mut self.preedit),
+            mouse_held: self.mouse_held.take(),
+            mouse_cell: self.mouse_cell,
+            scroll_accum: self.scroll_accum,
+            sync_since: self.sync_since.take(),
+        };
+        self.tabs[self.active].saved = saved;
+    }
+
+    /// Take up the per-tab state of the tab now in front.
+    fn load_live(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        let s = std::mem::take(&mut tab.saved);
+        tab.unseen = None;
+        self.term = Arc::clone(&tab.term);
+        self.pty = Arc::clone(&tab.pty);
+        self.selection = s.selection;
+        self.preedit = s.preedit;
+        self.mouse_held = s.mouse_held;
+        self.mouse_cell = s.mouse_cell;
+        self.scroll_accum = s.scroll_accum;
+        self.sync_since = s.sync_since;
+        // The cursor layer shows the old tab's cursor until redrawn.
+        self.cursor_shown = None;
+        self.refresh_label(self.active);
+        self.request_redraw();
+    }
+
+    /// The tab under a mouse event in the tab strip, if it is there.
+    fn strip_hit(&self, event: &NSEvent) -> Option<usize> {
+        if self.tabs.len() < 2 {
+            return None;
+        }
+        let p = self.view.convertPoint_fromView(event.locationInWindow(), None);
+        let scale = self.scale() as f32;
+        let height = self.view.bounds().size.height as f32;
+        self.renderer
+            .strip_index(p.x as f32 * scale, (height - p.y as f32) * scale, self.tabs.len())
+    }
+
     /// The view changed size: resize the drawable, and the grid if a whole
     /// cell more or fewer now fits.
     fn layout(&mut self) {
@@ -711,12 +960,16 @@ impl TermWindow {
         let (w, h) = ((bounds.size.width * scale) as f32, (bounds.size.height * scale) as f32);
         self.renderer.resize(w, h);
 
+        self.renderer.set_strip(self.tabs.len() > 1);
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
             crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
             self.grid = grid;
-            self.term.lock().resize(grid.0, grid.1);
-            self.pty.resize(grid.0 as u16, grid.1 as u16);
+            // Every tab, so one brought forward is already the right size.
+            for tab in &self.tabs {
+                tab.term.lock().resize(grid.0, grid.1);
+                tab.pty.resize(grid.0 as u16, grid.1 as u16);
+            }
         }
         self.update_resize_increments();
         self.request_redraw();
@@ -754,6 +1007,11 @@ impl TermWindow {
         // Mid-composition, every key belongs to the input method.
         if !self.preedit.is_empty() {
             return true;
+        }
+        // ⌃⇥ normally arrives as a key equivalent; this catches it if not.
+        if flags.contains(NSEventModifierFlags::Control) && event.keyCode() == 48 {
+            self.cycle_tab(if flags.contains(NSEventModifierFlags::Shift) { -1 } else { 1 });
+            return false;
         }
         let mods = input::Mods {
             shift: flags.contains(NSEventModifierFlags::Shift),
@@ -960,6 +1218,15 @@ impl TermWindow {
     }
 
     fn mouse_down(&mut self, event: &NSEvent, button: MouseButton) {
+        // The tab strip: click a tab to show it, middle-click to close it.
+        if let Some(i) = self.strip_hit(event) {
+            match button {
+                MouseButton::Left => self.switch_to(i),
+                MouseButton::Middle => self.remove_tab(i),
+                _ => {}
+            }
+            return;
+        }
         // Moving the window: ⌃⌘-drag anywhere, or a drag on the top edge.
         if button == MouseButton::Left {
             let f = event.modifierFlags();
@@ -1114,6 +1381,42 @@ impl TermWindow {
         CATransaction::commit();
         self.cursor_shown = overlay;
     }
+}
+
+/// What a tab is called. While a command runs: a title it set, or else its
+/// command line. At a prompt: the shell's own title if it sets one, or else
+/// the folder. Titles a finished program left behind are ignored, so a tab
+/// doesn't stay called "vim" after vim exits.
+fn tab_label(term: &Term) -> String {
+    let running = term
+        .current_command()
+        .filter(|&id| term.command(id).is_some_and(|c| c.state == CommandState::Running));
+    let title = term.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    if let Some(t) = title {
+        if term.title_cmd.is_none() || (running.is_some() && term.title_cmd == running) {
+            return t.to_string();
+        }
+    }
+    if let Some(cmdline) = running.and_then(|id| term.command(id)).and_then(|c| c.cmdline.as_deref()) {
+        return cmdline.to_string();
+    }
+    if let Some(cwd) = term.cwd.as_deref() {
+        return short_path(cwd);
+    }
+    title.unwrap_or("Tachyon").to_string()
+}
+
+/// A folder as a tab shows it: `~` for home, otherwise its own name.
+fn short_path(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return "/".into();
+    }
+    if !home.is_empty() && path == home.trim_end_matches('/') {
+        return "~".into();
+    }
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 /// Gutter bars and receipts for the rows on screen. Each row belongs to the
@@ -1323,8 +1626,10 @@ impl App {
             self.cascade = window.cascadeTopLeftFromPoint(self.cascade);
         }
 
-        let wake_pending = Arc::new(AtomicBool::new(false));
-        let (term, pty) = start_session(id, cfg, cfg.window.cols, cfg.window.rows, Arc::clone(&wake_pending))?;
+        let tab_id = self.next_tab;
+        self.next_tab += 1;
+        let tab = Tab::start(tab_id, cfg, cfg.window.cols, cfg.window.rows)?;
+        let (term, pty) = (Arc::clone(&tab.term), Arc::clone(&tab.pty));
 
         let link = unsafe { view.displayLinkWithTarget_selector(&view, sel!(tick:)) };
         unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
@@ -1335,16 +1640,17 @@ impl App {
             view: view.clone(),
             link,
             renderer,
+            tabs: vec![tab],
+            active: 0,
             term,
             pty,
-            wake_pending,
+            title_shown: String::new(),
             needs_redraw: true,
             idle_ticks: 0,
             sync_since: None,
             sync_timeout: Duration::from_millis(cfg.render.sync_timeout_ms),
             grid: (0, 0),
             scroll_accum: 0.0,
-            title_rev: u64::MAX,
             buttons_visible: false,
             focused: true,
             selection: None,
@@ -1358,6 +1664,44 @@ impl App {
             _delegate: delegate,
         });
         Ok((window, view, id))
+    }
+
+    /// Start a shell in a new tab of window `window`.
+    fn new_tab(&mut self, window: u64) -> Result<(), String> {
+        let tab_id = self.next_tab;
+        self.next_tab += 1;
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == window) else {
+            return Ok(());
+        };
+        let (cols, rows) = w.grid;
+        let tab = Tab::start(tab_id, &self.cfg, cols.max(1), rows.max(1))?;
+        w.add_tab(tab);
+        Ok(())
+    }
+}
+
+/// ⌘T: a new tab in this window.
+fn open_tab(window: u64) {
+    if let Some(Err(e)) = with_app(|app| app.new_tab(window)) {
+        crate::log::force(&format!("could not open a tab: {e}"));
+    }
+}
+
+/// ⌘W: close the tab in front, or the window with its last tab.
+fn close_active_tab(window: u64) {
+    let last = with_app(|app| {
+        let w = app.windows.iter_mut().find(|w| w.id == window)?;
+        if w.tabs.len() == 1 {
+            return Some(w.window.clone());
+        }
+        let i = w.active;
+        w.remove_tab(i);
+        None
+    })
+    .flatten();
+    // Outside the borrow: closing calls back into the window delegate.
+    if let Some(window) = last {
+        window.performClose(None);
     }
 }
 
@@ -1381,13 +1725,20 @@ fn open_window() {
     }
 }
 
-/// Close a window whose shell exited, the way Terminal.app does by default.
-fn close_window(id: u64) {
-    let window = APP.with(|cell| {
-        let guard = cell.try_borrow().ok()?;
-        guard.as_ref()?.windows.iter().find(|w| w.id == id).map(|w| w.window.clone())
-    });
-    // `close` sends windowWillClose:, which removes the session.
+/// A tab's shell exited: close the tab, or its window if it was the last
+/// one, the way Terminal.app does by default.
+fn shell_exited(tab: u64) {
+    let window = with_app(|app| {
+        let w = app.windows.iter_mut().find(|w| w.tabs.iter().any(|t| t.id == tab))?;
+        if w.tabs.len() == 1 {
+            return Some(w.window.clone());
+        }
+        let i = w.tabs.iter().position(|t| t.id == tab)?;
+        w.remove_tab(i);
+        None
+    })
+    .flatten();
+    // `close` sends windowWillClose:, which removes the window's state.
     if let Some(window) = window {
         window.close();
     }
@@ -1422,8 +1773,12 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     submenu(&main, &app_menu);
 
     let file = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Shell"));
+    item(&file, "New Tab", sel!(newTab:), "t");
     item(&file, "New Window", sel!(newWindow:), "n");
-    item(&file, "Close Window", sel!(performClose:), "w");
+    file.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&file, "Close Tab", sel!(tachyonCloseTab:), "w");
+    // A capital letter means Shift as well: ⌘⇧W.
+    item(&file, "Close Window", sel!(performClose:), "W");
     submenu(&main, &file);
 
     let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Edit"));
@@ -1446,6 +1801,10 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let window = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Window"));
     item(&window, "Minimize", sel!(performMiniaturize:), "m");
     item(&window, "Zoom", sel!(performZoom:), "");
+    window.addItem(&NSMenuItem::separatorItem(mtm));
+    // "{" and "}" are ⌘⇧[ and ⌘⇧], as in Safari and Terminal.
+    item(&window, "Show Previous Tab", sel!(tachyonPreviousTab:), "{");
+    item(&window, "Show Next Tab", sel!(tachyonNextTab:), "}");
     submenu(&main, &window);
     app.setWindowsMenu(Some(&window));
 
@@ -1469,7 +1828,7 @@ fn start_session(
         Some(dir) if cfg.shell.integration => pty::zsh_integration_env(&program, &dir),
         _ => Vec::new(),
     };
-    crate::log!("window {id}: spawning `{program}` {:?} at {cols}x{rows}, integration: {}", cfg.shell.args, !extra_env.is_empty());
+    crate::log!("tab {id}: spawning `{program}` {:?} at {cols}x{rows}, integration: {}", cfg.shell.args, !extra_env.is_empty());
     let pty = Arc::new(
         Pty::spawn(cols as u16, rows as u16, &program, &cfg.shell.args, login, &extra_env)
             .map_err(|e| format!("could not start {program}: {e}"))?,
@@ -1485,7 +1844,13 @@ fn start_session(
             // Receipts: the sampler wakes the window while a command runs so
             // its elapsed time stays current.
             let sampler = receipts::Sampler::spawn(move || {
-                DispatchQueue::main().exec_async(move || with_window(id, TermWindow::request_redraw));
+                DispatchQueue::main().exec_async(move || {
+                    with_tab(id, |w, i| {
+                        if i == w.active {
+                            w.request_redraw();
+                        }
+                    })
+                });
             });
             let shell = reader_pty.pid();
             let mut cpu_at_start: FxHashMap<u32, Option<Duration>> = FxHashMap::default();
@@ -1498,7 +1863,7 @@ fn start_session(
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
-                        crate::log!("window {id}: pty read failed: {e}");
+                        crate::log!("tab {id}: pty read failed: {e}");
                         break;
                     }
                 };
@@ -1527,15 +1892,23 @@ fn start_session(
                                 .map(|(a, b)| b.saturating_sub(a));
                             let receipt = sampler.finish(cpu);
                             reader_term.lock().set_receipt(cmd, receipt);
-                            DispatchQueue::main().exec_async(move || with_window(id, |w| w.command_finished(cmd)));
+                            DispatchQueue::main().exec_async(move || with_tab(id, |w, i| w.command_finished(i, cmd)));
                         }
                     }
                 }
                 if !wake_pending.swap(true, Ordering::AcqRel) {
-                    DispatchQueue::main().exec_async(move || with_window(id, TermWindow::resume));
+                    DispatchQueue::main().exec_async(move || {
+                        with_tab(id, |w, i| {
+                            if i == w.active {
+                                w.resume();
+                            } else {
+                                w.background_output(i);
+                            }
+                        })
+                    });
                 }
             }
-            DispatchQueue::main().exec_async(move || close_window(id));
+            DispatchQueue::main().exec_async(move || shell_exited(id));
         })
         .map_err(|e| format!("could not start the reader thread: {e}"))?;
 
@@ -1561,8 +1934,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     if let Some(icon) = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(ICON_SVG)) {
         unsafe { app.setApplicationIconImage(Some(&icon)) };
     }
-    // Native window tabs would merge our windows behind a tab bar we hide;
-    // Tachyon's own tabs come later.
+    // Native window tabs would merge our windows behind a title bar we hide;
+    // Tachyon draws its own tab strip.
     NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
     // A double-click on a title bar fills the screen (or zooms, or
     // minimises), per the system setting. Tachyon's title bar is invisible and
@@ -1587,6 +1960,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
             gpu,
             windows: Vec::new(),
             next_id: 1,
+            next_tab: 1,
             cascade: NSPoint::new(0.0, 0.0),
             _delegate: delegate,
         });
@@ -1600,4 +1974,48 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
     APP.with(|cell| cell.borrow_mut().take());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{short_path, tab_label};
+    use crate::term::{Processor, Term};
+
+    fn term_after(script: &str) -> Term {
+        let mut t = Term::new(40, 10, 100);
+        Processor::new().advance(&mut t, script.as_bytes());
+        t
+    }
+
+    #[test]
+    fn a_tab_is_named_after_its_folder_then_its_command() {
+        let home = std::env::var("HOME").unwrap();
+        let at_prompt = format!("\x1b]133;A\x07\x1b]7;file://h{home}/Github/Tachyon\x07$ \x1b]133;B\x07");
+        let t = term_after(&at_prompt);
+        assert_eq!(tab_label(&t), "Tachyon");
+
+        let running = format!("{at_prompt}\x1b]133;C;cmdline=python train.py\x07");
+        assert_eq!(tab_label(&term_after(&running)), "python train.py");
+
+        // A title the program sets while it runs wins, and is dropped once it
+        // exits.
+        let vim = format!("{at_prompt}\x1b]133;C;cmdline=vim\x07\x1b]2;main.rs - VIM\x07");
+        assert_eq!(tab_label(&term_after(&vim)), "main.rs - VIM");
+        let after = format!("{vim}\x1b]133;D;0\x07\x1b]133;A\x07");
+        assert_eq!(tab_label(&term_after(&after)), "Tachyon");
+    }
+
+    #[test]
+    fn without_integration_the_title_names_the_tab() {
+        assert_eq!(tab_label(&term_after("\x1b]2;remote host\x07")), "remote host");
+        assert_eq!(tab_label(&term_after("")), "Tachyon");
+    }
+
+    #[test]
+    fn folders_shorten() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(short_path(&home), "~");
+        assert_eq!(short_path("/"), "/");
+        assert_eq!(short_path("/usr/local/bin/"), "bin");
+    }
 }
