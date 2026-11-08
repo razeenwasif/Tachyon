@@ -232,6 +232,10 @@ Being explicit about these rather than leaving them to be discovered:
 - Colour glyphs that use `paletteIndex 0xFFFF` (meaning "tint with the text
   colour") render white. Rare outside icon fonts.
 
+What comes next is sketched in [docs/NEXT.md](docs/NEXT.md): a macOS backend
+for Apple silicon, and how the shaping and split-pane gaps get closed. It is a
+concept, not a commitment.
+
 ## Debugging
 
 Two environment variables, both built for diagnosing this thing during
