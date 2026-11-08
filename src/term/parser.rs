@@ -117,7 +117,62 @@ pub fn scan_printable_ascii(b: &[u8]) -> usize {
             return unsafe { scan_avx2(b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is part of the aarch64 baseline: no runtime check needed.
+        return scan_neon(b);
+    }
+    #[allow(unreachable_code)]
     scan_swar(b)
+}
+
+/// Apple Silicon / aarch64: 32 bytes per step as two 16-byte vectors.
+///
+/// Same range trick as AVX2 -- subtract 0x20 so one unsigned compare against
+/// 0x5E decides membership. The common case, a whole step of printable text,
+/// is answered by a single horizontal minimum (`vminvq_u8`): if every lane is
+/// 0xFF there is nothing to find. Only the step containing the stop byte pays
+/// for locating it. NEON has no `movemask`; narrowing each 16-bit lane by 4
+/// bits (`vshrn_n_u16`) packs the 16-byte mask into 64 bits, four bits per
+/// byte, and the first clear nibble is the answer.
+#[cfg(target_arch = "aarch64")]
+fn scan_neon(b: &[u8]) -> usize {
+    use core::arch::aarch64::*;
+
+    let n = b.len();
+    let mut i = 0usize;
+    // SAFETY: every load reads 16 bytes starting at `i` or `i + 16`, and the
+    // loop condition keeps `i + 32 <= n`.
+    unsafe {
+        let bias = vdupq_n_u8(0x20);
+        let limit = vdupq_n_u8(0x5E);
+        let first_bad = |ok: uint8x16_t| -> usize {
+            let packed = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(ok))));
+            ((!packed).trailing_zeros() / 4) as usize
+        };
+        while i + 32 <= n {
+            let a = vld1q_u8(b.as_ptr().add(i));
+            let c = vld1q_u8(b.as_ptr().add(i + 16));
+            let ok_a = vcleq_u8(vsubq_u8(a, bias), limit);
+            let ok_c = vcleq_u8(vsubq_u8(c, bias), limit);
+            if vminvq_u8(vandq_u8(ok_a, ok_c)) != 0xFF {
+                if vminvq_u8(ok_a) != 0xFF {
+                    return i + first_bad(ok_a);
+                }
+                return i + 16 + first_bad(ok_c);
+            }
+            i += 32;
+        }
+        if i + 16 <= n {
+            let a = vld1q_u8(b.as_ptr().add(i));
+            let ok_a = vcleq_u8(vsubq_u8(a, bias), limit);
+            if vminvq_u8(ok_a) != 0xFF {
+                return i + first_bad(ok_a);
+            }
+            i += 16;
+        }
+    }
+    i + scan_swar(&b[i..])
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -203,6 +258,8 @@ mod tests {
                 v.extend_from_slice(b"trailing");
                 assert_eq!(scan_printable_ascii(&v), prefix, "bad={bad:#04x} prefix={prefix}");
                 assert_eq!(scan_swar(&v), prefix, "swar bad={bad:#04x} prefix={prefix}");
+                #[cfg(target_arch = "aarch64")]
+                assert_eq!(scan_neon(&v), prefix, "neon bad={bad:#04x} prefix={prefix}");
                 assert_eq!(scan_ref(&v), prefix);
             }
         }
@@ -248,6 +305,8 @@ mod tests {
             let want = scan_ref(&buf);
             assert_eq!(scan_printable_ascii(&buf), want, "buf={buf:?}");
             assert_eq!(scan_swar(&buf), want, "swar buf={buf:?}");
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(scan_neon(&buf), want, "neon buf={buf:?}");
         }
     }
 }

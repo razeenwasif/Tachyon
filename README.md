@@ -101,6 +101,13 @@ and block elements are drawn as rectangles, so borders and progress bars meet
 exactly. Nerd Font icons come from any installed Nerd Font. The font defaults
 to Cascadia Mono and falls back to SF Mono when it is not installed.
 
+On an M2 Pro (`cargo test --release --test throughput -- --ignored
+--nocapture`): plain ASCII 657–662 MiB/s, a colour-escaped build log 291–296
+MiB/s, a full-screen TUI redraw 244–247 MiB/s; the NEON ground-state scanner runs
+at about 14 GiB/s. Scrollback lines are packed (one byte per ASCII character
+plus style runs), so 100,000 lines of build output take about 7x less memory
+than full-width rows -- see [docs/NEXT.md](docs/NEXT.md) for the measurements.
+
 Configuration is read from `~/.config/Tachyon/tachyon.conf`, in the same format
 as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 
