@@ -19,6 +19,7 @@ mod boxdraw;
 mod font;
 mod input;
 mod pty;
+mod receipts;
 mod renderer;
 mod selection;
 
@@ -35,11 +36,12 @@ use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThrea
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuItem, NSPasteboard,
-    NSPasteboardTypeString, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
-    NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSPasteboardTypeString, NSRequestUserAttentionType, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSTextInputClient, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSUserDefaults, NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop,
+    NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSNotFound, NSRange, NSUserDefaults, NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop,
     NSRunLoopCommonModes, NSSize, NSString,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -54,10 +56,11 @@ use objc2_quartz_core::{
 use parking_lot::Mutex;
 
 use crate::config::{Config, OptionAsMeta};
-use crate::term::{Processor, Term, TermMode};
+use crate::term::{CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
+use rustc_hash::FxHashMap;
 use pty::Pty;
 use input::{MouseButton, MouseEventKind};
-use renderer::{CursorOverlay, Gpu, Renderer};
+use renderer::{CursorOverlay, Decor, Gpu, Outcome, Renderer};
 use selection::{Pos, Selection, Unit};
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/icon/tachyon.svg");
@@ -88,6 +91,23 @@ fn with_window(id: u64, f: impl FnOnce(&mut TermWindow)) {
             f(w);
         }
     });
+}
+
+/// Like `with_window`, returning what `f` returns.
+fn query_window<R>(id: u64, f: impl FnOnce(&mut TermWindow) -> R) -> Option<R> {
+    with_app(|app| app.windows.iter_mut().find(|w| w.id == id).map(f)).flatten()
+}
+
+/// The text of an `insertText:` / `setMarkedText:` argument, which AppKit
+/// passes as either an NSString or an NSAttributedString.
+fn input_string(obj: &AnyObject) -> String {
+    if let Some(a) = obj.downcast_ref::<NSAttributedString>() {
+        a.string().to_string()
+    } else if let Some(s) = obj.downcast_ref::<NSString>() {
+        s.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Per-instance storage for the Objective-C classes: which window they serve.
@@ -210,6 +230,16 @@ define_class!(
             unsafe { msg_send![super(self), performKeyEquivalent: event] }
         }
 
+        #[unsafe(method(tachyonPreviousCommand:))]
+        fn previous_command(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.jump_command(true));
+        }
+
+        #[unsafe(method(tachyonNextCommand:))]
+        fn next_command(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.jump_command(false));
+        }
+
         #[unsafe(method(tachyonBiggerFont:))]
         fn bigger_font(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.zoom_font(1.0));
@@ -238,7 +268,12 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            with_window(self.id(), |w| w.key_down(event));
+            // Keys for the input system go through interpretKeyEvents, outside
+            // the window borrow: it calls straight back into insertText: and
+            // setMarkedText: below.
+            if query_window(self.id(), |w| w.key_down(event)).unwrap_or(false) {
+                self.interpretKeyEvents(&NSArray::from_slice(&[event]));
+            }
         }
 
         #[unsafe(method(scrollWheel:))]
@@ -269,6 +304,75 @@ define_class!(
         #[unsafe(method(tick:))]
         fn tick(&self, _link: &CADisplayLink) {
             with_window(self.id(), TermWindow::tick);
+        }
+    }
+
+    /// The text-input protocol: how dead keys (Option-E then E gives é) and
+    /// input methods (Japanese, Chinese, Korean) reach the terminal. Committed
+    /// text goes to the shell; text still being composed is shown at the
+    /// cursor until it is committed.
+    unsafe impl NSTextInputClient for TachyonView {
+        #[unsafe(method(insertText:replacementRange:))]
+        fn insert_text(&self, string: &AnyObject, _range: NSRange) {
+            let text = input_string(string);
+            with_window(self.id(), |w| w.type_text(&text));
+        }
+
+        #[unsafe(method(doCommandBySelector:))]
+        fn do_command_by_selector(&self, _selector: Sel) {
+            // Editing commands (moveLeft:, insertNewline: ...) come from keys
+            // Tachyon already sends to the shell itself.
+        }
+
+        #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
+        fn set_marked_text(&self, string: &AnyObject, _selected: NSRange, _replace: NSRange) {
+            let text = input_string(string);
+            with_window(self.id(), |w| w.set_preedit(text));
+        }
+
+        #[unsafe(method(unmarkText))]
+        fn unmark_text(&self) {
+            with_window(self.id(), |w| w.set_preedit(String::new()));
+        }
+
+        #[unsafe(method(selectedRange))]
+        fn selected_range(&self) -> NSRange {
+            NSRange::new(NSNotFound as usize, 0)
+        }
+
+        #[unsafe(method(markedRange))]
+        fn marked_range(&self) -> NSRange {
+            match query_window(self.id(), |w| w.preedit.encode_utf16().count()) {
+                Some(n) if n > 0 => NSRange::new(0, n),
+                _ => NSRange::new(NSNotFound as usize, 0),
+            }
+        }
+
+        #[unsafe(method(hasMarkedText))]
+        fn has_marked_text(&self) -> bool {
+            query_window(self.id(), |w| !w.preedit.is_empty()).unwrap_or(false)
+        }
+
+        #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
+        fn attributed_substring(&self, _range: NSRange, _actual: *mut NSRange) -> Option<Retained<NSAttributedString>> {
+            None
+        }
+
+        #[unsafe(method_id(validAttributesForMarkedText))]
+        fn valid_attributes(&self) -> Retained<NSArray<NSAttributedStringKey>> {
+            NSArray::new()
+        }
+
+        /// Where the input method's candidate window should appear: under
+        /// the cursor, in screen coordinates.
+        #[unsafe(method(firstRectForCharacterRange:actualRange:))]
+        fn first_rect(&self, _range: NSRange, _actual: *mut NSRange) -> NSRect {
+            query_window(self.id(), TermWindow::cursor_screen_rect).unwrap_or(NSRect::ZERO)
+        }
+
+        #[unsafe(method(characterIndexForPoint:))]
+        fn character_index(&self, _point: NSPoint) -> usize {
+            NSNotFound as usize
         }
     }
 );
@@ -453,6 +557,8 @@ struct TermWindow {
     focused: bool,
 
     selection: Option<Selection>,
+    /// Text an input method is composing, shown at the cursor until committed.
+    preedit: String,
     /// A button an application is tracking: it is owed motion and a release.
     mouse_held: Option<MouseButton>,
     /// Last cell reported to the application, so motion is sent per cell.
@@ -524,7 +630,9 @@ impl TermWindow {
             let term = self.term.lock();
             let blink = self.focused && term.cursor_state().blinking;
             let selection = self.selection.and_then(|s| s.range(&term));
-            self.renderer.draw(&term, self.focused, selection, blink);
+            let mut decor = command_decor(&term);
+            decor.preedit = self.preedit.clone();
+            self.renderer.draw(&term, self.focused, selection, blink, &decor);
             let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
             drop(term);
             self.update_cursor_layer(overlay);
@@ -536,6 +644,58 @@ impl TermWindow {
                 self.link.setPaused(true);
             }
         }
+    }
+
+    /// A command finished. If it ran a while and the window is not in front,
+    /// bounce the Dock icon once.
+    fn command_finished(&mut self, cmd: u32) {
+        self.request_redraw();
+        let long = self
+            .term
+            .lock()
+            .command(cmd)
+            .and_then(|c| c.elapsed())
+            .is_some_and(|d| d >= Duration::from_secs(10));
+        if long && !self.window.isKeyWindow() {
+            if let Some(mtm) = MainThreadMarker::new() {
+                NSApplication::sharedApplication(mtm)
+                    .requestUserAttention(NSRequestUserAttentionType::InformationalRequest);
+            }
+        }
+    }
+
+    /// ⌘↑ / ⌘↓: scroll so the previous or next command's prompt is at the top.
+    fn jump_command(&mut self, up: bool) {
+        {
+            let mut t = self.term.lock();
+            let g = t.grid();
+            let hist = g.history_len();
+            let first = hist - g.display_offset();
+            // The start of a command's prompt, which may be a line or two
+            // above where typing started.
+            let prompt_of = |l: usize| {
+                let cmd = g.mark(l).cmd;
+                (l.saturating_sub(4)..=l)
+                    .find(|&p| g.mark(p).cmd == cmd && g.mark(p).has(RowMark::PROMPT))
+                    .unwrap_or(l)
+            };
+            let is_input = |l: &usize| g.mark(*l).has(RowMark::INPUT);
+            let target = if up {
+                (0..first).rev().filter(is_input).map(prompt_of).find(|&p| p < first)
+            } else {
+                // Skip the command already at the top: its input line is just
+                // below its own prompt.
+                (first + 1..g.total_lines()).filter(is_input).map(prompt_of).find(|&p| p > first)
+            };
+            let offset = match target {
+                Some(l) => hist.saturating_sub(l),
+                None if !up => 0,
+                None => return,
+            };
+            let delta = offset as isize - g.display_offset() as isize;
+            t.scroll_display(delta);
+        }
+        self.request_redraw();
     }
 
     fn request_redraw(&mut self) {
@@ -582,12 +742,18 @@ impl TermWindow {
         self.request_redraw();
     }
 
-    fn key_down(&mut self, event: &NSEvent) {
+    /// Handle a key press. Returns true when it should go to the input
+    /// system instead (ordinary typing, dead keys, input methods).
+    fn key_down(&mut self, event: &NSEvent) -> bool {
         let flags = event.modifierFlags();
         if flags.contains(NSEventModifierFlags::Command) {
             // Command shortcuts belong to the menu bar; one that reaches us
             // has no binding.
-            return;
+            return false;
+        }
+        // Mid-composition, every key belongs to the input method.
+        if !self.preedit.is_empty() {
+            return true;
         }
         let mods = input::Mods {
             shift: flags.contains(NSEventModifierFlags::Shift),
@@ -609,6 +775,12 @@ impl TermWindow {
             OptionAsMeta::Left => raw & LEFT_OPTION != 0,
             OptionAsMeta::Right => raw & RIGHT_OPTION != 0,
         };
+        // Plain typing goes through the input system, so dead keys compose and
+        // input methods work. Keys the shell needs exactly come straight here.
+        let direct = input::is_shell_key(event.keyCode()) || mods.ctrl || (mods.option && meta);
+        if !direct {
+            return true;
+        }
         let mode = self.term.lock().mode;
         if let Some(bytes) = input::encode(event.keyCode(), &chars, &bare, mods, mode, meta) {
             self.term.lock().scroll_to_bottom();
@@ -620,6 +792,45 @@ impl TermWindow {
             // Typing restarts the blink in its visible phase.
             self.cursor_shown = None;
         }
+        false
+    }
+
+    /// Text committed by the input system: typed characters, a composed
+    /// accent, or an input method's conversion.
+    fn type_text(&mut self, text: &str) {
+        self.preedit.clear();
+        if text.is_empty() {
+            self.request_redraw();
+            return;
+        }
+        self.term.lock().scroll_to_bottom();
+        let _ = self.pty.write(text.as_bytes());
+        NSCursor::setHiddenUntilMouseMoves(true);
+        self.selection = None;
+        self.cursor_shown = None;
+        self.request_redraw();
+    }
+
+    fn set_preedit(&mut self, text: String) {
+        if text != self.preedit {
+            self.preedit = text;
+            self.request_redraw();
+        }
+    }
+
+    /// The cursor cell in screen coordinates, for placing an input method's
+    /// candidate window.
+    fn cursor_screen_rect(&mut self) -> NSRect {
+        let c = self.term.lock().cursor_state();
+        let m = self.renderer.metrics();
+        let (pad_x, pad_y) = self.renderer.padding();
+        let s = self.scale();
+        let h = self.view.bounds().size.height;
+        let x = (pad_x + c.x as f32 * m.width) as f64 / s;
+        let top = (pad_y + c.y as f32 * m.height) as f64 / s;
+        let cell_h = m.height as f64 / s;
+        let in_view = NSRect::new(NSPoint::new(x, h - top - cell_h), NSSize::new(m.width as f64 / s, cell_h));
+        self.window.convertRectToScreen(self.view.convertRect_toView(in_view, None))
     }
 
     fn paste(&mut self) {
@@ -905,6 +1116,57 @@ impl TermWindow {
     }
 }
 
+/// Gutter bars and receipts for the rows on screen. Each row belongs to the
+/// command whose prompt is the nearest one at or above it.
+fn command_decor(term: &Term) -> Decor {
+    let g = term.grid();
+    let first = g.history_len() - g.display_offset();
+    let mut decor = Decor::default();
+
+    // The command owning the top row may have started above the viewport.
+    let mut owner = (first.saturating_sub(5000)..first)
+        .rev()
+        .map(|l| g.mark(l))
+        .find(|m| m.has(RowMark::PROMPT) || m.has(RowMark::INPUT))
+        .map(|m| m.cmd);
+
+    for y in 0..term.rows() {
+        let mark = g.mark(first + y);
+        if mark.has(RowMark::PROMPT) || mark.has(RowMark::INPUT) {
+            owner = Some(mark.cmd);
+        }
+        let Some(info) = owner.and_then(|id| term.command(id)) else {
+            continue;
+        };
+        let outcome = match info.state {
+            CommandState::Prompt => continue,
+            CommandState::Running => Outcome::Running,
+            CommandState::Done if info.exit.is_some_and(|e| e != 0) => Outcome::Failed,
+            CommandState::Done => Outcome::Succeeded,
+        };
+        decor.gutter.push((y, outcome));
+        if mark.has(RowMark::INPUT) {
+            let running = info.state == CommandState::Running;
+            if let Some(text) = info
+                .elapsed()
+                .and_then(|e| receipts::describe(e, info.exit, running, info.receipt.as_ref()))
+            {
+                // The input line, or if the command fills it, the first of its
+                // wrapped continuation lines with room at the right.
+                let room = |r: usize| g.row(r).trimmed_len() + text.chars().count() + 3 <= term.cols();
+                let mut r = y;
+                while !room(r) && r + 1 < term.rows() && g.row(r).wrapped {
+                    r += 1;
+                }
+                if room(r) {
+                    decor.notes.push((r, text));
+                }
+            }
+        }
+    }
+    decor
+}
+
 /// On for 530 ms, off for 530 ms, forever -- the same rhythm as before, now
 /// run by the window server.
 fn restart_blink(layer: &CALayer) {
@@ -1086,6 +1348,7 @@ impl App {
             buttons_visible: false,
             focused: true,
             selection: None,
+            preedit: String::new(),
             mouse_held: None,
             mouse_cell: (usize::MAX, usize::MAX),
             option_as_meta: cfg.macos.option_as_meta,
@@ -1175,6 +1438,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Bigger", sel!(tachyonBiggerFont:), "+");
     item(&view, "Smaller", sel!(tachyonSmallerFont:), "-");
     item(&view, "Actual Size", sel!(tachyonResetFont:), "0");
+    // Up and down arrows: the function-key codepoints AppKit uses for them.
+    item(&view, "Previous Command", sel!(tachyonPreviousCommand:), "\u{F700}");
+    item(&view, "Next Command", sel!(tachyonNextCommand:), "\u{F701}");
     submenu(&main, &view);
 
     let window = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Window"));
@@ -1199,9 +1465,13 @@ fn start_session(
     } else {
         (cfg.shell.program.clone(), false)
     };
-    crate::log!("window {id}: spawning `{program}` {:?} at {cols}x{rows}", cfg.shell.args);
+    let extra_env = match integration_dir() {
+        Some(dir) if cfg.shell.integration => pty::zsh_integration_env(&program, &dir),
+        _ => Vec::new(),
+    };
+    crate::log!("window {id}: spawning `{program}` {:?} at {cols}x{rows}, integration: {}", cfg.shell.args, !extra_env.is_empty());
     let pty = Arc::new(
-        Pty::spawn(cols as u16, rows as u16, &program, &cfg.shell.args, login)
+        Pty::spawn(cols as u16, rows as u16, &program, &cfg.shell.args, login, &extra_env)
             .map_err(|e| format!("could not start {program}: {e}"))?,
     );
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));
@@ -1212,6 +1482,13 @@ fn start_session(
         .name(format!("tachyon-pty-reader-{id}"))
         .spawn(move || {
             let mut processor = Processor::new();
+            // Receipts: the sampler wakes the window while a command runs so
+            // its elapsed time stays current.
+            let sampler = receipts::Sampler::spawn(move || {
+                DispatchQueue::main().exec_async(move || with_window(id, TermWindow::request_redraw));
+            });
+            let shell = reader_pty.pid();
+            let mut cpu_at_start: FxHashMap<u32, Option<Duration>> = FxHashMap::default();
             let mut dump = std::env::var_os("TACHYON_DUMP").and_then(|p| std::fs::File::create(p).ok());
             // 128 KiB amortises the syscall over a burst without holding the
             // terminal lock for long.
@@ -1229,13 +1506,30 @@ fn start_session(
                     use std::io::Write;
                     let _ = f.write_all(&buf[..n]);
                 }
-                let replies = {
+                let (replies, events) = {
                     let mut t = reader_term.lock();
                     processor.advance(&mut t, &buf[..n]);
-                    t.take_replies()
+                    (t.take_replies(), t.take_command_events())
                 };
                 if !replies.is_empty() {
                     let _ = reader_pty.write(&replies);
+                }
+                for event in events {
+                    match event {
+                        CommandEvent::Started(cmd) => {
+                            cpu_at_start.insert(cmd, receipts::children_cpu(shell));
+                            sampler.start(shell, reader_pty.master_fd());
+                        }
+                        CommandEvent::Finished(cmd, _) => {
+                            let start = cpu_at_start.remove(&cmd).flatten();
+                            let cpu = start
+                                .zip(receipts::children_cpu(shell))
+                                .map(|(a, b)| b.saturating_sub(a));
+                            let receipt = sampler.finish(cpu);
+                            reader_term.lock().set_receipt(cmd, receipt);
+                            DispatchQueue::main().exec_async(move || with_window(id, |w| w.command_finished(cmd)));
+                        }
+                    }
                 }
                 if !wake_pending.swap(true, Ordering::AcqRel) {
                     DispatchQueue::main().exec_async(move || with_window(id, TermWindow::resume));
@@ -1246,6 +1540,18 @@ fn start_session(
         .map_err(|e| format!("could not start the reader thread: {e}"))?;
 
     Ok((term, pty))
+}
+
+/// Where the shell-integration scripts live: inside the app bundle, or the
+/// source tree when running with `cargo run`.
+fn integration_dir() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bundled = exe.parent()?.parent()?.join("Resources/shell");
+    if bundled.is_dir() {
+        return Some(bundled);
+    }
+    let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shell");
+    dev.is_dir().then_some(dev)
 }
 
 pub fn run(cfg: Config) -> Result<(), String> {

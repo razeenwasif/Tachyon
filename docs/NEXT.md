@@ -325,6 +325,11 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
 5. **Rewind log and snapshots**, with cell provenance. New `src/rewind/`.
 6. **Shell integration and receipts**: OSC 133 for zsh first, then bash and
    fish. `proc_pid_rusage` receipts, rerun diff, notifications, ⌘↑/⌘↓.
+   *Done for zsh (9 November 2026):* marks stored on rows so they survive
+   packing and reflow; receipts with exact CPU time (shell child accounting)
+   and sampled P-core share, energy and peak footprint; gutter bars; ⌘↑/⌘↓;
+   Dock bounce for long commands. Still to do: bash and fish, rerun diff, and
+   system notifications.
 7. **Metric lens and job tabs**: Nexus first, then Slurm. New `src/lens/`,
    `src/jobs/`.
 8. **Session host**: `tachyon-host` as a login agent with keep-awake

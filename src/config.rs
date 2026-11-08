@@ -160,6 +160,9 @@ pub struct ShellConfig {
     /// Program to launch. Empty means "pick the best available".
     pub program: String,
     pub args: Vec<String>,
+    /// Load Tachyon's shell integration (OSC 133 prompt and command marks)
+    /// into zsh automatically.
+    pub integration: bool,
 }
 
 impl Default for ShellConfig {
@@ -167,6 +170,7 @@ impl Default for ShellConfig {
         ShellConfig {
             program: String::new(),
             args: Vec::new(),
+            integration: true,
         }
     }
 }
@@ -362,6 +366,7 @@ impl Config {
             "theme.bold_is_bright" => self.theme.bold_is_bright = parse_bool(value)?,
 
             "shell.program" => self.shell.program = value.to_string(),
+            "shell.integration" => self.shell.integration = parse_bool(value)?,
             "shell.args" => {
                 self.shell.args = value
                     .split_whitespace()

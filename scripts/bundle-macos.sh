@@ -21,6 +21,8 @@ app=dist/Tachyon.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/tachyon"
+# Shell integration scripts, found at Contents/Resources/shell at runtime.
+cp -R shell "$app/Contents/Resources/shell"
 
 # --- icon: render the SVG masters with Quick Look, then build an .icns ---
 work=$(mktemp -d)

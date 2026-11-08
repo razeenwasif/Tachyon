@@ -357,12 +357,20 @@ impl Renderer {
     /// Build and present one frame.
     /// Build and present one frame. With `cursor_on_layer`, a focused cursor
     /// is left out of the frame because a Core Animation layer draws it.
-    pub fn draw(&mut self, term: &Term, focused: bool, selection: Option<Range>, cursor_on_layer: bool) {
+    pub fn draw(
+        &mut self,
+        term: &Term,
+        focused: bool,
+        selection: Option<Range>,
+        cursor_on_layer: bool,
+        decor: &Decor,
+    ) {
         if self.atlas.overflowed {
             self.atlas.reset();
             self.atlas.overflowed = false;
         }
         self.build(term, focused, selection, cursor_on_layer);
+        self.build_decor(term, decor);
 
         let Some(drawable) = self.layer.nextDrawable() else {
             crate::log!("render: no drawable");
@@ -583,6 +591,92 @@ impl Renderer {
         }
     }
 
+    /// Gutter bars in the left padding, and receipts at the right of rows.
+    fn build_decor(&mut self, term: &Term, decor: &Decor) {
+        let m = self.fonts.metrics;
+        let (pad_x, pad_y) = self.padding();
+        let theme = self.cfg.theme.clone();
+        let width = (self.scale * 1.5).round().max(2.0);
+        let x = (pad_x * 0.35).round();
+        for &(y, outcome) in &decor.gutter {
+            let color = match outcome {
+                Outcome::Running => self.palette.0[4],
+                Outcome::Succeeded => self.palette.0[2],
+                Outcome::Failed => self.palette.0[1],
+            };
+            self.bg.push(RectInstance {
+                rect: [x, pad_y + y as f32 * m.height, width, m.height],
+                color: srgb(color),
+            });
+        }
+
+        if !decor.preedit.is_empty() {
+            let cursor = term.cursor_state();
+            let row_y = pad_y + cursor.y as f32 * m.height;
+            let n = decor.preedit.chars().count();
+            let x0 = pad_x + cursor.x as f32 * m.width;
+            // Cover what is underneath, then draw the text and an underline.
+            self.overlay.push(RectInstance {
+                rect: [x0, row_y, n as f32 * m.width, m.height],
+                color: srgb(theme.background),
+            });
+            for (i, ch) in decor.preedit.chars().enumerate() {
+                let Some((face, glyph)) = self.fonts.glyph_for(ch, false, false) else {
+                    continue;
+                };
+                let Some(e) = self.atlas.get(&self.fonts, face, glyph) else {
+                    continue;
+                };
+                self.glyphs.push(GlyphInstance {
+                    dst: [x0 + i as f32 * m.width + e.left, row_y + m.ascent + e.top, e.width, e.height],
+                    uv: [e.u, e.v],
+                    flags: [if e.color { 1.0 } else { 0.0 }, 0.0],
+                    color: srgb(theme.foreground),
+                });
+            }
+            self.overlay.push(RectInstance {
+                rect: [x0, row_y + m.underline_y, n as f32 * m.width, m.underline_thickness],
+                color: srgb(theme.foreground),
+            });
+        }
+
+        // Receipts in a muted foreground, never over text: a note is drawn
+        // only when the row is empty where it would go.
+        let dim = std::array::from_fn::<u8, 3, _>(|i| {
+            ((theme.foreground[i] as u16 + theme.background[i] as u16 * 2) / 3) as u8
+        });
+        let cols = term.cols();
+        for (y, text) in &decor.notes {
+            let len = text.chars().count();
+            if *y >= term.rows() || len + 2 > cols {
+                continue;
+            }
+            let start = cols - len - 1;
+            if term.grid().row(*y).trimmed_len() + 2 > start {
+                continue;
+            }
+            let row_y = pad_y + *y as f32 * m.height;
+            for (i, ch) in text.chars().enumerate() {
+                if ch == ' ' {
+                    continue;
+                }
+                let Some((face, glyph)) = self.fonts.glyph_for(ch, false, false) else {
+                    continue;
+                };
+                let Some(e) = self.atlas.get(&self.fonts, face, glyph) else {
+                    continue;
+                };
+                let cell_x = pad_x + (start + i) as f32 * m.width;
+                self.glyphs.push(GlyphInstance {
+                    dst: [cell_x + e.left, row_y + m.ascent + e.top, e.width, e.height],
+                    uv: [e.u, e.v],
+                    flags: [if e.color { 1.0 } else { 0.0 }, 0.0],
+                    color: srgb(dim),
+                });
+            }
+        }
+    }
+
     fn push_glyphs(&mut self, cell: &Cell, term: &Term, cell_x: f32, row_y: f32, fg: [u8; 3]) {
         let bold = cell.flags.contains(CellFlags::BOLD);
         let italic = cell.flags.contains(CellFlags::ITALIC);
@@ -760,6 +854,25 @@ fn is_invisible(ch: char) -> bool {
 /// before its renderer exists.
 pub fn grid_metrics(cfg: &crate::config::FontConfig, scale: f32) -> CellMetrics {
     FontSet::new(cfg, scale).metrics
+}
+
+/// How a command ended, for its gutter bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// Shell-integration decorations for one frame, by viewport row.
+#[derive(Default)]
+pub struct Decor {
+    pub gutter: Vec<(usize, Outcome)>,
+    /// Receipt text, drawn right-aligned on the row when it fits.
+    pub notes: Vec<(usize, String)>,
+    /// Text being composed in an input method (a dead key's accent, or
+    /// Japanese before conversion), drawn underlined at the cursor.
+    pub preedit: String,
 }
 
 /// What the cursor layer should show: a rectangle in drawable pixels and, for
