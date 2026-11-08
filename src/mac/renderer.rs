@@ -230,6 +230,8 @@ pub struct Renderer {
     cfg: Config,
     scale: f32,
     size: (f32, f32),
+    /// The window shows a tab strip along its bottom edge.
+    strip: bool,
 
     bg: Vec<RectInstance>,
     glyphs: Vec<GlyphInstance>,
@@ -265,6 +267,7 @@ impl Renderer {
             cfg: cfg.clone(),
             scale,
             size: (1.0, 1.0),
+            strip: false,
             bg: Vec::new(),
             glyphs: Vec::new(),
             overlay: Vec::new(),
@@ -300,16 +303,61 @@ impl Renderer {
         )
     }
 
-    /// Grid dimensions that fit a drawable of the given pixel size.
+    /// Grid dimensions that fit a drawable of the given pixel size, above the
+    /// tab strip when there is one.
     pub fn grid_size_for(&self, width_px: f32, height_px: f32) -> (usize, usize) {
         let m = self.fonts.metrics;
         let (pad_x, pad_y) = self.padding();
         let w = (width_px - pad_x * 2.0).max(m.width);
-        let h = (height_px - pad_y * 2.0).max(m.height);
+        let h = (height_px - pad_y * 2.0 - self.strip_height()).max(m.height);
         (
             (w / m.width).floor().max(1.0) as usize,
             (h / m.height).floor().max(1.0) as usize,
         )
+    }
+
+    /// Show or hide the tab strip. The caller lays the grid out again.
+    pub fn set_strip(&mut self, on: bool) {
+        self.strip = on;
+    }
+
+    /// Height of the tab strip in pixels: a row of text with room around it,
+    /// enough to aim a click at.
+    fn strip_height(&self) -> f32 {
+        if self.strip {
+            (self.fonts.metrics.height * 1.6).round()
+        } else {
+            0.0
+        }
+    }
+
+    /// Where tab `i` of `n` starts, in grid columns. Tabs share the width
+    /// equally and start on cell boundaries, so labels line up with the text.
+    fn strip_col(cols: usize, n: usize, i: usize) -> usize {
+        i * cols / n.max(1)
+    }
+
+    /// Left and right edges of tab `i` of `n`, in pixels. The outer tabs run
+    /// to the window's edges.
+    fn strip_edges(&self, cols: usize, n: usize, i: usize) -> (f32, f32) {
+        let (pad_x, _) = self.padding();
+        let w = self.fonts.metrics.width;
+        let x = |i: usize| match i {
+            0 => 0.0,
+            i if i >= n => self.size.0,
+            i => pad_x + Self::strip_col(cols, n, i) as f32 * w,
+        };
+        (x(i), x(i + 1))
+    }
+
+    /// The tab at drawable pixel (`x`, `y`), counted from the top left, if the
+    /// point is in the strip.
+    pub fn strip_index(&self, x: f32, y: f32, n: usize) -> Option<usize> {
+        if !self.strip || n == 0 || y < self.size.1 - self.strip_height() {
+            return None;
+        }
+        let cols = self.grid_size_for(self.size.0, self.size.1).0;
+        (0..n).find(|&i| x < self.strip_edges(cols, n, i).1).or(Some(n - 1))
     }
 
     /// Change the font size in points, keeping the backing scale.
@@ -354,7 +402,6 @@ impl Renderer {
         (fg, bg)
     }
 
-    /// Build and present one frame.
     /// Build and present one frame. With `cursor_on_layer`, a focused cursor
     /// is left out of the frame because a Core Animation layer draws it.
     pub fn draw(
@@ -656,24 +703,94 @@ impl Renderer {
                 continue;
             }
             let row_y = pad_y + *y as f32 * m.height;
-            for (i, ch) in text.chars().enumerate() {
-                if ch == ' ' {
-                    continue;
+            self.push_text(text, pad_x + start as f32 * m.width, row_y, dim);
+        }
+
+        if let Some(strip) = &decor.strip {
+            self.build_strip(strip, cols);
+        }
+    }
+
+    /// The tab strip along the bottom edge. The tab in front takes the
+    /// terminal's own background, so it reads as the same surface as the text
+    /// above it; the others sit on a slightly lighter band under a hairline.
+    fn build_strip(&mut self, strip: &Strip, cols: usize) {
+        let m = self.fonts.metrics;
+        let (pad_x, _) = self.padding();
+        let theme = self.cfg.theme.clone();
+        let mix = |a: [u8; 3], b: [u8; 3], t: f32| -> [u8; 3] {
+            std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
+        };
+        let band = mix(theme.background, theme.foreground, 0.05);
+        let line = mix(theme.background, theme.foreground, 0.14);
+        let dim = mix(theme.foreground, theme.background, 0.45);
+        let hair = self.scale.round().max(1.0);
+
+        let n = strip.tabs.len();
+        let h = self.strip_height();
+        let y0 = self.size.1 - h;
+        let text_y = y0 + ((h - m.height) / 2.0).round();
+        self.bg.push(RectInstance { rect: [0.0, y0, self.size.0, h], color: srgb(band) });
+
+        for (i, (label, unseen)) in strip.tabs.iter().enumerate() {
+            let (x0, x1) = self.strip_edges(cols, n, i);
+            let active = i == strip.active;
+            if active {
+                self.bg.push(RectInstance { rect: [x0, y0, x1 - x0, h], color: srgb(theme.background) });
+            } else {
+                self.bg.push(RectInstance { rect: [x0, y0, x1 - x0, hair], color: srgb(line) });
+                // A short divider between two tabs in the background.
+                if i + 1 < n && i + 1 != strip.active {
+                    self.bg.push(RectInstance {
+                        rect: [x1 - hair, y0 + h * 0.28, hair, h * 0.44],
+                        color: srgb(line),
+                    });
                 }
-                let Some((face, glyph)) = self.fonts.glyph_for(ch, false, false) else {
-                    continue;
-                };
-                let Some(e) = self.atlas.get(&self.fonts, face, glyph) else {
-                    continue;
-                };
-                let cell_x = pad_x + (start + i) as f32 * m.width;
-                self.glyphs.push(GlyphInstance {
-                    dst: [cell_x + e.left, row_y + m.ascent + e.top, e.width, e.height],
-                    uv: [e.u, e.v],
-                    flags: [if e.color { 1.0 } else { 0.0 }, 0.0],
-                    color: srgb(dim),
-                });
             }
+
+            // The label, centred in the tab's cells, after a dot when a
+            // command finished there unseen.
+            let c0 = Self::strip_col(cols, n, i);
+            let c1 = Self::strip_col(cols, n, i + 1);
+            let mark = if unseen.is_some() { 2 } else { 0 };
+            let room = (c1 - c0).saturating_sub(2 + mark);
+            if room == 0 {
+                continue;
+            }
+            let text = fit(label, room);
+            let width = text.chars().map(|c| c.width().unwrap_or(1)).sum::<usize>() + mark;
+            let mut x = pad_x + (c0 + (c1 - c0).saturating_sub(width) / 2) as f32 * m.width;
+            if let Some(outcome) = unseen {
+                let color = match outcome {
+                    Outcome::Failed => self.palette.0[1],
+                    _ => self.palette.0[2],
+                };
+                self.push_text("●", x, text_y, color);
+                x += 2.0 * m.width;
+            }
+            self.push_text(&text, x, text_y, if active { theme.foreground } else { dim });
+        }
+    }
+
+    /// A line of plain text from pixel (`x`, `row_y`), one cell per column.
+    fn push_text(&mut self, text: &str, x: f32, row_y: f32, color: [u8; 3]) {
+        let m = self.fonts.metrics;
+        let mut pen = x;
+        for ch in text.chars() {
+            let cells = ch.width().unwrap_or(1).max(1) as f32;
+            if ch != ' ' && !is_invisible(ch) {
+                if let Some((face, glyph)) = self.fonts.glyph_for(ch, false, false) {
+                    if let Some(e) = self.atlas.get(&self.fonts, face, glyph) {
+                        self.glyphs.push(GlyphInstance {
+                            dst: [pen + e.left, row_y + m.ascent + e.top, e.width, e.height],
+                            uv: [e.u, e.v],
+                            flags: [if e.color { 1.0 } else { 0.0 }, 0.0],
+                            color: srgb(color),
+                        });
+                    }
+                }
+            }
+            pen += cells * m.width;
         }
     }
 
@@ -864,6 +981,32 @@ pub enum Outcome {
     Failed,
 }
 
+/// `text` cut to at most `cols` cells, ending in an ellipsis when cut.
+fn fit(text: &str, cols: usize) -> String {
+    let width = |c: char| c.width().unwrap_or(1);
+    if text.chars().map(width).sum::<usize>() <= cols {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        if used + width(c) + 1 > cols {
+            break;
+        }
+        used += width(c);
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// The tab strip: each tab's label and whether a command finished there
+/// unseen, and which tab is in front.
+pub struct Strip {
+    pub tabs: Vec<(String, Option<Outcome>)>,
+    pub active: usize,
+}
+
 /// Shell-integration decorations for one frame, by viewport row.
 #[derive(Default)]
 pub struct Decor {
@@ -873,6 +1016,8 @@ pub struct Decor {
     /// Text being composed in an input method (a dead key's accent, or
     /// Japanese before conversion), drawn underlined at the cursor.
     pub preedit: String,
+    /// The tab strip, when the window has more than one tab.
+    pub strip: Option<Strip>,
 }
 
 /// What the cursor layer should show: a rectangle in drawable pixels and, for
@@ -964,5 +1109,19 @@ impl Renderer {
             color: theme.cursor,
             image: Some((w as u32, h as u32, img)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    #[test]
+    fn labels_fit_their_tab() {
+        assert_eq!(fit("zsh", 10), "zsh");
+        assert_eq!(fit("python train.py --epochs 3", 10), "python tr…");
+        assert_eq!(fit("python train.py", 10).chars().count(), 10);
+        // Wide characters take two cells each.
+        assert_eq!(fit("日本語のファイル", 7), "日本語…");
     }
 }

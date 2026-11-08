@@ -143,6 +143,8 @@ pub struct CommandInfo {
     pub finished: Option<Instant>,
     pub exit: Option<i32>,
     pub receipt: Option<Receipt>,
+    /// The command line, when the shell reports it (`OSC 133;C;cmdline=...`).
+    pub cmdline: Option<String>,
 }
 
 impl CommandInfo {
@@ -192,7 +194,14 @@ pub struct Term {
     replies: Vec<u8>,
 
     pub title: Option<String>,
-    /// Incremented whenever the title changes, so the app can cheaply notice.
+    /// The command that was running when the title was set, or `None` when
+    /// the shell itself set it (at a prompt, or without shell integration).
+    pub title_cmd: Option<u32>,
+    /// The working directory the shell last reported with OSC 7.
+    pub cwd: Option<String>,
+    /// Incremented whenever anything a tab's name is made from changes (the
+    /// title, the working directory, a command starting or ending), so the
+    /// app can cheaply notice.
     pub title_revision: u64,
     pub bell_revision: u64,
 
@@ -231,6 +240,8 @@ impl Term {
             underline_colors: Vec::new(),
             replies: Vec::new(),
             title: None,
+            title_cmd: None,
+            cwd: None,
             title_revision: 0,
             bell_revision: 0,
             ground_signal: false,
@@ -283,7 +294,7 @@ impl Term {
                 self.current_cmd = Some(id);
                 self.commands.insert(
                     id,
-                    CommandInfo { state: CommandState::Prompt, started: None, finished: None, exit: None, receipt: None },
+                    CommandInfo { state: CommandState::Prompt, started: None, finished: None, exit: None, receipt: None, cmdline: None },
                 );
                 self.mark_row(id, RowMark::PROMPT);
                 if self.commands.len() > MAX_COMMANDS as usize {
@@ -298,10 +309,17 @@ impl Term {
             }
             b'C' => {
                 if let Some(id) = self.current_cmd {
+                    // Everything after `C;` is options; a `;` inside the
+                    // command line split it into more parameters.
+                    let rest = params.get(2..).unwrap_or(&[]);
+                    let rest = rest.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join(";");
+                    let cmdline = rest.strip_prefix("cmdline=").map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
                     if let Some(c) = self.commands.get_mut(&id) {
                         c.state = CommandState::Running;
                         c.started = Some(Instant::now());
+                        c.cmdline = cmdline;
                     }
+                    self.title_revision = self.title_revision.wrapping_add(1);
                     self.mark_row(id, RowMark::OUTPUT);
                     self.command_events.push(CommandEvent::Started(id));
                 }
@@ -318,6 +336,7 @@ impl Term {
                             c.finished = Some(Instant::now());
                             c.exit = exit;
                             self.command_events.push(CommandEvent::Finished(id, exit));
+                            self.title_revision = self.title_revision.wrapping_add(1);
                         }
                     }
                 }
@@ -1539,14 +1558,26 @@ impl Perform for Term {
         match *cmd {
             // Window / icon title.
             b"0" | b"2" => {
-                if let Some(t) = params.get(1) {
-                    self.title = Some(String::from_utf8_lossy(t).into_owned());
+                if params.len() > 1 {
+                    // A `;` in the title split it into more parameters.
+                    let title = params[1..].iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join(";");
+                    let running = self
+                        .current_cmd
+                        .filter(|id| self.commands.get(id).is_some_and(|c| c.state == CommandState::Running));
+                    self.title = Some(title);
+                    self.title_cmd = running;
                     self.title_revision = self.title_revision.wrapping_add(1);
                 }
             }
-            // OSC 7: report working directory. Recorded for future use (new
-            // tab inherits cwd); parsing it here keeps shells quiet.
-            b"7" => {}
+            // OSC 7: the working directory, as file://host/path.
+            b"7" => {
+                if let Some(path) = params.get(1).and_then(|p| parse_file_url(p)) {
+                    if self.cwd.as_deref() != Some(path.as_str()) {
+                        self.cwd = Some(path);
+                        self.title_revision = self.title_revision.wrapping_add(1);
+                    }
+                }
+            }
             // Shell integration: prompt, input, output and exit marks.
             b"133" => self.semantic_mark(params),
             _ => {}
@@ -1564,12 +1595,63 @@ impl Perform for Term {
     }
 }
 
+/// The path of an OSC 7 `file://host/path` URL, percent-decoded.
+fn parse_file_url(url: &[u8]) -> Option<String> {
+    let rest = url.strip_prefix(b"file://")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let path = &rest[slash..];
+    let mut out = Vec::with_capacity(path.len());
+    let mut i = 0;
+    while i < path.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (path[i], path.get(i + 1).and_then(|&b| hex(b)), path.get(i + 2).and_then(|&b| hex(b))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn feed(t: &mut Term, p: &mut Processor, s: &str) {
         p.advance(t, s.as_bytes());
+    }
+
+    /// What names a tab: the folder from OSC 7, the command line from
+    /// OSC 133;C (with any `;` in it kept), and who set the title.
+    #[test]
+    fn records_cwd_cmdline_and_title_owner() {
+        let mut t = Term::new(40, 10, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "\x1b]133;A\x07\x1b]7;file://mac.local/Users/me/My%20Code\x07$ ");
+        assert_eq!(t.cwd.as_deref(), Some("/Users/me/My Code"));
+        let rev = t.title_revision;
+        feed(&mut t, &mut p, "\x1b]2;shell title\x07");
+        assert_eq!(t.title_cmd, None, "set at a prompt, so the shell's own");
+
+        feed(&mut t, &mut p, "\x1b]133;B\x07\x1b]133;C;cmdline=make; echo done\x07");
+        let id = t.current_command().unwrap();
+        assert_eq!(t.command(id).unwrap().cmdline.as_deref(), Some("make; echo done"));
+        assert!(t.title_revision != rev);
+        feed(&mut t, &mut p, "\x1b]0;vim; main.rs\x07");
+        assert_eq!(t.title.as_deref(), Some("vim; main.rs"));
+        assert_eq!(t.title_cmd, Some(id), "set while the command ran");
+    }
+
+    #[test]
+    fn file_urls_decode() {
+        assert_eq!(parse_file_url(b"file:///tmp").as_deref(), Some("/tmp"));
+        assert_eq!(parse_file_url(b"file://h/a%2Fb%zz").as_deref(), Some("/a/b%zz"));
+        assert_eq!(parse_file_url(b"http://h/x"), None);
     }
 
     /// A command as zsh with Tachyon's integration reports it.

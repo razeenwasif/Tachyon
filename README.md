@@ -113,7 +113,11 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 
 | | |
 |---|---|
-| ⌘N / ⌘W | New window / close window |
+| ⌘T / ⌘N | New tab / new window |
+| ⌘W / ⌘⇧W | Close the tab (the window with its last tab) / close the window |
+| ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
+| ⌘⇧[ / ⌘⇧], ⌃⇥ / ⌃⇧⇥ | Previous / next tab |
+| Click / middle-click a tab | Show it / close it |
 | Drag, double-click, triple-click | Select by character, word (paths count as one word), or line |
 | Shift-click | Extend the selection |
 | ⌘C / ⌘V / ⌘A | Copy / paste / select all |
@@ -121,6 +125,13 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌃⌘-drag, or drag the top edge | Move the window |
 | ⌘↑ / ⌘↓ | Jump to the previous / next command |
 | Shift-drag in vim, tmux, htop | Select even while the app has the mouse |
+
+**Tabs.** With two or more tabs, a strip along the bottom edge shows them; with
+one, it goes away and the grid gets the row back. A tab is named after what's
+running in it, or its folder at a prompt (zsh reports both through the
+integration below), or a title a program set while it runs. When a command
+finishes in a tab you aren't looking at, the tab gets a dot: green if it
+succeeded, red if it failed.
 
 Applications that turn on mouse reporting (vim, tmux, htop) get clicks, drags
 and the wheel. The cursor blinks through Core Animation, so a blinking cursor
@@ -147,7 +158,7 @@ marks every prompt and command with OSC 133, which gives:
 
 Set `shell.integration = false` to turn it off.
 
-Not yet on the Mac: tabs, translucency, ligatures, and emoji sequences that need
+Not yet on the Mac: split panes, translucency, ligatures, and emoji sequences that need
 shaping (skin tones, ZWJ families).
 
 ## Installing and pinning to the taskbar
