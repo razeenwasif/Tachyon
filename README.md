@@ -104,9 +104,23 @@ to Cascadia Mono and falls back to SF Mono when it is not installed.
 Configuration is read from `~/.config/Tachyon/tachyon.conf`, in the same format
 as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 
-Not yet on the Mac: selection and copy, mouse reporting, IME and dead keys,
-tabs, cursor blink, translucency, ligatures, and emoji sequences that need
-shaping (skin tones, ZWJ families).
+| | |
+|---|---|
+| ⌘N / ⌘W | New window / close window |
+| Drag, double-click, triple-click | Select by character, word (paths count as one word), or line |
+| Shift-click | Extend the selection |
+| ⌘C / ⌘V / ⌘A | Copy / paste / select all |
+| ⌘+ (or ⌘=) / ⌘− / ⌘0 | Bigger / smaller / configured font size |
+| ⌃⌘-drag, or drag the top edge | Move the window |
+| Shift-drag in vim, tmux, htop | Select even while the app has the mouse |
+
+Applications that turn on mouse reporting (vim, tmux, htop) get clicks, drags
+and the wheel. The cursor blinks through Core Animation, so a blinking cursor
+costs the app no wake-ups. To make Option act as Meta, for shell shortcuts like
+⌥B and ⌥F, set `macos.option_as_meta` to `left`, `right` or `true`.
+
+Not yet on the Mac: IME and dead keys, tabs, translucency, ligatures, and emoji
+sequences that need shaping (skin tones, ZWJ families).
 
 ## Installing and pinning to the taskbar
 

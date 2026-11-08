@@ -171,6 +171,22 @@ impl Default for ShellConfig {
     }
 }
 
+/// Which Option keys act as Meta (sending ESC + key) on macOS. Off by default,
+/// so Option types the layout's special characters as it does everywhere else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OptionAsMeta {
+    #[default]
+    Off,
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MacConfig {
+    pub option_as_meta: OptionAsMeta,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub font: FontConfig,
@@ -178,6 +194,7 @@ pub struct Config {
     pub render: RenderConfig,
     pub theme: ThemeConfig,
     pub shell: ShellConfig,
+    pub macos: MacConfig,
     pub scrollback: usize,
     /// Diagnostics produced while loading, surfaced by the caller.
     pub warnings: Vec<String>,
@@ -191,6 +208,7 @@ impl Default for Config {
             render: RenderConfig::default(),
             theme: ThemeConfig::default(),
             shell: ShellConfig::default(),
+            macos: MacConfig::default(),
             scrollback: 10_000,
             warnings: Vec::new(),
         }
@@ -292,6 +310,16 @@ impl Config {
             "font.cell_width" => self.font.cell_width = parse_f32(value, 0.5, 3.0)?,
             "font.bold" => self.font.use_bold_font = parse_bool(value)?,
             "font.italic" => self.font.use_italic_font = parse_bool(value)?,
+
+            "macos.option_as_meta" => {
+                self.macos.option_as_meta = match value {
+                    "false" | "off" | "no" => OptionAsMeta::Off,
+                    "true" | "on" | "yes" | "both" => OptionAsMeta::Both,
+                    "left" => OptionAsMeta::Left,
+                    "right" => OptionAsMeta::Right,
+                    _ => return Err(format!("option_as_meta: expected false, left, right or true, got `{value}`")),
+                }
+            }
 
             "window.cols" => self.window.cols = parse_usize(value, 8, 2000)?,
             "window.rows" => self.window.rows = parse_usize(value, 2, 1000)?,
@@ -445,6 +473,16 @@ fn parse_hex(v: &str) -> Result<[u8; 3], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn option_as_meta_accepts_sides() {
+        assert_eq!(Config::parse("").macos.option_as_meta, OptionAsMeta::Off);
+        assert_eq!(Config::parse("macos.option_as_meta = left").macos.option_as_meta, OptionAsMeta::Left);
+        assert_eq!(Config::parse("macos.option_as_meta = true").macos.option_as_meta, OptionAsMeta::Both);
+        let bad = Config::parse("macos.option_as_meta = sideways");
+        assert_eq!(bad.macos.option_as_meta, OptionAsMeta::Off);
+        assert_eq!(bad.warnings.len(), 1);
+    }
 
     #[test]
     fn parses_a_representative_file() {

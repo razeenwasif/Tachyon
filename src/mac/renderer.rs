@@ -33,6 +33,7 @@ use rustc_hash::FxHashMap;
 use unicode_width::UnicodeWidthChar;
 
 use super::font::{CellMetrics, FontSet, GlyphBitmap};
+use super::selection::Range;
 use crate::config::Config;
 use crate::term::{Cell, CellFlags, CursorShape, Palette, Term, TermMode, CLUSTER_TAG};
 
@@ -311,7 +312,18 @@ impl Renderer {
         )
     }
 
-    fn resolve_colors(&self, cell: &Cell, term: &Term) -> ([u8; 3], [u8; 3]) {
+    /// Change the font size in points, keeping the backing scale.
+    pub fn set_font_size(&mut self, points: f32) {
+        self.cfg.font.size = points;
+        self.fonts = FontSet::new(&self.cfg.font, self.scale);
+        self.atlas.reset();
+    }
+
+    pub fn font_size(&self) -> f32 {
+        self.cfg.font.size
+    }
+
+    fn resolve_colors(&self, cell: &Cell, term: &Term, selected: bool) -> ([u8; 3], [u8; 3]) {
         let theme = &self.cfg.theme;
         let mut fg_color = cell.fg;
         if cell.flags.contains(CellFlags::BOLD) && theme.bold_is_bright {
@@ -333,16 +345,24 @@ impl Renderer {
         if cell.flags.contains(CellFlags::HIDDEN) {
             fg = bg;
         }
+        if selected {
+            bg = theme.selection_bg;
+            if let Some(sfg) = theme.selection_fg {
+                fg = sfg;
+            }
+        }
         (fg, bg)
     }
 
     /// Build and present one frame.
-    pub fn draw(&mut self, term: &Term, focused: bool) {
+    /// Build and present one frame. With `cursor_on_layer`, a focused cursor
+    /// is left out of the frame because a Core Animation layer draws it.
+    pub fn draw(&mut self, term: &Term, focused: bool, selection: Option<Range>, cursor_on_layer: bool) {
         if self.atlas.overflowed {
             self.atlas.reset();
             self.atlas.overflowed = false;
         }
-        self.build(term, focused);
+        self.build(term, focused, selection, cursor_on_layer);
 
         let Some(drawable) = self.layer.nextDrawable() else {
             crate::log!("render: no drawable");
@@ -438,7 +458,7 @@ impl Renderer {
         slot.in_flight = Some(cb);
     }
 
-    fn build(&mut self, term: &Term, focused: bool) {
+    fn build(&mut self, term: &Term, focused: bool, selection: Option<Range>, cursor_on_layer: bool) {
         let m = self.fonts.metrics;
         let theme = self.cfg.theme.clone();
         let (pad_x, pad_y) = self.padding();
@@ -451,9 +471,14 @@ impl Renderer {
         let cols = term.cols();
         let cursor = term.cursor_state();
         let at_bottom = term.grid().display_offset() == 0;
+        let first_visible = term.grid().history_len().saturating_sub(term.grid().display_offset());
+        let selected = |line: usize, x: usize| selection.is_some_and(|r| r.contains(line, x));
+        // The focused cursor lives on its own layer when it blinks.
+        let draw_cursor = cursor.visible && at_bottom && !(focused && cursor_on_layer);
 
         for y in 0..rows {
             let row_y = pad_y + y as f32 * m.height;
+            let line = first_visible + y;
             let cells = term.grid().row(y).cells();
 
             // Backgrounds, run-length coalesced; the clear colour is free.
@@ -461,7 +486,7 @@ impl Renderer {
             let mut run_color: Option<[u8; 3]> = None;
             for x in 0..=cols {
                 let effective = if x < cols {
-                    let (_, bg) = self.resolve_colors(&cells[x], term);
+                    let (_, bg) = self.resolve_colors(&cells[x], term, selected(line, x));
                     (bg != theme.background).then_some(bg)
                 } else {
                     None
@@ -484,7 +509,7 @@ impl Renderer {
             }
 
             // Cursor, under the glyph so a block cursor can invert it.
-            if cursor.visible && at_bottom && cursor.y == y {
+            if draw_cursor && cursor.y == y {
                 let cx = pad_x + cursor.x as f32 * m.width;
                 let rect = match cursor.shape {
                     CursorShape::Block => [cx, row_y, m.width, m.height],
@@ -518,10 +543,9 @@ impl Renderer {
                     x += 1;
                     continue;
                 }
-                let (mut fg, _) = self.resolve_colors(&cell, term);
+                let (mut fg, _) = self.resolve_colors(&cell, term, selected(line, x));
                 if focused
-                    && cursor.visible
-                    && at_bottom
+                    && draw_cursor
                     && cursor.y == y
                     && cursor.x == x
                     && cursor.shape == CursorShape::Block
@@ -736,4 +760,96 @@ fn is_invisible(ch: char) -> bool {
 /// before its renderer exists.
 pub fn grid_metrics(cfg: &crate::config::FontConfig, scale: f32) -> CellMetrics {
     FontSet::new(cfg, scale).metrics
+}
+
+/// What the cursor layer should show: a rectangle in drawable pixels and, for
+/// a block cursor, an image of the cell with its character in the cursor-text
+/// colour (RGBA8, premultiplied, rows top to bottom).
+#[derive(Clone, PartialEq)]
+pub struct CursorOverlay {
+    pub rect: [f32; 4],
+    pub color: [u8; 3],
+    pub image: Option<(u32, u32, Vec<u8>)>,
+}
+
+impl Renderer {
+    /// The cursor as a layer would draw it, or `None` when it should not be
+    /// shown (hidden, or scrolled back into history).
+    pub fn cursor_overlay(&mut self, term: &Term) -> Option<CursorOverlay> {
+        let cursor = term.cursor_state();
+        if !cursor.visible || term.grid().display_offset() != 0 {
+            return None;
+        }
+        let m = self.fonts.metrics;
+        let (pad_x, pad_y) = self.padding();
+        let theme = self.cfg.theme.clone();
+        let x = pad_x + cursor.x as f32 * m.width;
+        let y = pad_y + cursor.y as f32 * m.height;
+
+        let rect = match cursor.shape {
+            CursorShape::Block => [x, y, m.width, m.height],
+            CursorShape::Underline => [
+                x,
+                y + m.height - m.underline_thickness * 2.0,
+                m.width,
+                m.underline_thickness * 2.0,
+            ],
+            CursorShape::Beam => [x, y, (m.width * 0.12).max(self.scale).round(), m.height],
+        };
+        if cursor.shape != CursorShape::Block {
+            return Some(CursorOverlay { rect, color: theme.cursor, image: None });
+        }
+
+        // Block: paint the cell in the cursor colour with its character on top
+        // in the cursor-text colour, the same inversion the frame would draw.
+        let (w, h) = (m.width.max(1.0) as usize, m.height.max(1.0) as usize);
+        let mut img = vec![0u8; w * h * 4];
+        for px in img.chunks_exact_mut(4) {
+            px.copy_from_slice(&[theme.cursor[0], theme.cursor[1], theme.cursor[2], 255]);
+        }
+        let cell = term.grid().row(cursor.y).cells().get(cursor.x).copied();
+        let ch = cell.and_then(|c| {
+            if c.ch & CLUSTER_TAG != 0 {
+                term.cluster(c.ch).and_then(|cl| cl.first().copied())
+            } else {
+                c.scalar()
+            }
+        });
+        if let (Some(cell), Some(ch)) = (cell, ch) {
+            let bold = cell.flags.contains(CellFlags::BOLD);
+            let italic = cell.flags.contains(CellFlags::ITALIC);
+            let glyph = (ch != ' ' && super::boxdraw::pieces(ch, 0.0, 0.0, 1.0, 1.0, 1.0).is_none())
+                .then(|| self.fonts.glyph_for(ch, bold, italic))
+                .flatten()
+                .and_then(|(face, g)| self.fonts.rasterize(face, g));
+            if let Some(bmp) = glyph {
+                let ox = bmp.left.round() as isize;
+                let oy = (m.ascent + bmp.top).round() as isize;
+                for gy in 0..bmp.height as isize {
+                    for gx in 0..bmp.width as isize {
+                        let (dx, dy) = (ox + gx, oy + gy);
+                        if dx < 0 || dy < 0 || dx >= w as isize || dy >= h as isize {
+                            continue;
+                        }
+                        let s = ((gy * bmp.width as isize + gx) * 4) as usize;
+                        let d = ((dy * w as isize + dx) * 4) as usize;
+                        let a = bmp.data[s + 3] as u32;
+                        let src = if bmp.color {
+                            [bmp.data[s], bmp.data[s + 1], bmp.data[s + 2]]
+                        } else {
+                            theme.cursor_text
+                        };
+                        for c in 0..3 {
+                            img[d + c] = ((src[c] as u32 * a + img[d + c] as u32 * (255 - a)) / 255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        Some(CursorOverlay {
+            rect,
+            color: theme.cursor,
+            image: Some((w as u32, h as u32, img)),
+        })
+    }
 }

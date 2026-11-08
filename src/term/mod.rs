@@ -1413,6 +1413,36 @@ mod tests {
         p.advance(t, s.as_bytes());
     }
 
+    /// Growing and then shrinking a window (macOS Stage Manager animates a
+    /// window this way when it comes forward) must leave the text where it
+    /// was, not push it into scrollback behind empty rows.
+    #[test]
+    fn grow_then_shrink_keeps_the_screen() {
+        let mut t = Term::new(120, 32, 1000);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "alpha beta gamma\r\n/usr/local/bin/tool\r\n> ");
+        for (c, r) in [(160, 48), (214, 66), (120, 32)] {
+            t.resize(c, r);
+        }
+        assert_eq!(t.grid().history_len(), 0);
+        assert_eq!(&screen(&t)[..3], ["alpha beta gamma", "/usr/local/bin/tool", ">"]);
+        assert_eq!((t.cursor_state().x, t.cursor_state().y), (2, 2));
+    }
+
+    /// Making a window taller brings scrollback back into view, keeping the
+    /// cursor on the bottom row, rather than adding empty rows below it.
+    #[test]
+    fn growing_brings_scrollback_back() {
+        let mut t = Term::new(20, 3, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "one\r\ntwo\r\nthree\r\nfour\r\n$ ");
+        assert_eq!(t.grid().history_len(), 2);
+        t.resize(20, 5);
+        assert_eq!(t.grid().history_len(), 0);
+        assert_eq!(screen(&t), ["one", "two", "three", "four", "$"]);
+        assert_eq!(t.cursor_state().y, 4);
+    }
+
     fn screen(t: &Term) -> Vec<String> {
         (0..t.rows())
             .map(|y| {

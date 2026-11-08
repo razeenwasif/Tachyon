@@ -516,13 +516,27 @@ impl Grid {
             }
         }
 
+        let (cursor_col, cursor_abs) = new_cursor.unwrap_or((0, lines.len().saturating_sub(1)));
+
+        // Blank rows below the cursor are unused screen, not content. Left in,
+        // they count towards the "last `rows` lines" that become the viewport,
+        // so shrinking a window would push the real text -- prompt included --
+        // into scrollback and keep empty padding on screen. Without them the
+        // viewport ends at the cursor when the text no longer fits, and growing
+        // the window brings scrollback back into view, as in other terminals.
+        while lines.len() > cursor_abs + 1
+            && lines
+                .last()
+                .is_some_and(|r| !r.wrapped && r.cells.iter().all(|c| c.is_empty()))
+        {
+            lines.pop();
+        }
+
         // The viewport is the last `rows` physical lines; pad if reflow produced
         // fewer than a screenful.
         while lines.len() < rows {
             lines.push(Row::new(cols));
         }
-
-        let (cursor_col, cursor_abs) = new_cursor.unwrap_or((0, lines.len().saturating_sub(1)));
 
         // --- rebuild --------------------------------------------------------
         let cap = rows + self.max_scrollback;
