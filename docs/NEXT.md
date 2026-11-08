@@ -174,6 +174,30 @@ Closest today: Typometer, or a high-speed camera.
   `CTFontCreateForString` replaces v0.1's static fallback chain.
 - **Glass behind, opaque letters**, kept from v0.1.
 
+### Window layouts (`window.chrome`)
+
+- **Edge-to-edge** (`edge`). No title bar and no tab bar; the grid starts at
+  the top edge.
+  - The window buttons fade in when the pointer reaches the top-left corner,
+    and the cells beneath them stay usable.
+  - Tabs move into the existing status line, so they take no extra rows. The
+    rewind track shares that row and appears on hover or ⌘[.
+  - Drag the status line to move the window, double-click it to zoom, or ⌃⌘-drag
+    anywhere.
+  - Trade-off: tabs drawn in cells lose native tab behaviour (drag-out into a
+    window, Merge All Windows), which has to be rebuilt.
+  - Closest today: Ghostty's hidden title bar, iTerm2's minimal theme with
+    bottom tabs, kitty's `hide_window_decorations`.
+- **Standard** (`standard`, the default). A unified Liquid Glass title bar with
+  native tabs. It costs roughly 50–60 pt, about 3 to 4 rows of 13 pt SF Mono at
+  a 1.2 line height (15.6 pt a row) (Computed, approximate).
+- **Full screen around the notch** (`window.fullscreen = notch`). Tabs to the
+  left of the notch, status to the right (`NSScreen.auxiliaryTopLeftArea` /
+  `auxiliaryTopRightArea`), and every row below it is output. Native full
+  screen keeps windows below the notch, so this needs a borderless window
+  covering the screen's full frame and gives up some of how Spaces treats
+  full-screen apps. Prototype it before promising it.
+
 Mac details: Quick Look on ⌘-click of a path, Secure Keyboard Entry that turns
 on by itself while the PTY has echo off, ⌘↑/⌘↓ to jump between commands, and
 independent left and right Option keys. These are expected on a Mac rather than
@@ -246,7 +270,9 @@ new.
 3. **Display-link pacing, two clocks, Core Animation cursor**: idle goes to
    zero.
 4. **Apple look**: Liquid Glass, appearance-following palettes, accent cursor,
-   native tabs, menus and shortcuts, accessibility settings.
+   native tabs, menus and shortcuts, accessibility settings. The edge-to-edge
+   layout with cell tabs in the status line and hover-reveal window buttons.
+   The notch full-screen mode as a prototype.
 5. **Rewind log and snapshots**, with cell provenance. New `src/rewind/`.
 6. **Shell integration and receipts**: OSC 133 for zsh first, then bash and
    fish. `proc_pid_rusage` receipts, rerun diff, notifications, ⌘↑/⌘↓.
