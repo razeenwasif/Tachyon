@@ -37,17 +37,49 @@ throughput test gives:
 | Build log (SGR every 7 lines) | 223.2 MiB/s | 272 MiB/s |
 | TUI full redraw | 222.8 MiB/s | 207 MiB/s |
 
-Two conclusions:
+That first run led to two hypotheses: aarch64 needed a NEON scanner, and the
+cost was "16 bytes per character written". The first held. Profiling showed the
+second was wrong in an instructive way.
 
-1. **There is no NEON path.** `scan_printable_ascii` checks for AVX2 on x86 and
-   otherwise falls back to `scan_swar`, so aarch64 gets the 8-bytes-at-a-time
-   SWAR loop. On Apple silicon the per-byte loop is already fast, so SWAR buys
-   only 1.37×.
-2. **Scanning isn't the bottleneck here; applying is.** The scanner is 19×
-   faster than end-to-end throughput. Every input byte becomes a 16-byte cell,
-   so 448 MiB/s in is about 7.0 GiB/s of cell writes (Computed). A NEON scanner
-   is still worth having, but the next version's speed comes from writing fewer
-   bytes per character (see compact rows, §3).
+### Update, 9 November 2026: NEON scanner and packed scrollback (done)
+
+- **NEON scanner.** Two 16-byte vectors per step, `vminvq` for the all-printable
+  case, narrow-by-4 to locate the stop byte. 13.8–14.2 GiB/s, up from 7.0–8.3
+  with SWAR. Short of the 20 GiB/s target: terminal output stops at every line
+  ending, so much of each call is finding the stop, not scanning.
+- **Where the time actually went.** `Grid::scroll_up` took about 60% of samples
+  on plain output, and throughput fell with scrollback size alone: 681 MiB/s
+  with none, 481 with 10,000 lines, 452 with 50,000. The ring held every
+  scrollback line at full width (10,000 x 200 x 16 B = 32 MB, beyond the
+  caches), and each scroll recycled a row that had long left the cache. The
+  cost was the *footprint* of 16-byte cells in history, not writing them.
+- **Packed history.** The screen keeps full rows; a line leaving the top is
+  packed into one allocation: one byte per character when the line is ASCII,
+  plus 14-byte style runs, trailing blanks dropped. The common case (one style,
+  all ASCII) is checked and narrowed with NEON `vld4q_u32`, which splits four
+  cells into character and style lanes in one load. Once scrollback is full the
+  evicted line's buffer is reused, so packing allocates nothing. Clearing a
+  recycled row now touches only its content, with a constant zero fill that
+  compiles to `memset`.
+
+Measured on the M2 Pro, `cargo test --release --test throughput`, five runs:
+
+| | Before | After | Change |
+|---|---:|---:|---:|
+| Scanner | 7.0–8.3 GiB/s | 13.8–14.2 GiB/s | +80% |
+| Plain ASCII, end to end | 429–455 MiB/s | 657–662 MiB/s | +49% |
+| Build log (SGR every 7 lines) | 210–230 MiB/s | 291–296 MiB/s | +33% |
+| TUI full redraw | 206–222 MiB/s | 244–247 MiB/s | +14% |
+
+Memory, 100,000 lines of build-log output in scrollback (peak RSS of the test
+process, about 25 MiB of which is its input buffer): **420 MiB before, 78 MiB
+after**, roughly 7x less for the scrollback itself. That is about 550 bytes per
+packed line in practice once allocator overhead and buffer capacity are counted,
+not the ~94 bytes estimated in §4.
+
+Still short of the 1 GiB/s target. For build logs, scrolling has dropped out
+of the profile and parsing and writing cells dominate; for long plain lines,
+packing a full 200-character line is now about half the cost.
 
 ---
 
