@@ -119,6 +119,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘C / ⌘V / ⌘A | Copy / paste / select all |
 | ⌘+ (or ⌘=) / ⌘− / ⌘0 | Bigger / smaller / configured font size |
 | ⌃⌘-drag, or drag the top edge | Move the window |
+| ⌘↑ / ⌘↓ | Jump to the previous / next command |
 | Shift-drag in vim, tmux, htop | Select even while the app has the mouse |
 
 Applications that turn on mouse reporting (vim, tmux, htop) get clicks, drags
@@ -126,8 +127,28 @@ and the wheel. The cursor blinks through Core Animation, so a blinking cursor
 costs the app no wake-ups. To make Option act as Meta, for shell shortcuts like
 ⌥B and ⌥F, set `macos.option_as_meta` to `left`, `right` or `true`.
 
-Not yet on the Mac: IME and dead keys, tabs, translucency, ligatures, and emoji
-sequences that need shaping (skin tones, ZWJ families).
+Dead keys and input methods work: ⌥E then E types é, and Japanese, Chinese and
+Korean input methods compose at the cursor.
+
+**Shell integration.** zsh is started with Tachyon's integration loaded
+(`shell/`, via a `ZDOTDIR` that restores yours; your `.zshrc` is untouched). It
+marks every prompt and command with OSC 133, which gives:
+
+- a bar in the left margin per command: blue while running, green on success,
+  red on failure;
+- a **receipt** on the command line once it finishes or has run for two seconds:
+  `✓ 4.2s · cpu 4.1s (P 100%) · 20.7 J · 425 MB` -- wall time, CPU time and
+  the share on performance cores, energy, and peak memory footprint. CPU time is
+  exact (from the shell's child-process accounting); P-core share, energy and
+  memory are sampled every half second, so very short commands show only their
+  exit status and time;
+- ⌘↑ / ⌘↓ to jump between commands, and a Dock bounce when a command of 10
+  seconds or more finishes while the window is in the background.
+
+Set `shell.integration = false` to turn it off.
+
+Not yet on the Mac: tabs, translucency, ligatures, and emoji sequences that need
+shaping (skin tones, ZWJ families).
 
 ## Installing and pinning to the taskbar
 

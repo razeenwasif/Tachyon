@@ -29,6 +29,7 @@ impl Pty {
         program: &str,
         args: &[String],
         login: bool,
+        extra_env: &[(String, String)],
     ) -> io::Result<Pty> {
         let path = resolve(program)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("`{program}` not found")))?;
@@ -43,7 +44,7 @@ impl Pty {
         let mut argv: Vec<*const libc::c_char> = argv_c.iter().map(|c| c.as_ptr()).collect();
         argv.push(ptr::null());
 
-        let env_c = child_environment();
+        let env_c = child_environment(extra_env);
         let mut envp: Vec<*const libc::c_char> = env_c.iter().map(|c| c.as_ptr()).collect();
         envp.push(ptr::null());
 
@@ -163,6 +164,34 @@ impl Drop for Pty {
     }
 }
 
+impl Pty {
+    pub fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    pub fn master_fd(&self) -> libc::c_int {
+        self.master.as_raw_fd()
+    }
+}
+
+/// Environment that makes zsh load Tachyon's shell integration: point
+/// `ZDOTDIR` at `dir/zsh`, whose `.zshenv` restores the real one. Empty for
+/// other shells.
+pub fn zsh_integration_env(program: &str, dir: &std::path::Path) -> Vec<(String, String)> {
+    if !program.rsplit('/').next().is_some_and(|b| b == "zsh") {
+        return Vec::new();
+    }
+    let mut env = vec![
+        ("ZDOTDIR".to_string(), dir.join("zsh").to_string_lossy().into_owned()),
+        ("TACHYON_SHELL_INTEGRATION".to_string(), dir.to_string_lossy().into_owned()),
+    ];
+    if let Some(orig) = std::env::var_os("ZDOTDIR") {
+        env.push(("TACHYON_ORIG_ZDOTDIR".to_string(), orig.to_string_lossy().into_owned()));
+        env.push(("TACHYON_ZDOTDIR_WAS_SET".to_string(), "1".to_string()));
+    }
+    env
+}
+
 /// The user's login shell: `$SHELL`, else the account's shell, else zsh.
 pub fn default_shell() -> String {
     if let Some(s) = std::env::var_os("SHELL").filter(|s| !s.is_empty()) {
@@ -192,11 +221,13 @@ fn resolve(program: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// The parent's environment with the terminal-identity variables replaced.
-fn child_environment() -> Vec<CString> {
+/// The parent's environment with the terminal-identity variables replaced and
+/// `extra` added (overriding anything of the same name).
+fn child_environment(extra: &[(String, String)]) -> Vec<CString> {
     const OURS: [&str; 4] = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"];
     let mut env: Vec<CString> = std::env::vars_os()
         .filter(|(k, _)| !OURS.iter().any(|o| OsStr::new(o) == k))
+        .filter(|(k, _)| !extra.iter().any(|(e, _)| OsStr::new(e) == k))
         .filter_map(|(k, v)| {
             let mut kv = k.as_bytes().to_vec();
             kv.push(b'=');
@@ -218,6 +249,9 @@ fn child_environment() -> Vec<CString> {
     // tools fall back to ASCII. Terminal.app sets it for the same reason.
     if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {
         set("LANG", "en_US.UTF-8");
+    }
+    for (k, v) in extra {
+        set(k, v);
     }
     env
 }

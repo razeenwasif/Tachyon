@@ -32,6 +32,31 @@ use std::collections::VecDeque;
 use super::cell::{Cell, CellFlags, Pen};
 use super::color::Color;
 
+/// Shell-integration marks on a line (OSC 133): which command it belongs to
+/// and whether that command's prompt, input or output starts here. Stored on
+/// the row so it travels with its text through scrolling, packing and reflow.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct RowMark {
+    pub cmd: u32,
+    pub kinds: u8,
+}
+
+impl RowMark {
+    pub const PROMPT: u8 = 1;
+    pub const INPUT: u8 = 2;
+    pub const OUTPUT: u8 = 4;
+
+    #[inline]
+    pub fn is_some(&self) -> bool {
+        self.kinds != 0
+    }
+
+    #[inline]
+    pub fn has(&self, kind: u8) -> bool {
+        self.kinds & kind != 0
+    }
+}
+
 /// One line of the grid.
 #[derive(Clone)]
 pub struct Row {
@@ -41,6 +66,7 @@ pub struct Row {
     pub wrapped: bool,
     /// Content changed since the renderer last consumed this row.
     pub dirty: bool,
+    pub mark: RowMark,
 }
 
 impl Row {
@@ -49,6 +75,7 @@ impl Row {
             cells: vec![Cell::EMPTY; cols],
             wrapped: false,
             dirty: true,
+            mark: RowMark::default(),
         }
     }
 
@@ -74,6 +101,7 @@ impl Row {
             self.cells.fill(blank);
         }
         self.wrapped = false;
+        self.mark = RowMark::default();
         self.dirty = true;
     }
 
@@ -88,6 +116,7 @@ impl Row {
             self.cells.fill(blank);
         }
         self.wrapped = false;
+        self.mark = RowMark::default();
         self.dirty = true;
     }
 
@@ -126,6 +155,7 @@ pub struct PackedRow {
     runs: u16,
     wide: bool,
     wrapped: bool,
+    mark: RowMark,
 }
 
 const RUN_BYTES: usize = 14;
@@ -150,7 +180,7 @@ impl PackedRow {
         let w = words(&cells[..len]);
         data.clear();
         if len == 0 {
-            return PackedRow { data, len: 0, runs: 0, wide: false, wrapped: row.wrapped };
+            return PackedRow { data, len: 0, runs: 0, wide: false, wrapped: row.wrapped, mark: row.mark };
         }
 
         // Most lines are one style and all ASCII: one byte per cell plus a
@@ -158,7 +188,7 @@ impl PackedRow {
         data.resize(len + RUN_BYTES, 0);
         if uniform_ascii(w, &mut data[..len]) {
             put_run(&mut data[len..], 0, &w[1..4]);
-            return PackedRow { data, len: len as u16, runs: 1, wide: false, wrapped: row.wrapped };
+            return PackedRow { data, len: len as u16, runs: 1, wide: false, wrapped: row.wrapped, mark: row.mark };
         }
 
         // General case: several styles, or characters beyond ASCII.
@@ -190,6 +220,7 @@ impl PackedRow {
             runs: starts.len() as u16,
             wide,
             wrapped: row.wrapped,
+            mark: row.mark,
         }
     }
 
@@ -225,7 +256,7 @@ impl PackedRow {
             }
         }
         cells.truncate(cols);
-        Row { cells, wrapped: self.wrapped, dirty: true }
+        Row { cells, wrapped: self.wrapped, dirty: true, mark: self.mark }
     }
 }
 
@@ -419,6 +450,19 @@ impl Grid {
         }
     }
 
+    /// The shell-integration mark on a line, by absolute position, without
+    /// unpacking history.
+    pub fn mark(&self, absolute: usize) -> RowMark {
+        let h = self.history.len();
+        if absolute < h {
+            self.history[absolute].mark
+        } else if absolute - h < self.rows {
+            self.screen[self.live_index(absolute - h)].mark
+        } else {
+            RowMark::default()
+        }
+    }
+
     #[inline]
     pub fn total_lines(&self) -> usize {
         self.history.len() + self.rows
@@ -537,6 +581,7 @@ impl Grid {
                     cells: Vec::new(),
                     wrapped: false,
                     dirty: true,
+                    mark: RowMark::default(),
                 },
             ));
         }
@@ -576,6 +621,7 @@ impl Grid {
                     cells: Vec::new(),
                     wrapped: false,
                     dirty: true,
+                    mark: RowMark::default(),
                 },
             ));
         }
@@ -681,7 +727,9 @@ impl Grid {
 
         // --- gather logical lines -------------------------------------------
         let mut logical: Vec<Vec<Cell>> = Vec::with_capacity(old_total);
+        let mut logical_marks: Vec<RowMark> = Vec::with_capacity(old_total);
         let mut current: Vec<Cell> = Vec::new();
+        let mut current_mark = RowMark::default();
         // Where the cursor sits: (logical line index, offset within it).
         let mut cursor_at = (0usize, 0usize);
         let mut cursor_found = false;
@@ -693,6 +741,15 @@ impl Grid {
                 cursor_found = true;
             }
             current.extend_from_slice(row.cells());
+            // A logical line keeps the marks of its rows (in practice only
+            // its first row has one).
+            if row.mark.is_some() {
+                if current_mark.is_some() && current_mark.cmd == row.mark.cmd {
+                    current_mark.kinds |= row.mark.kinds;
+                } else if !current_mark.is_some() {
+                    current_mark = row.mark;
+                }
+            }
 
             if !row.wrapped {
                 // Trailing blanks are padding, not content: keeping them would
@@ -708,6 +765,7 @@ impl Grid {
                     current.pop();
                 }
                 logical.push(std::mem::take(&mut current));
+                logical_marks.push(std::mem::take(&mut current_mark));
             }
         }
         if !current.is_empty() || logical.is_empty() {
@@ -718,6 +776,7 @@ impl Grid {
                 current.pop();
             }
             logical.push(current);
+            logical_marks.push(current_mark);
         }
         if !cursor_found {
             cursor_at = (logical.len().saturating_sub(1), 0);
@@ -744,6 +803,9 @@ impl Grid {
 
                 let mut row = Row::new(cols);
                 row.cells[..take].copy_from_slice(&cells[pos..pos + take]);
+                if pos == 0 {
+                    row.mark = logical_marks[li];
+                }
                 // Every chunk but the last continues into the next one.
                 row.wrapped = pos + take < cells.len();
                 lines.push(row);
@@ -765,7 +827,9 @@ impl Grid {
 
             // An empty logical line still occupies a row.
             if lines.len() == start_row {
-                lines.push(Row::new(cols));
+                let mut row = Row::new(cols);
+                row.mark = logical_marks[li];
+                lines.push(row);
                 if li == cursor_at.0 && new_cursor.is_none() {
                     new_cursor = Some((0, lines.len() - 1));
                 }
@@ -783,7 +847,7 @@ impl Grid {
         while lines.len() > cursor_abs + 1
             && lines
                 .last()
-                .is_some_and(|r| !r.wrapped && r.cells.iter().all(|c| c.is_empty()))
+                .is_some_and(|r| !r.wrapped && !r.mark.is_some() && r.cells.iter().all(|c| c.is_empty()))
         {
             lines.pop();
         }

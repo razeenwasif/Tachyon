@@ -57,6 +57,17 @@ const F_KEYS: [(u16, u8); 12] = [
     (0x6F, 12),
 ];
 
+/// Keys handled by the terminal itself rather than by the input system: they
+/// have no text, or the text they would produce (Return, Tab, Delete) must
+/// reach the shell exactly.
+pub fn is_shell_key(key_code: u16) -> bool {
+    matches!(
+        key_code,
+        RETURN | TAB | DELETE | ESCAPE | KEYPAD_ENTER | HOME | PAGE_UP | FORWARD_DELETE | END | PAGE_DOWN | LEFT
+            | RIGHT | DOWN | UP
+    ) || F_KEYS.iter().any(|(k, _)| *k == key_code)
+}
+
 /// Bytes for one key press, or `None` if it produces nothing.
 ///
 /// `chars` is `NSEvent.characters`; `bare` is `charactersIgnoringModifiers`,

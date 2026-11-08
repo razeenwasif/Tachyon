@@ -5,13 +5,16 @@ pub mod color;
 pub mod grid;
 pub mod parser;
 
+use std::time::{Duration, Instant};
+
 use bitflags::bitflags;
+use rustc_hash::FxHashMap;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
 pub use cell::{Cell, CellFlags, Pen, CLUSTER_TAG};
 pub use color::{Color, Palette};
-pub use grid::Grid;
+pub use grid::{Grid, RowMark};
 pub use parser::Processor;
 
 bitflags! {
@@ -112,6 +115,55 @@ pub struct CursorState {
     pub blinking: bool,
 }
 
+/// Where a command is in its life, as the shell reported it through OSC 133.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommandState {
+    /// The prompt is showing; nothing has run yet.
+    Prompt,
+    Running,
+    Done,
+}
+
+/// What a command cost, filled in by the platform layer. CPU time is exact;
+/// the sampled figures are present only for commands that ran long enough to
+/// be sampled.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Receipt {
+    pub cpu: Option<Duration>,
+    /// Share of CPU time spent on performance cores, 0..=1.
+    pub pcore_share: Option<f32>,
+    pub energy_joules: Option<f64>,
+    pub peak_footprint: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommandInfo {
+    pub state: CommandState,
+    pub started: Option<Instant>,
+    pub finished: Option<Instant>,
+    pub exit: Option<i32>,
+    pub receipt: Option<Receipt>,
+}
+
+impl CommandInfo {
+    /// How long it ran, or has been running.
+    pub fn elapsed(&self) -> Option<Duration> {
+        let start = self.started?;
+        Some(self.finished.unwrap_or_else(Instant::now).duration_since(start))
+    }
+}
+
+/// A command started or finished. Drained by the platform layer, which
+/// measures what the command cost.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommandEvent {
+    Started(u32),
+    Finished(u32, Option<i32>),
+}
+
+/// Commands remembered for gutter marks and receipts.
+const MAX_COMMANDS: u32 = 4096;
+
 pub struct Term {
     grid: Grid,
     /// The screen we are not currently showing. Swapping is O(1).
@@ -149,6 +201,13 @@ pub struct Term {
 
     /// Set whenever anything visible changed.
     dirty: bool,
+
+    /// Shell integration (OSC 133): every command seen, by id.
+    commands: FxHashMap<u32, CommandInfo>,
+    command_events: Vec<CommandEvent>,
+    /// The command whose prompt is showing or which is running.
+    current_cmd: Option<u32>,
+    next_cmd: u32,
 }
 
 impl Term {
@@ -176,7 +235,105 @@ impl Term {
             bell_revision: 0,
             ground_signal: false,
             dirty: true,
+            commands: FxHashMap::default(),
+            command_events: Vec::new(),
+            current_cmd: None,
+            next_cmd: 1,
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Shell integration
+    // ---------------------------------------------------------------------
+
+    pub fn command(&self, id: u32) -> Option<&CommandInfo> {
+        self.commands.get(&id)
+    }
+
+    /// The command whose prompt is showing or which is running.
+    pub fn current_command(&self) -> Option<u32> {
+        self.current_cmd
+    }
+
+    pub fn take_command_events(&mut self) -> Vec<CommandEvent> {
+        core::mem::take(&mut self.command_events)
+    }
+
+    pub fn set_receipt(&mut self, id: u32, receipt: Receipt) {
+        if let Some(c) = self.commands.get_mut(&id) {
+            c.receipt = Some(receipt);
+            self.dirty = true;
+        }
+    }
+
+    /// OSC 133: A prompt starts, B input starts, C output starts (the command
+    /// runs), D;exit the command finished.
+    fn semantic_mark(&mut self, params: &[&[u8]]) {
+        // Marks belong to the shell's own screen, not to full-screen apps.
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let Some(&kind) = params.get(1).and_then(|p| p.first()) else {
+            return;
+        };
+        match kind {
+            b'A' => {
+                let id = self.next_cmd;
+                self.next_cmd = self.next_cmd.wrapping_add(1).max(1);
+                self.current_cmd = Some(id);
+                self.commands.insert(
+                    id,
+                    CommandInfo { state: CommandState::Prompt, started: None, finished: None, exit: None, receipt: None },
+                );
+                self.mark_row(id, RowMark::PROMPT);
+                if self.commands.len() > MAX_COMMANDS as usize {
+                    let floor = self.next_cmd.wrapping_sub(MAX_COMMANDS);
+                    self.commands.retain(|&k, _| k.wrapping_sub(floor) < MAX_COMMANDS);
+                }
+            }
+            b'B' => {
+                if let Some(id) = self.current_cmd {
+                    self.mark_row(id, RowMark::INPUT);
+                }
+            }
+            b'C' => {
+                if let Some(id) = self.current_cmd {
+                    if let Some(c) = self.commands.get_mut(&id) {
+                        c.state = CommandState::Running;
+                        c.started = Some(Instant::now());
+                    }
+                    self.mark_row(id, RowMark::OUTPUT);
+                    self.command_events.push(CommandEvent::Started(id));
+                }
+            }
+            b'D' => {
+                if let Some(id) = self.current_cmd {
+                    let exit = params
+                        .get(2)
+                        .and_then(|p| std::str::from_utf8(p).ok())
+                        .and_then(|s| s.parse().ok());
+                    if let Some(c) = self.commands.get_mut(&id) {
+                        if c.state == CommandState::Running {
+                            c.state = CommandState::Done;
+                            c.finished = Some(Instant::now());
+                            c.exit = exit;
+                            self.command_events.push(CommandEvent::Finished(id, exit));
+                        }
+                    }
+                }
+            }
+            _ => return,
+        }
+        self.dirty = true;
+    }
+
+    fn mark_row(&mut self, id: u32, kind: u8) {
+        let y = self.cursor.y.min(self.rows() - 1);
+        let row = self.grid.row_mut(y);
+        if row.mark.cmd != id {
+            row.mark = RowMark { cmd: id, kinds: 0 };
+        }
+        row.mark.kinds |= kind;
     }
 
     // ---------------------------------------------------------------------
@@ -1390,6 +1547,8 @@ impl Perform for Term {
             // OSC 7: report working directory. Recorded for future use (new
             // tab inherits cwd); parsing it here keeps shells quiet.
             b"7" => {}
+            // Shell integration: prompt, input, output and exit marks.
+            b"133" => self.semantic_mark(params),
             _ => {}
         }
     }
@@ -1411,6 +1570,47 @@ mod tests {
 
     fn feed(t: &mut Term, p: &mut Processor, s: &str) {
         p.advance(t, s.as_bytes());
+    }
+
+    /// A command as zsh with Tachyon's integration reports it.
+    #[test]
+    fn osc_133_tracks_a_command() {
+        let mut t = Term::new(40, 10, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "\x1b]133;A\x07~\r\n$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07a b c\r\n");
+        let id = t.current_command().unwrap();
+        assert_eq!(t.command(id).unwrap().state, CommandState::Running);
+        assert_eq!(t.take_command_events(), [CommandEvent::Started(id)]);
+
+        // Marks sit on the rows: prompt on 0, input on 1, output on 2.
+        assert!(t.grid().row(0).mark.has(RowMark::PROMPT));
+        assert!(t.grid().row(1).mark.has(RowMark::INPUT));
+        assert!(t.grid().row(2).mark.has(RowMark::OUTPUT));
+        assert_eq!(t.grid().row(1).mark.cmd, id);
+
+        feed(&mut t, &mut p, "\x1b]133;D;2\x07\x1b]133;A\x07");
+        assert_eq!(t.command(id).unwrap().state, CommandState::Done);
+        assert_eq!(t.command(id).unwrap().exit, Some(2));
+        assert_eq!(t.take_command_events(), [CommandEvent::Finished(id, Some(2))]);
+        assert_ne!(t.current_command(), Some(id));
+    }
+
+    /// Marks survive scrolling into packed history and a reflowing resize.
+    #[test]
+    fn marks_survive_history_and_reflow() {
+        let mut t = Term::new(20, 3, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07");
+        let id = t.current_command().unwrap();
+        for i in 0..6 {
+            feed(&mut t, &mut p, &format!("line {i}\r\n"));
+        }
+        assert!(t.grid().history_len() > 0);
+        assert!(t.grid().mark(0).has(RowMark::INPUT));
+        t.resize(10, 3);
+        let found = (0..t.grid().total_lines()).find(|&l| t.grid().mark(l).has(RowMark::INPUT));
+        assert_eq!(found.map(|l| t.grid().mark(l).cmd), Some(id));
+        assert_eq!(t.line_text(found.unwrap()), "$ make");
     }
 
     /// Growing and then shrinking a window (macOS Stage Manager animates a
