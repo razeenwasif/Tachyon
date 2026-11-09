@@ -148,9 +148,13 @@ costs the app no wake-ups. To make Option act as Meta, for shell shortcuts like
 Dead keys and input methods work: ⌥E then E types é, and Japanese, Chinese and
 Korean input methods compose at the cursor.
 
-**Shell integration.** zsh is started with Tachyon's integration loaded
-(`shell/`, via a `ZDOTDIR` that restores yours; your `.zshrc` is untouched). It
-marks every prompt and command with OSC 133, which gives:
+**Shell integration.** zsh, bash and fish start with Tachyon's integration
+loaded from `shell/`, and none of your startup files change: zsh through a
+`ZDOTDIR` that restores yours, bash through `--rcfile` (the script reads your
+`.bash_profile` or `.bashrc` first, and works with macOS's bash 3.2 as well as
+Homebrew's), and fish through `vendor_conf.d`. Existing `PROMPT_COMMAND`s and
+DEBUG traps, like starship's, keep working. It marks every prompt and command
+with OSC 133, which gives:
 
 - a bar in the left margin per command: blue while running, green on success,
   red on failure;
@@ -168,6 +172,20 @@ marks every prompt and command with OSC 133, which gives:
   bounces instead.
 
 Set `shell.integration = false` to turn it off.
+
+Over ssh, the shell on the other machine needs the script too. Copy it there
+and load it from your startup file; ssh passes `LC_TERMINAL=Tachyon`, which is
+how it knows it's in Tachyon:
+
+```sh
+scp shell/tachyon-integration.bash cluster:~/.tachyon-integration.bash
+# then in ~/.bashrc on the cluster:
+[[ $LC_TERMINAL == Tachyon ]] && source ~/.tachyon-integration.bash
+```
+
+For zsh, source `shell/tachyon-integration.zsh` from `~/.zshrc`; for fish, copy
+`shell/xdg/fish/vendor_conf.d/tachyon-integration.fish` into
+`~/.config/fish/conf.d/`. Some servers' `sshd_config` doesn't accept `LC_*`.
 
 Not yet on the Mac: split panes, translucency, ligatures, and emoji sequences that need
 shaping (skin tones, ZWJ families).

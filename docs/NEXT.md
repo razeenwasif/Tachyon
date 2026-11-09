@@ -333,7 +333,10 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    *Done for zsh (9 November 2026):* marks stored on rows so they survive
    packing and reflow; receipts with exact CPU time (shell child accounting)
    and sampled P-core share, energy and peak footprint; gutter bars; ⌘↑/⌘↓;
-   Dock bounce for long commands. Still to do: bash and fish, and rerun diff.
+   Dock bounce for long commands. Still to do: rerun diff.
+   *bash and fish done (9 November 2026):* bash through `--rcfile` (3.2 and
+   5.x, chaining existing DEBUG traps and PROMPT_COMMAND), fish through
+   `vendor_conf.d`; `LC_TERMINAL=Tachyon` turns the scripts on over ssh.
    *Notifications done (9 November 2026):* a command of `notify.after` seconds
    (10) or more that finishes while you're elsewhere posts a notification with
    its receipt; clicking it shows the tab. ⌘-click Quick Look and URLs, and

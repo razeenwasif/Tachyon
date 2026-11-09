@@ -2015,13 +2015,16 @@ fn start_session(
     } else {
         (cfg.shell.program.clone(), false)
     };
-    let extra_env = match integration_dir() {
-        Some(dir) if cfg.shell.integration => pty::zsh_integration_env(&program, &dir),
-        _ => Vec::new(),
+    let integration = integration_dir()
+        .filter(|_| cfg.shell.integration)
+        .and_then(|dir| pty::integration(&program, &dir, login));
+    let (extra_env, args, login) = match integration {
+        Some(i) => (i.env, i.args.into_iter().chain(cfg.shell.args.iter().cloned()).collect(), i.login),
+        None => (Vec::new(), cfg.shell.args.clone(), login),
     };
-    crate::log!("tab {id}: spawning `{program}` {:?} at {cols}x{rows}, integration: {}", cfg.shell.args, !extra_env.is_empty());
+    crate::log!("tab {id}: spawning `{program}` {args:?} at {cols}x{rows}, integration: {}", !extra_env.is_empty());
     let pty = Arc::new(
-        Pty::spawn(cols as u16, rows as u16, &program, &cfg.shell.args, login, &extra_env)
+        Pty::spawn(cols as u16, rows as u16, &program, &args, login, &extra_env)
             .map_err(|e| format!("could not start {program}: {e}"))?,
     );
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));

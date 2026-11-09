@@ -24,10 +24,12 @@
 //!  * `ESC` and anything `>= 0x7F` may begin a multi-byte construct, so we drop
 //!    out and feed `vte` a byte at a time.
 //!  * `vte` tells us we are back in Ground by dispatching a *terminating*
-//!    action: `print`, `csi_dispatch`, `esc_dispatch`, `osc_dispatch`, or
-//!    `unhook`. Notably `execute` is not one of those -- a C0 byte inside a CSI
-//!    is executed without leaving the sequence -- and neither are `hook`/`put`,
-//!    which sit inside a DCS.
+//!    action: `print`, `csi_dispatch`, `esc_dispatch`, or `osc_dispatch` when
+//!    the string ended with BEL. Notably `execute` is not one of those -- a C0
+//!    byte inside a CSI is executed without leaving the sequence -- and neither
+//!    are `hook`/`put`, which sit inside a DCS. Nor is an OSC or DCS ended by
+//!    ST (`ESC \`): vte dispatches it on the ESC and is then in Escape until
+//!    the `\`, whose `esc_dispatch` is the signal.
 //!
 //! Byte-at-a-time is slower, but it only ever applies to escape sequences,
 //! which are a rounding error in the byte budget and are short besides. A

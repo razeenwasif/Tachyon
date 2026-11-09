@@ -289,6 +289,15 @@ impl Term {
         };
         match kind {
             b'A' => {
+                // A prompt redrawn, or marked twice (fish 4 marks its own
+                // prompts as well as ours): still the same command.
+                if let Some(id) = self.current_cmd.filter(|id| {
+                    self.commands.get(id).is_some_and(|c| c.state == CommandState::Prompt)
+                }) {
+                    self.mark_row(id, RowMark::PROMPT);
+                    self.dirty = true;
+                    return;
+                }
                 let id = self.next_cmd;
                 self.next_cmd = self.next_cmd.wrapping_add(1).max(1);
                 self.current_cmd = Some(id);
@@ -314,11 +323,21 @@ impl Term {
                     let rest = params.get(2..).unwrap_or(&[]);
                     let rest = rest.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join(";");
                     let cmdline = rest.strip_prefix("cmdline=").map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
-                    if let Some(c) = self.commands.get_mut(&id) {
-                        c.state = CommandState::Running;
-                        c.started = Some(Instant::now());
-                        c.cmdline = cmdline;
+                    let Some(c) = self.commands.get_mut(&id) else {
+                        return;
+                    };
+                    if c.state != CommandState::Prompt {
+                        // Marked twice: keep the first start, take the command
+                        // line if only the second has one.
+                        if c.cmdline.is_none() && cmdline.is_some() {
+                            c.cmdline = cmdline;
+                            self.title_revision = self.title_revision.wrapping_add(1);
+                        }
+                        return;
                     }
+                    c.state = CommandState::Running;
+                    c.started = Some(Instant::now());
+                    c.cmdline = cmdline;
                     self.title_revision = self.title_revision.wrapping_add(1);
                     self.mark_row(id, RowMark::OUTPUT);
                     self.command_events.push(CommandEvent::Started(id));
@@ -1551,8 +1570,11 @@ impl Perform for Term {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        self.ground_signal = true;
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        // Ended by BEL, the parser is back in Ground. Ended by ESC (the start
+        // of ST, `ESC \`), it is in Escape until the `\`, whose esc_dispatch
+        // signals Ground; signalling here would print that `\` as text.
+        self.ground_signal = bell_terminated;
         let Some(cmd) = params.first() else { return };
 
         match *cmd {
@@ -1591,7 +1613,9 @@ impl Perform for Term {
     fn put(&mut self, _byte: u8) {}
 
     fn unhook(&mut self) {
-        self.ground_signal = true;
+        // A DCS ends on the ESC of ST too; see osc_dispatch. (CAN and SUB end
+        // it in Ground without a signal, which only means the next bytes take
+        // the slow path until something does signal.)
     }
 }
 
@@ -1645,6 +1669,42 @@ mod tests {
         feed(&mut t, &mut p, "\x1b]0;vim; main.rs\x07");
         assert_eq!(t.title.as_deref(), Some("vim; main.rs"));
         assert_eq!(t.title_cmd, Some(id), "set while the command ran");
+    }
+
+    /// fish 4 marks its own prompts and commands as well as ours: the
+    /// repeats are the same command, and the command line is kept.
+    #[test]
+    fn repeated_marks_are_one_command() {
+        let mut t = Term::new(40, 10, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "\x1b]133;A;click_events=1\x07\x1b]133;A\x07> \x1b]133;B\x07");
+        let id = t.current_command().unwrap();
+        feed(&mut t, &mut p, "\x1b]133;C\x07\x1b]133;C;cmdline=make\x07");
+        assert_eq!(t.current_command(), Some(id));
+        assert_eq!(t.command(id).unwrap().cmdline.as_deref(), Some("make"));
+        let events = t.take_command_events();
+        assert_eq!(events.len(), 1, "one start, not two: {events:?}");
+        feed(&mut t, &mut p, "\x1b]133;D;0\x07\x1b]133;D;0\x07");
+        assert_eq!(t.take_command_events().len(), 1);
+    }
+
+    /// Strings ended by ST (`ESC \`) instead of BEL: fish 4, tmux and vim
+    /// send them. The `\` belongs to the terminator, not the screen.
+    #[test]
+    fn st_terminated_strings_leave_no_backslash() {
+        let mut t = Term::new(40, 5, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "\x1b]0;title\x1b\\\x1b]133;A\x1b\\\x1bP+q696e646e\x1b\\abc");
+        let row0 = |t: &Term| {
+            let h = t.grid().history_len();
+            t.text_range(h, 0, h, 39).trim_end().to_string()
+        };
+        assert_eq!(row0(&t), "abc");
+        assert_eq!(t.title.as_deref(), Some("title"));
+        assert!(t.current_command().is_some(), "the OSC 133 still counts");
+        // And BEL-ended ones still go straight back to the fast path.
+        feed(&mut t, &mut p, "\x1b]2;x\x07def");
+        assert_eq!(row0(&t), "abcdef");
     }
 
     #[test]
