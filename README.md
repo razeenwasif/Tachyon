@@ -95,7 +95,14 @@ scripts/bundle-macos.sh --install    # ...and install it to /Applications
 ```
 
 The window is edge-to-edge: no title bar, and the window buttons appear when
-the pointer reaches the top-left corner. Drawing is paced by a display link
+the pointer reaches the top-left corner. **Liquid Glass** sits behind the text
+(NSGlassEffectView on macOS 26 and later): only the default background lets it
+through, at `window.opacity` (0.82); text, the cursor, the selection and colours
+a program sets stay solid. `window.backdrop = none` makes it opaque, and so does
+Reduce Transparency. A **light theme** with its own ANSI colours takes over in
+Light Mode and switches back as the system does (`theme.appearance` fixes one);
+`theme.cursor = accent` and `theme.selection_bg = accent` use the system accent
+colour. Drawing is paced by a display link
 that pauses when nothing changes, so an idle window uses no CPU. Box drawing
 and block elements are drawn as rectangles, so borders and progress bars meet
 exactly. Nerd Font icons come from any installed Nerd Font. The font defaults
@@ -187,7 +194,7 @@ For zsh, source `shell/tachyon-integration.zsh` from `~/.zshrc`; for fish, copy
 `shell/xdg/fish/vendor_conf.d/tachyon-integration.fish` into
 `~/.config/fish/conf.d/`. Some servers' `sshd_config` doesn't accept `LC_*`.
 
-Not yet on the Mac: split panes, translucency, ligatures, and emoji sequences that need
+Not yet on the Mac: split panes, ligatures, and emoji sequences that need
 shaping (skin tones, ZWJ families).
 
 ## Installing and pinning to the taskbar

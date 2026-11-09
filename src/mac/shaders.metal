@@ -20,7 +20,7 @@ struct Globals {
     float2 atlas_inv;     // 1 / atlas size
     float  gamma;         // coverage shaping exponent
     float  contrast;      // stem darkening, 0..1
-    float  opacity;       // background alpha
+    float  opacity;       // default background alpha (the clear colour's)
     float  pad;
 };
 
@@ -69,8 +69,11 @@ vertex RectOut vs_rect(uint vid [[vertex_id]],
     return o;
 }
 
+// Rectangles carry their own alpha. Over glass, only the default background
+// (the clear colour) and the tab strip are see-through; cell colours an app
+// asked for, the cursor, selection and box drawing stay solid, like the text.
 fragment float4 fs_rect(RectOut in [[stage_in]], constant Globals& g [[buffer(0)]]) {
-    float a = in.color.a * g.opacity;
+    float a = in.color.a;
     return float4(in.color.rgb * a, a);
 }
 

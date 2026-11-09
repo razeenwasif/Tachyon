@@ -322,6 +322,12 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    native tabs, menus and shortcuts, accessibility settings. The edge-to-edge
    layout with cell tabs in the status line and hover-reveal window buttons.
    The notch full-screen mode as a prototype.
+   *Liquid Glass and appearance done (9 November 2026):* an NSGlassEffectView
+   behind a non-opaque Metal layer (NSVisualEffectView before macOS 26), with
+   only the default background translucent; Reduce Transparency makes it
+   opaque. A light theme with its own ANSI set follows Light and Dark Mode
+   through viewDidChangeEffectiveAppearance; `accent` for the cursor and
+   selection. Still to do: the Increase Contrast palette.
    *Tabs done (9 November 2026):* a strip drawn in cells along the bottom
    edge, shown only with two or more tabs. Tabs are named from OSC 7 (the
    folder), the command line the zsh integration reports with OSC 133;C, or a

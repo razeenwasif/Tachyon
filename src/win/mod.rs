@@ -1132,8 +1132,8 @@ impl App {
 fn apply_backdrop(hwnd: HWND, backdrop: Backdrop) {
     match backdrop {
         Backdrop::None => {}
-        Backdrop::Acrylic | Backdrop::Blur => {
-            let acrylic = backdrop == Backdrop::Acrylic;
+        Backdrop::Acrylic | Backdrop::Blur | Backdrop::Glass => {
+            let acrylic = backdrop != Backdrop::Blur;
             if !apply_accent_blur(hwnd, acrylic) {
                 crate::log!("accent blur unavailable; falling back to system backdrop");
                 apply_system_backdrop(hwnd, DWMSBT_TRANSIENTWINDOW);

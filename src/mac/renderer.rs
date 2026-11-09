@@ -371,6 +371,12 @@ impl Renderer {
         self.cfg.font.size
     }
 
+    /// Switch colours, for Light and Dark Mode. The caller redraws.
+    pub fn set_theme(&mut self, theme: &crate::config::ThemeConfig) {
+        self.palette = theme.palette();
+        self.cfg.theme = theme.clone();
+    }
+
     fn resolve_colors(&self, cell: &Cell, term: &Term, selected: bool) -> ([u8; 3], [u8; 3]) {
         let theme = &self.cfg.theme;
         let mut fg_color = cell.fg;
@@ -730,14 +736,21 @@ impl Renderer {
         let h = self.strip_height();
         let y0 = self.size.1 - h;
         let text_y = y0 + ((h - m.height) / 2.0).round();
-        self.bg.push(RectInstance { rect: [0.0, y0, self.size.0, h], color: srgb(band) });
+        let see_through = |c: [u8; 3], a: f32| {
+            let mut v = srgb(c);
+            v[3] = a;
+            v
+        };
+        let opacity = self.cfg.window.opacity;
 
         for (i, (label, unseen)) in strip.tabs.iter().enumerate() {
             let (x0, x1) = self.strip_edges(cols, n, i);
             let active = i == strip.active;
-            if active {
-                self.bg.push(RectInstance { rect: [x0, y0, x1 - x0, h], color: srgb(theme.background) });
-            } else {
+            // The tab in front is left as the window's own background (the
+            // clear colour), so over glass it's exactly as see-through as the
+            // text area above it. The others get the band, just as see-through.
+            if !active {
+                self.bg.push(RectInstance { rect: [x0, y0, x1 - x0, h], color: see_through(band, opacity) });
                 self.bg.push(RectInstance { rect: [x0, y0, x1 - x0, hair], color: srgb(line) });
                 // A short divider between two tabs in the background.
                 if i + 1 < n && i + 1 != strip.active {
