@@ -49,11 +49,27 @@ pub fn set_bulk_lines(on: bool) {
     BULK.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The longest APC string kept (a kitty image chunk is at most 4 KB, but a
+/// client may send a whole image in one): beyond this it's dropped.
+const MAX_APC: usize = 64 << 20;
+
 /// Drives a [`Term`] from a raw byte stream.
 pub struct Processor {
     parser: Parser,
     /// True when the VT state machine is known to be in Ground.
     in_ground: bool,
+    /// The last byte given to vte was ESC.
+    after_esc: bool,
+    /// Inside an OSC string, which can go to vte in bulk up to its end.
+    in_osc: bool,
+    /// Inside an APC string (`ESC _ ... ESC \`), which vte ignores: kitty's
+    /// graphics protocol. Collected here and given to the terminal whole.
+    apc: Option<Vec<u8>>,
+    /// The APC string so far ended with an ESC: the next byte says whether
+    /// that started its terminator.
+    apc_esc: bool,
+    /// The APC string grew past [`MAX_APC`]: it's skipped.
+    apc_overflow: bool,
 }
 
 impl Default for Processor {
@@ -67,6 +83,11 @@ impl Processor {
         Processor {
             parser: Parser::new(),
             in_ground: true,
+            after_esc: false,
+            in_osc: false,
+            apc: None,
+            apc_esc: false,
+            apc_overflow: false,
         }
     }
 
@@ -115,10 +136,73 @@ impl Processor {
                 self.in_ground = false;
             }
 
+            if self.apc.is_some() {
+                bytes = self.apc_bytes(term, bytes);
+                continue;
+            }
+            if self.in_osc {
+                // The string's body, up to whatever might end it, in one go:
+                // an image sent with OSC 1337 is megabytes of it.
+                let n = bytes.iter().position(|&b| matches!(b, 0x07 | 0x1B | 0x18 | 0x1A)).unwrap_or(bytes.len());
+                if n > 0 {
+                    self.parser.advance(term, &bytes[..n]);
+                    bytes = &bytes[n..];
+                    continue;
+                }
+                self.in_osc = false;
+            }
+
+            let b = bytes[0];
             self.parser.advance(term, &bytes[..1]);
             bytes = &bytes[1..];
+            if self.after_esc && b == b'_' {
+                self.apc = Some(Vec::new());
+                self.apc_overflow = false;
+            } else if self.after_esc && b == b']' {
+                self.in_osc = true;
+            }
+            self.after_esc = b == 0x1B;
             if term.take_ground_signal() {
                 self.in_ground = true;
+            }
+        }
+    }
+
+    /// Collect an APC string's bytes, giving it to the terminal when its
+    /// `ESC \` comes. Returns what's left of `bytes`.
+    fn apc_bytes<'a>(&mut self, term: &mut Term, mut bytes: &'a [u8]) -> &'a [u8] {
+        loop {
+            if self.apc_esc {
+                self.apc_esc = false;
+                let apc = self.apc.take().unwrap_or_default();
+                // vte is in its APC state, ignoring everything: the ESC (with
+                // the `\`) ends that.
+                self.parser.advance(term, b"\x1b");
+                self.after_esc = true;
+                if bytes[0] == b'\\' && !self.apc_overflow {
+                    term.apc(&apc);
+                }
+                // The `\`, or whatever follows a stray ESC, takes the usual path.
+                return bytes;
+            }
+            let buf = self.apc.as_mut().expect("in an APC string");
+            let end = bytes.iter().position(|&b| b == 0x1B);
+            let body = &bytes[..end.unwrap_or(bytes.len())];
+            if buf.len() + body.len() > MAX_APC {
+                self.apc_overflow = true;
+                buf.clear();
+            } else if !self.apc_overflow {
+                buf.extend_from_slice(body);
+            }
+            match end {
+                Some(i) => {
+                    self.apc_esc = true;
+                    bytes = &bytes[i + 1..];
+                    if bytes.is_empty() {
+                        return bytes;
+                    }
+                }
+                None => return &[],
             }
         }
     }

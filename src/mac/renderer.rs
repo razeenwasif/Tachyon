@@ -33,6 +33,7 @@ use rustc_hash::FxHashMap;
 use unicode_width::UnicodeWidthChar;
 
 use super::font::{CellMetrics, FontSet, GlyphBitmap};
+use super::images;
 use super::selection::Range;
 use crate::config::Config;
 use crate::term::{Cell, CellFlags, CursorShape, Palette, Term, TermMode, CLUSTER_TAG};
@@ -51,6 +52,26 @@ struct Globals {
     opacity: f32,
     _pad: f32,
 }
+
+/// One inline image to draw: where, and which part of its texture.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ImageInstance {
+    dst: [f32; 4],
+    uv: [f32; 4],
+}
+
+/// An inline image's texture, made at the size it last showed at.
+struct ImageTexture {
+    /// `None` when it couldn't be decoded: not tried again.
+    texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    size: (u32, u32),
+    /// The frame it was last drawn in.
+    used: usize,
+}
+
+/// Texture memory kept for inline images not on screen.
+const IMAGE_CACHE_BYTES: usize = 384 << 20;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -196,6 +217,7 @@ pub struct Gpu {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     rect_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     glyph_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    image_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }
 
 impl Gpu {
@@ -208,11 +230,13 @@ impl Gpu {
             .map_err(|e| format!("shader compile failed: {}", e.localizedDescription()))?;
         let rect_pso = pipeline(&device, &*library, "vs_rect", "fs_rect")?;
         let glyph_pso = pipeline(&device, &*library, "vs_glyph", "fs_glyph")?;
+        let image_pso = pipeline(&device, &*library, "vs_image", "fs_image")?;
         Ok(Rc::new(Gpu {
             device,
             queue,
             rect_pso,
             glyph_pso,
+            image_pso,
         }))
     }
 }
@@ -241,6 +265,9 @@ pub struct Renderer {
     bg: Vec<RectInstance>,
     glyphs: Vec<GlyphInstance>,
     overlay: Vec<RectInstance>,
+    /// Inline images this frame, by image id, drawn in order.
+    images: Vec<(u64, ImageInstance)>,
+    textures: FxHashMap<u64, ImageTexture>,
 }
 
 impl Renderer {
@@ -278,6 +305,8 @@ impl Renderer {
             bg: Vec::new(),
             glyphs: Vec::new(),
             overlay: Vec::new(),
+            images: Vec::new(),
+            textures: FxHashMap::default(),
         })
     }
 
@@ -464,9 +493,13 @@ impl Renderer {
         self.bg.clear();
         self.glyphs.clear();
         self.overlay.clear();
+        self.images.clear();
         for p in panes {
             let origin = self.pane_origin(p.col, p.row);
             self.build(p.term, origin, p.focused, p.selection, p.cursor_on_layer);
+            if p.term.has_images() {
+                self.build_images(p.term, origin);
+            }
             // Receipt gutter bars sit in the padding left of the text, or for
             // a pane right of a divider, in the divider's cell beside it.
             let (pad_x, _) = self.padding();
@@ -583,6 +616,18 @@ impl Renderer {
         };
 
         draw(&self.gpu.rect_pso, bg, self.bg.len());
+        // Images sit on the cell backgrounds, under any text.
+        if !self.images.is_empty() {
+            enc.setRenderPipelineState(&self.gpu.image_pso);
+            for (id, inst) in &self.images {
+                let Some(tex) = self.textures.get(id).and_then(|t| t.texture.as_ref()) else { continue };
+                unsafe {
+                    enc.setVertexBytes_length_atIndex(NonNull::from(inst).cast(), size_of::<ImageInstance>(), 0);
+                    enc.setFragmentTexture_atIndex(Some(tex), 0);
+                    enc.drawPrimitives_vertexStart_vertexCount_instanceCount(MTLPrimitiveType::TriangleStrip, 0, 4, 1);
+                }
+            }
+        }
         unsafe { enc.setFragmentTexture_atIndex(Some(&self.atlas.texture), 0) };
         draw(&self.gpu.glyph_pso, glyphs, self.glyphs.len());
         draw(&self.gpu.rect_pso, overlay, self.overlay.len());
@@ -598,6 +643,80 @@ impl Renderer {
         cb.presentDrawable(drawable);
         cb.commit();
         slot.in_flight = Some(cb);
+    }
+
+    /// The pane's inline images: each fitted to its cells keeping its shape,
+    /// clipped to the pane, with a texture made at the size it shows at.
+    fn build_images(&mut self, term: &Term, origin: (f32, f32)) {
+        let m = self.fonts.metrics;
+        let pane = (origin.0, origin.1, origin.0 + term.cols() as f32 * m.width, origin.1 + term.rows() as f32 * m.height);
+        for v in term.visible_images() {
+            let bx = (v.cols as f32 * m.width, v.rows as f32 * m.height);
+            let (w, h) = images::contain((v.image.width, v.image.height), bx);
+            let (x0, y0) = (origin.0 + v.col as f32 * m.width, origin.1 + v.row as f32 * m.height);
+            // The part inside the pane.
+            let (cx0, cy0) = (x0.max(pane.0), y0.max(pane.1));
+            let (cx1, cy1) = ((x0 + w).min(pane.2), (y0 + h).min(pane.3));
+            if cx1 <= cx0 || cy1 <= cy0 {
+                continue;
+            }
+            let uv = [(cx0 - x0) / w, (cy0 - y0) / h, (cx1 - x0) / w, (cy1 - y0) / h];
+            let want = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
+            self.image_texture(&v.image, want);
+            self.images.push((v.image.id, ImageInstance { dst: [cx0, cy0, cx1 - cx0, cy1 - cy0], uv }));
+        }
+    }
+
+    /// Make sure there's a texture for `image` at about `want` pixels:
+    /// decoded again when it shows at a quite different size (the font size
+    /// changed, or the window moved to another display).
+    fn image_texture(&mut self, image: &crate::term::image::Image, want: (u32, u32)) {
+        let want = (want.0.min(images::MAX_SIDE), want.1.min(images::MAX_SIDE));
+        let frame = self.frame;
+        if let Some(t) = self.textures.get_mut(&image.id) {
+            t.used = frame;
+            let near = |a: u32, b: u32| a.abs_diff(b) <= (b / 8).max(2);
+            if t.texture.is_none() || (near(t.size.0, want.0) && near(t.size.1, want.1)) {
+                return;
+            }
+        }
+        let texture = images::decode(image, want.0, want.1).and_then(|px| {
+            let desc = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    MTLPixelFormat::RGBA8Unorm_sRGB,
+                    px.width as usize,
+                    px.height as usize,
+                    false,
+                )
+            };
+            desc.setUsage(MTLTextureUsage::ShaderRead);
+            let tex = self.gpu.device.newTextureWithDescriptor(&desc)?;
+            let region = MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize { width: px.width as usize, height: px.height as usize, depth: 1 },
+            };
+            unsafe {
+                tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    region,
+                    0,
+                    NonNull::new(px.data.as_ptr() as *mut _)?,
+                    px.width as usize * 4,
+                )
+            };
+            Some(tex)
+        });
+        if texture.is_none() {
+            crate::log!("images: could not decode image {} ({}x{})", image.id, image.width, image.height);
+        }
+        self.textures.insert(image.id, ImageTexture { texture, size: want, used: frame });
+        // Over budget: the least recently drawn go, never one in this frame.
+        let bytes = |t: &ImageTexture| t.size.0 as usize * t.size.1 as usize * 4;
+        let mut total: usize = self.textures.values().map(bytes).sum();
+        while total > IMAGE_CACHE_BYTES {
+            let Some((&id, t)) = self.textures.iter().filter(|(_, t)| t.used != frame).min_by_key(|(_, t)| t.used) else { break };
+            total -= bytes(t);
+            self.textures.remove(&id);
+        }
     }
 
     fn build(&mut self, term: &Term, origin: (f32, f32), focused: bool, selection: Option<Range>, cursor_on_layer: bool) {

@@ -124,3 +124,34 @@ fragment float4 fs_glyph(GlyphOut in [[stage_in]],
     float a = shape_coverage(t.a, g) * in.color.a;
     return float4(in.color.rgb * a, a);
 }
+
+// ---- inline images ------------------------------------------------------------
+//
+// One draw per image, each with its own texture: premultiplied sRGB, decoded
+// at about the size it shows at, so a linear filter is enough.
+
+struct ImageInstance {
+    float4 dst;    // x, y, w, h in pixels
+    float4 uv;     // the texture's visible part: u0, v0, u1, v1
+};
+
+struct ImageOut {
+    float4 pos [[position]];
+    float2 uv;
+};
+
+vertex ImageOut vs_image(uint vid [[vertex_id]],
+                         constant ImageInstance& im [[buffer(0)]],
+                         constant Globals& g [[buffer(1)]]) {
+    float2 c = corner(vid);
+    ImageOut o;
+    o.pos = to_clip(im.dst.xy + c * im.dst.zw, g.viewport);
+    o.uv = mix(im.uv.xy, im.uv.zw, c);
+    return o;
+}
+
+fragment float4 fs_image(ImageOut in [[stage_in]],
+                         texture2d<float> tex [[texture(0)]]) {
+    constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);
+    return tex.sample(s, in.uv);
+}

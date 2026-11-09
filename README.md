@@ -313,6 +313,18 @@ terminal wrapped is searched as one line, so a match can cross the wrap. A
 search over a full 100,000-line scrollback takes 12–18 ms, most of it reading
 lines straight from their packed bytes.
 
+**Inline images.** Programs can show pictures in the terminal, through either
+of the two protocols tools use: iTerm2's (OSC 1337 `File=`, what `imgcat` and
+many plotting backends send, multipart transfers included) and kitty's
+graphics protocol (APC `G`: PNG or raw RGB/RGBA pixels, chunked, sent with an
+id and shown again or deleted later, with its `OK` replies). An image sits on
+the lines it was printed on and scrolls with them, into the scrollback and
+back, and goes when they do; `clear` removes it. Images wider than the
+terminal are scaled down to fit, keeping their shape. Tachyon reports a cell's
+size in pixels (`CSI 16 t`, `CSI 14 t`, and the PTY's pixel size), which is
+how tools size what they send. ImageIO decodes them at the size they show at,
+and each draws as one textured quad under the text.
+
 **Suggestions.** As you type at a prompt, Tachyon shows in grey the rest of a
 command you've run before; → or End (or ⌃F) types it in for you, ⌥→ one word
 of it. Suggestions come from your shell's history file (zsh, bash or fish),
