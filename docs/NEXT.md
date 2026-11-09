@@ -77,6 +77,15 @@ after**, roughly 7x less for the scrollback itself. That is about 550 bytes per
 packed line in practice once allocator overhead and buffer capacity are counted,
 not the ~94 bytes estimated in §4.
 
+*Shared blocks (9 November 2026):* scrollback lines now live in 64 KiB
+blocks with a 24-byte index entry each, instead of an allocation per line;
+a block goes when its last line is evicted and is reused for the next.
+Footprint per line, each case in a fresh process
+(`tests/scrollback_memory.rs`): a build log 195 → 128 B, the same once
+scrollback is full and evicting 320 → 140 B, short lines 153 → 79 B. So a
+full 100,000-line scrollback of build output went from about 31 MiB to 13 MiB.
+Parse throughput unchanged.
+
 Still short of the 1 GiB/s target. For build logs, scrolling has dropped out
 of the profile and parsing and writing cells dominate; for long plain lines,
 packing a full 200-character line is now about half the cost.

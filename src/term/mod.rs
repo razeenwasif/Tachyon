@@ -252,6 +252,9 @@ pub struct Term {
 
     /// Reused by `write_bulk_lines`.
     bulk_scratch: Vec<(usize, usize)>,
+
+    /// The column where the command line starts on its row (OSC 133 B).
+    input_col: usize,
 }
 
 impl Term {
@@ -293,6 +296,7 @@ impl Term {
             awake_cmd: None,
             awake_next: false,
             bulk_scratch: Vec::new(),
+            input_col: 0,
         }
     }
 
@@ -426,6 +430,7 @@ impl Term {
             awake_cmd: None,
             awake_next: false,
             bulk_scratch: Vec::new(),
+            input_col: 0,
         }
     }
 
@@ -505,6 +510,50 @@ impl Term {
         self.awake_cmd
     }
 
+    /// What's typed at the prompt, when the cursor is at its end: the text
+    /// from where the command line starts (OSC 133 B) to the cursor, and how
+    /// many blank cells follow the cursor before anything else on its row (a
+    /// right prompt, say). `None` while a command runs, on the alternate
+    /// screen, scrolled back, with the cursor inside the text, or without
+    /// shell integration.
+    pub fn prompt_input(&self) -> Option<(String, usize)> {
+        if self.mode.contains(TermMode::ALT_SCREEN) || self.grid.display_offset() != 0 {
+            return None;
+        }
+        let id = self.current_cmd?;
+        if self.commands.get(&id)?.state != CommandState::Prompt {
+            return None;
+        }
+        let cy = self.cursor.y.min(self.rows() - 1);
+        let cx = if self.cursor.wrap_pending { self.cols() } else { self.cursor.x };
+        // The row the command line starts on: at or above the cursor's.
+        let start = (cy.saturating_sub(8)..=cy)
+            .rev()
+            .find(|&y| self.grid.row(y).mark.cmd == id && self.grid.row(y).mark.has(RowMark::INPUT))?;
+        let mut text = String::new();
+        for y in start..=cy {
+            let row = self.grid.row(y);
+            let from = if y == start { self.input_col } else { 0 };
+            let to = if y == cy { cx } else { self.cols() };
+            for c in row.cells().get(from..to.max(from))? {
+                if c.flags.contains(CellFlags::WIDE_SPACER) {
+                    continue;
+                }
+                if c.ch & CLUSTER_TAG != 0 {
+                    text.extend(self.cluster(c.ch).unwrap_or(&[]));
+                } else {
+                    text.push(char::from_u32(c.ch).filter(|&ch| ch != '\0').unwrap_or(' '));
+                }
+            }
+            if y < cy && !row.wrapped {
+                return None; // a second line of input: not a simple command line
+            }
+        }
+        let after = self.grid.row(cy).cells().get(cx..).unwrap_or(&[]);
+        let blank = after.iter().take_while(|c| c.ch == 0 || c.ch == ' ' as u32).count();
+        Some((text, blank))
+    }
+
     pub fn command_running(&self) -> bool {
         self.current_cmd
             .and_then(|id| self.commands.get(&id))
@@ -575,6 +624,7 @@ impl Term {
             b'B' => {
                 if let Some(id) = self.current_cmd {
                     self.mark_row(id, RowMark::INPUT);
+                    self.input_col = self.cursor.x;
                 }
             }
             b'C' => {
@@ -2032,6 +2082,40 @@ fn parse_file_url(url: &[u8]) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    fn feed(t: &mut Term, s: &str) {
+        Processor::new().advance(t, s.as_bytes());
+    }
+
+    #[test]
+    fn what_is_typed_at_the_prompt() {
+        let mut t = Term::new(40, 6, 100);
+        assert_eq!(t.prompt_input(), None, "no shell integration");
+        feed(&mut t, "\x1b]133;A\x07~/proj \x1b]133;B\x07");
+        assert_eq!(t.prompt_input(), Some((String::new(), 33)));
+        feed(&mut t, "cargo t");
+        assert_eq!(t.prompt_input(), Some(("cargo t".into(), 26)));
+        // A right prompt further along: the blank cells before it.
+        feed(&mut t, "\x1b[34G(base)\x1b[15G");
+        assert_eq!(t.prompt_input(), Some(("cargo t".into(), 19)));
+        // Cursor moved back into the text: nothing blank after it.
+        feed(&mut t, "\x1b[12G");
+        assert_eq!(t.prompt_input(), Some(("carg".into(), 0)));
+        feed(&mut t, "\x1b[15G\r\n\x1b]133;C;cmdline=cargo t\x07");
+        assert_eq!(t.prompt_input(), None, "running");
+    }
+
+    #[test]
+    fn a_long_command_line_wraps() {
+        let mut t = Term::new(10, 6, 100);
+        feed(&mut t, "\x1b]133;A\x07$ \x1b]133;B\x07echo abcdefghij");
+        assert_eq!(t.prompt_input().map(|p| p.0), Some("echo abcdefghij".into()));
+    }
 }
 
 #[cfg(test)]

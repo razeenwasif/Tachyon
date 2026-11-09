@@ -229,38 +229,173 @@ impl PackedRow {
     }
 
     pub fn unpack(&self, cols: usize) -> Row {
-        let len = self.len as usize;
-        let mut cells = vec![Cell::EMPTY; cols.max(len)];
-        let text_bytes = if self.wide { len * 4 } else { len };
-        let runs = &self.data[text_bytes..];
-        let run_at = |k: usize| -> (usize, Cell) {
-            let r = &runs[k * RUN_BYTES..(k + 1) * RUN_BYTES];
-            let u = |o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
-            let fu = u(10);
-            let style = Cell {
-                ch: 0,
-                fg: Color(u(2)),
-                bg: Color(u(6)),
-                flags: CellFlags::from_bits_retain(fu as u16),
-                underline: (fu >> 16) as u16,
-            };
-            (u16::from_le_bytes([r[0], r[1]]) as usize, style)
+        unpack(&self.data, self.len, self.runs, self.wide, self.wrapped, self.mark, cols)
+    }
+}
+
+/// A packed line's cells, `cols` wide, from its bytes and description.
+fn unpack(data: &[u8], len: u16, runs: u16, wide: bool, wrapped: bool, mark: RowMark, cols: usize) -> Row {
+    let len = len as usize;
+    let mut cells = vec![Cell::EMPTY; cols.max(len)];
+    let text_bytes = if wide { len * 4 } else { len };
+    let run_bytes = &data[text_bytes..];
+    let run_at = |k: usize| -> (usize, Cell) {
+        let r = &run_bytes[k * RUN_BYTES..(k + 1) * RUN_BYTES];
+        let u = |o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+        let fu = u(10);
+        let style = Cell {
+            ch: 0,
+            fg: Color(u(2)),
+            bg: Color(u(6)),
+            flags: CellFlags::from_bits_retain(fu as u16),
+            underline: (fu >> 16) as u16,
         };
-        for k in 0..self.runs as usize {
-            let (start, style) = run_at(k);
-            let end = if k + 1 < self.runs as usize { run_at(k + 1).0 } else { len };
-            for (i, cell) in cells[start..end].iter_mut().enumerate() {
-                let i = start + i;
-                *cell = style;
-                cell.ch = if self.wide {
-                    u32::from_le_bytes([self.data[i * 4], self.data[i * 4 + 1], self.data[i * 4 + 2], self.data[i * 4 + 3]])
-                } else {
-                    self.data[i] as u32
-                };
+        (u16::from_le_bytes([r[0], r[1]]) as usize, style)
+    };
+    for k in 0..runs as usize {
+        let (start, style) = run_at(k);
+        let end = if k + 1 < runs as usize { run_at(k + 1).0 } else { len };
+        for (i, cell) in cells[start..end].iter_mut().enumerate() {
+            let i = start + i;
+            *cell = style;
+            cell.ch = if wide {
+                u32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+            } else {
+                data[i] as u32
+            };
+        }
+    }
+    cells.truncate(cols);
+    Row { cells, wrapped, dirty: true, mark }
+}
+
+/// Scrollback: every line's packed bytes in shared blocks, with a small
+/// index entry each, rather than an allocation per line. A line never spans
+/// two blocks; a block goes when its last line is evicted, and the newest
+/// block freed is kept to fill next, so a full scrollback allocates nothing.
+#[derive(Default)]
+struct History {
+    /// Blocks oldest first; the last is being filled.
+    blocks: VecDeque<Vec<u8>>,
+    /// The sequence number of `blocks[0]`.
+    first_block: u32,
+    index: VecDeque<Entry>,
+    /// A freed block, to fill next.
+    spare: Option<Vec<u8>>,
+}
+
+/// One scrollback line: where its bytes are, and what they describe.
+#[derive(Clone, Copy)]
+struct Entry {
+    block: u32,
+    offset: u32,
+    len: u16,
+    runs: u16,
+    /// Bit 0: wide (4-byte characters). Bit 1: wrapped.
+    flags: u8,
+    mark: RowMark,
+}
+
+const BLOCK: usize = 64 * 1024;
+
+impl Entry {
+    fn size(&self) -> usize {
+        let text = if self.flags & 1 != 0 { self.len as usize * 4 } else { self.len as usize };
+        text + self.runs as usize * RUN_BYTES
+    }
+}
+
+impl History {
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    fn clear(&mut self) {
+        self.index.clear();
+        self.spare = self.blocks.drain(..).max_by_key(Vec::capacity).map(|mut b| {
+            b.clear();
+            b
+        });
+        self.first_block = 0;
+    }
+
+    /// Add a line at the end, evicting the oldest first if there are `max`.
+    fn push(&mut self, p: &PackedRow, max: usize) {
+        let flags = p.wide as u8 | (p.wrapped as u8) << 1;
+        let (block, offset) = self.room(p.data.len(), max);
+        self.blocks.back_mut().expect("room made").extend_from_slice(&p.data);
+        self.index.push_back(Entry { block, offset, len: p.len, runs: p.runs, flags, mark: p.mark });
+    }
+
+    /// Add a line of ASCII in one style, written straight into its block.
+    fn push_ascii(&mut self, text: &[u8], style: [u32; 3], mark: RowMark, max: usize) {
+        let len = text.len().min(u16::MAX as usize);
+        let runs = (len > 0) as usize;
+        let (block, offset) = self.room(len + runs * RUN_BYTES, max);
+        let b = self.blocks.back_mut().expect("room made");
+        b.extend_from_slice(&text[..len]);
+        if runs > 0 {
+            let at = b.len();
+            b.resize(at + RUN_BYTES, 0);
+            put_run(&mut b[at..], 0, &style);
+        }
+        self.index.push_back(Entry { block, offset, len: len as u16, runs: runs as u16, flags: 0, mark });
+    }
+
+    /// Make room for `n` bytes at the end of the newest block, evicting the
+    /// oldest line if there are `max`; returns the block and offset.
+    fn room(&mut self, n: usize, max: usize) -> (u32, u32) {
+        if self.index.len() >= max {
+            self.pop_front();
+        }
+        let fits = self.blocks.back().is_some_and(|b| b.capacity() - b.len() >= n);
+        if !fits {
+            let block = match self.spare.take() {
+                Some(b) if b.capacity() >= n => b,
+                _ => Vec::with_capacity(BLOCK.max(n)),
+            };
+            if self.blocks.is_empty() {
+                self.first_block = 0;
+            }
+            self.blocks.push_back(block);
+        }
+        let block_seq = self.first_block.wrapping_add(self.blocks.len() as u32 - 1);
+        let offset = self.blocks.back().expect("just ensured").len() as u32;
+        (block_seq, offset)
+    }
+
+    fn pop_front(&mut self) {
+        if self.index.pop_front().is_none() {
+            return;
+        }
+        // Free leading blocks no line points into any more (never the one
+        // being filled).
+        while self.blocks.len() > 1 && self.index.front().is_none_or(|e| e.block != self.first_block) {
+            let mut b = self.blocks.pop_front().expect("len > 1");
+            b.clear();
+            self.spare = Some(b);
+            self.first_block = self.first_block.wrapping_add(1);
+        }
+        if self.index.is_empty() {
+            if let Some(b) = self.blocks.back_mut() {
+                b.clear();
             }
         }
-        cells.truncate(cols);
-        Row { cells, wrapped: self.wrapped, dirty: true, mark: self.mark }
+    }
+
+    fn row(&self, i: usize, cols: usize) -> Row {
+        let e = self.index[i];
+        let b = &self.blocks[e.block.wrapping_sub(self.first_block) as usize];
+        let data = &b[e.offset as usize..e.offset as usize + e.size()];
+        unpack(data, e.len, e.runs, e.flags & 1 != 0, e.flags & 2 != 0, e.mark, cols)
+    }
+
+    fn mark(&self, i: usize) -> RowMark {
+        self.index[i].mark
+    }
+
+    fn set_mark(&mut self, i: usize, mark: RowMark) {
+        self.index[i].mark = mark;
     }
 }
 
@@ -360,7 +495,9 @@ pub struct Grid {
     /// Ring index of the screen's first line.
     top: usize,
     /// Scrollback, oldest first, packed.
-    history: VecDeque<PackedRow>,
+    history: History,
+    /// Reused for packing each line before it's copied into the history.
+    scratch: Vec<u8>,
     /// Lines scrolled up from the live viewport, 0..=history.
     display_offset: usize,
     /// While scrolled back: the history lines at the top of the viewport,
@@ -381,7 +518,8 @@ impl Grid {
             max_scrollback,
             screen: (0..rows).map(|_| Row::new(cols)).collect(),
             top: 0,
-            history: VecDeque::new(),
+            history: History::default(),
+            scratch: Vec::new(),
             display_offset: 0,
             view: Vec::new(),
             full_damage: true,
@@ -448,7 +586,7 @@ impl Grid {
     pub fn line(&self, absolute: usize) -> Cow<'_, Row> {
         let h = self.history.len();
         if absolute < h {
-            Cow::Owned(self.history[absolute].unpack(self.cols))
+            Cow::Owned(self.history.row(absolute, self.cols))
         } else {
             Cow::Borrowed(&self.screen[self.live_index((absolute - h).min(self.rows - 1))])
         }
@@ -459,7 +597,7 @@ impl Grid {
     pub fn mark(&self, absolute: usize) -> RowMark {
         let h = self.history.len();
         if absolute < h {
-            self.history[absolute].mark
+            self.history.mark(absolute)
         } else if absolute - h < self.rows {
             self.screen[self.live_index(absolute - h)].mark
         } else {
@@ -475,7 +613,8 @@ impl Grid {
             max_scrollback: 0,
             screen: self.screen.clone(),
             top: self.top,
-            history: VecDeque::new(),
+            history: History::default(),
+            scratch: Vec::new(),
             display_offset: 0,
             view: Vec::new(),
             full_damage: true,
@@ -486,7 +625,7 @@ impl Grid {
     pub fn set_mark(&mut self, absolute: usize, mark: RowMark) {
         let h = self.history.len();
         if absolute < h {
-            self.history[absolute].mark = mark;
+            self.history.set_mark(absolute, mark);
         } else if absolute - h < self.rows {
             let i = self.live_index(absolute - h);
             self.screen[i].mark = mark;
@@ -532,7 +671,7 @@ impl Grid {
         let first = self.history.len() - self.display_offset;
         let n = self.display_offset.min(self.rows);
         self.view
-            .extend((first..first + n).map(|i| self.history[i].unpack(self.cols)));
+            .extend((first..first + n).map(|i| self.history.row(i, self.cols)));
     }
 
     // ---------------------------------------------------------------------
@@ -553,20 +692,8 @@ impl Grid {
         if self.max_scrollback == 0 {
             return;
         }
-        let mut data = if self.history.len() == self.max_scrollback {
-            self.history.pop_front().map(|p| p.data).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        data.clear();
-        let len = text.len().min(u16::MAX as usize);
-        if len > 0 {
-            data.extend_from_slice(&text[..len]);
-            data.resize(len + RUN_BYTES, 0);
-            let fu = style.flags.bits() as u32 | (style.underline as u32) << 16;
-            put_run(&mut data[len..], 0, &[style.fg.0, style.bg.0, fu]);
-        }
-        self.history.push_back(PackedRow { data, len: len as u16, runs: (len > 0) as u16, wide: false, wrapped: false, mark });
+        let fu = style.flags.bits() as u32 | (style.underline as u32) << 16;
+        self.history.push_ascii(text, [style.fg.0, style.bg.0, fu], mark, self.max_scrollback);
     }
 
     /// Whether screen row `y` is entirely blank.
@@ -593,14 +720,9 @@ impl Grid {
             // The line leaving the top of the screen becomes history, packed.
             let i = self.top;
             if self.max_scrollback > 0 {
-                // When scrollback is full, the evicted line's buffer holds the
-                // new one.
-                let recycled = if self.history.len() == self.max_scrollback {
-                    self.history.pop_front().map(|p| p.data).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                self.history.push_back(PackedRow::pack_into(&self.screen[i], recycled));
+                let p = PackedRow::pack_into(&self.screen[i], std::mem::take(&mut self.scratch));
+                self.history.push(&p, self.max_scrollback);
+                self.scratch = p.data;
             }
             // Its row, still hot in cache, becomes the new bottom line.
             let cols = self.cols;
@@ -944,7 +1066,10 @@ impl Grid {
         let split = lines.len() - rows;
         let screen = lines.split_off(split);
 
-        self.history = lines.iter().map(PackedRow::pack).collect();
+        self.history = History::default();
+        for line in &lines {
+            self.history.push(&PackedRow::pack(line), usize::MAX);
+        }
         self.screen = screen;
         self.cols = cols;
         self.rows = rows;
@@ -1111,6 +1236,45 @@ mod tests {
             let back = PackedRow::pack(&row).unpack(64);
             assert_eq!(back.cells, row.cells, "len={len} break={style_break:?} wide={wide_at:?}");
         }
+    }
+
+    /// Lines go into shared blocks; evicting the oldest frees whole blocks
+    /// and reuses them, and every line kept reads back as it went in.
+    #[test]
+    fn history_blocks_evict_and_reuse() {
+        let mut h = History::default();
+        let line = |i: usize| {
+            let mut row = Row::new(80);
+            for (k, c) in format!("line {i} {}", "x".repeat(i % 70)).chars().enumerate() {
+                row.cells[k].ch = c as u32;
+            }
+            row.mark = RowMark { cmd: i as u32, kinds: RowMark::OUTPUT };
+            row
+        };
+        let max = 3000;
+        for i in 0..20_000 {
+            h.push(&PackedRow::pack(&line(i)), max);
+        }
+        assert_eq!(h.len(), max);
+        // Only the blocks the kept lines need, plus the one being filled.
+        let bytes: usize = h.index.iter().map(Entry::size).sum();
+        assert!(h.blocks.len() <= bytes / BLOCK + 2, "{} blocks for {bytes} bytes", h.blocks.len());
+        for k in [0, 1, 1500, max - 1] {
+            let i = 20_000 - max + k;
+            assert_eq!(h.row(k, 80).cells, line(i).cells, "line {i}");
+            assert_eq!(h.mark(k).cmd, i as u32);
+        }
+        h.clear();
+        assert_eq!(h.len(), 0);
+        h.push(&PackedRow::pack(&line(7)), max);
+        assert_eq!(h.row(0, 80).cells, line(7).cells);
+        // A line longer than a block gets one of its own.
+        let mut wide = Row::new(20_000);
+        for c in wide.cells.iter_mut() {
+            c.ch = 0x4f60;
+        }
+        h.push(&PackedRow::pack(&wide), max);
+        assert_eq!(h.row(1, 20_000).cells, wide.cells);
     }
 
     #[test]

@@ -135,6 +135,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
 | ⌥⌘A | Keep the Mac awake while this pane's command runs (or its next one) |
 | ⌥⌘L | Latency ledger: where each keystroke's delay goes |
+| → or End, ⌥→ | Take the grey suggestion after the cursor, or one word of it |
 | ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
 | ⌘D / ⌘⇧D | Split the pane: a new shell to the right / below, in the same folder |
 | ⌘⌥← ⌘⌥→ ⌘⌥↑ ⌘⌥↓, or click | Focus the pane on that side, or the one clicked |
@@ -286,6 +287,18 @@ scp shell/tachyon-integration.bash cluster:~/.tachyon-integration.bash
 For zsh, source `shell/tachyon-integration.zsh` from `~/.zshrc`; for fish, copy
 `shell/xdg/fish/vendor_conf.d/tachyon-integration.fish` into
 `~/.config/fish/conf.d/`. Some servers' `sshd_config` doesn't accept `LC_*`.
+
+**Suggestions.** As you type at a prompt, Tachyon shows in grey the rest of a
+command you've run before; → or End (or ⌃F) types it in for you, ⌥→ one word
+of it. Suggestions come from your shell's history file (zsh, bash or fish),
+read at launch, and from every command run in any Tachyon tab, recorded with
+its folder: the newest match wins, one run in the same folder first. Tachyon's
+record is `~/Library/Application Support/Tachyon/history`, readable only by
+you. Commands typed with a leading space aren't recorded, the shells'
+convention for keeping one out of history, and multi-line commands aren't
+suggested. A suggestion is only drawn where the rest of the line is blank, so a
+shell that suggests on its own (fish, zsh-autosuggestions) keeps its own, and it
+stops short of a right prompt. `shell.suggestions = false` turns them off.
 
 **Latency ledger.** ⌥⌘L shows, on the prompt line, where your last
 keystroke's delay went. The key event is timed when the hardware delivered

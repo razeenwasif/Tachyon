@@ -341,6 +341,9 @@ pub struct ShellConfig {
     /// updating Tachyon leaves them running and reopening it brings them
     /// back. Off: shells end with the app.
     pub persist: bool,
+    /// macOS: grey suggestions after the cursor at a prompt, from commands
+    /// run before; → takes one.
+    pub suggestions: bool,
 }
 
 impl Default for ShellConfig {
@@ -350,6 +353,7 @@ impl Default for ShellConfig {
             args: Vec::new(),
             integration: true,
             persist: true,
+            suggestions: true,
         }
     }
 }
@@ -596,6 +600,7 @@ impl Config {
             "shell.program" => self.shell.program = value.to_string(),
             "shell.integration" => self.shell.integration = parse_bool(value)?,
             "shell.persist" => self.shell.persist = parse_bool(value)?,
+            "shell.suggestions" => self.shell.suggestions = parse_bool(value)?,
             "shell.args" => {
                 self.shell.args = value
                     .split_whitespace()
