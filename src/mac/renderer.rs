@@ -668,7 +668,10 @@ impl Renderer {
                 Outcome::Running => self.palette.0[4],
                 Outcome::Succeeded => self.palette.0[2],
                 Outcome::Failed => self.palette.0[1],
+                Outcome::Changed => self.palette.0[3],
             };
+            // A changed line's mark is wider, so it stands out from the bar.
+            let width = if outcome == Outcome::Changed { width * 2.0 } else { width };
             self.bg.push(RectInstance {
                 rect: [x, pad_y + y as f32 * m.height, width, m.height],
                 color: srgb(color),
@@ -1004,6 +1007,8 @@ pub enum Outcome {
     Running,
     Succeeded,
     Failed,
+    /// Rerun diff: this line differs from the command's last run.
+    Changed,
 }
 
 /// `text` cut to at most `cols` cells, ending in an ellipsis when cut.

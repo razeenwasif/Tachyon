@@ -2,6 +2,7 @@
 
 pub mod jobs;
 pub mod lens;
+pub mod rerun;
 pub mod cell;
 pub mod color;
 pub mod grid;
@@ -151,6 +152,9 @@ pub struct CommandInfo {
     pub lens: lens::Lens,
     /// The first job it submitted to a cluster, if it did.
     pub job: Option<jobs::JobRef>,
+    /// How its output differs from the last run of the same command, by
+    /// logical output line; `None` when there was no last run to compare.
+    pub rerun: Option<Vec<(usize, rerun::Change)>>,
 }
 
 impl CommandInfo {
@@ -213,6 +217,9 @@ pub struct Term {
     ssh_session: Option<(String, Option<String>)>,
     /// Jobs submitted here, newest last.
     pub jobs: Vec<jobs::JobRef>,
+    /// The last output of recent commands, by command-line shape, for
+    /// rerun diff.
+    last_outputs: std::collections::VecDeque<(String, Vec<String>)>,
     /// Incremented whenever anything a tab's name is made from changes (the
     /// title, the working directory, a command starting or ending), so the
     /// app can cheaply notice.
@@ -259,6 +266,7 @@ impl Term {
             cwd_host: None,
             ssh_session: None,
             jobs: Vec::new(),
+            last_outputs: std::collections::VecDeque::new(),
             title_revision: 0,
             bell_revision: 0,
             ground_signal: false,
@@ -285,6 +293,82 @@ impl Term {
 
     pub fn take_command_events(&mut self) -> Vec<CommandEvent> {
         core::mem::take(&mut self.command_events)
+    }
+
+    /// The first output row of command `id`, searching back from `from`.
+    fn output_start(&self, id: u32, from: usize) -> Option<usize> {
+        let lo = from.saturating_sub(rerun::MAX_LINES * 4);
+        (lo..=from.min(self.grid.total_lines().saturating_sub(1)))
+            .rev()
+            .find(|&l| {
+                let m = self.grid.mark(l);
+                m.cmd == id && m.has(RowMark::OUTPUT)
+            })
+    }
+
+    /// Command `id` just finished: compare its output with the last run of
+    /// the same command (numbers in the command line ignored), and mark the
+    /// lines that differ.
+    fn compare_run(&mut self, id: u32) {
+        let Some(cmdline) = self.commands.get(&id).and_then(|c| c.cmdline.clone()) else {
+            return;
+        };
+        let end = self.grid.history_len() + self.cursor.y;
+        let Some(first) = self.output_start(id, end) else {
+            return;
+        };
+        // Logical lines (wrapped rows joined) and the row each starts on.
+        let mut starts = vec![first];
+        for l in first..end {
+            if !self.grid.line(l).wrapped && l + 1 < end {
+                starts.push(l + 1);
+            }
+        }
+        if starts.len() > rerun::MAX_LINES || end <= first {
+            return;
+        }
+        let cols = self.cols();
+        let text = self.text_range(first, 0, end - 1, cols.saturating_sub(1));
+        let lines: Vec<String> = text.split('\n').map(|l| l.trim_end().to_string()).take(starts.len()).collect();
+        let key = rerun::shape(cmdline.trim());
+        if let Some(pos) = self.last_outputs.iter().position(|(k, _)| *k == key) {
+            let (_, old) = self.last_outputs.remove(pos).expect("found above");
+            let changes = rerun::diff(&old, &lines);
+            for (i, change) in &changes {
+                let Some(&abs) = starts.get(*i) else { continue };
+                let mut m = self.grid.mark(abs);
+                if m.cmd != id {
+                    m = RowMark { cmd: id, kinds: 0 };
+                }
+                m.kinds |= if *change == rerun::Change::New { RowMark::NEW } else { RowMark::CHANGED };
+                self.grid.set_mark(abs, m);
+            }
+            if let Some(c) = self.commands.get_mut(&id) {
+                c.rerun = Some(changes);
+            }
+            self.dirty = true;
+        }
+        self.last_outputs.push_back((key, lines));
+        if self.last_outputs.len() > 16 {
+            self.last_outputs.pop_front();
+        }
+    }
+
+    /// What a rerun-diff mark on line `abs` means: the line it replaced, or
+    /// that it's new.
+    pub fn rerun_note(&self, abs: usize) -> Option<String> {
+        let mark = self.grid.mark(abs);
+        if !mark.has(RowMark::CHANGED) && !mark.has(RowMark::NEW) {
+            return None;
+        }
+        let changes = self.commands.get(&mark.cmd)?.rerun.as_ref()?;
+        let first = self.output_start(mark.cmd, abs)?;
+        // Which logical output line `abs` starts.
+        let index = (first..abs).filter(|&l| !self.grid.line(l).wrapped).count();
+        changes.iter().find(|(i, _)| *i == index).map(|(_, c)| match c {
+            rerun::Change::Changed(old) => format!("Last run: {old}"),
+            rerun::Change::New => "Not in the last run".to_string(),
+        })
     }
 
     /// A job id seen in the running command's output: remember it, and tie
@@ -384,6 +468,7 @@ impl Term {
                         cmdline: None,
                         lens: lens::Lens::default(),
                         job: None,
+                        rerun: None,
                     },
                 );
                 self.mark_row(id, RowMark::PROMPT);
@@ -440,6 +525,7 @@ impl Term {
                             c.finished = Some(Instant::now());
                             c.exit = exit;
                             self.command_events.push(CommandEvent::Finished(id, exit));
+                            self.compare_run(id);
                             self.title_revision = self.title_revision.wrapping_add(1);
                         }
                     }
@@ -1836,6 +1922,30 @@ mod tests {
         t.record_job(jobs::JobKind::Nexus, "j-1a2b3c4d".into());
         assert_eq!(t.jobs.last().unwrap().via, None);
         assert_eq!(t.running_cmdline(), Some("nexus cpu --detach make"));
+    }
+
+    /// A rerun (numbers in the command line ignored) marks the lines that
+    /// differ from the last run, and says what they were.
+    #[test]
+    fn reruns_mark_what_changed() {
+        let mut t = Term::new(60, 20, 1000);
+        let mut p = Processor::new();
+        let run = |t: &mut Term, p: &mut Processor, cmd: &str, out: &str| {
+            feed(t, p, &format!("\x1b]133;A\x07$ \x1b]133;B\x07{cmd}\r\n\x1b]133;C;cmdline={cmd}\x07{out}\x1b]133;D;0\x07"));
+        };
+        run(&mut t, &mut p, "python train.py --lr 3e-4", "epoch 1 loss=0.90\r\nepoch 2 loss=0.71\r\ndone\r\n");
+        let first = t.current_command().unwrap();
+        assert!(t.command(first).unwrap().rerun.is_none(), "nothing to compare the first run with");
+        run(&mut t, &mut p, "python train.py --lr 1e-3", "epoch 1 loss=0.90\r\nepoch 2 loss=0.65\r\nwarning: lr high\r\ndone\r\n");
+        let second = t.current_command().unwrap();
+        let changes = t.command(second).unwrap().rerun.clone().unwrap();
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        // Find the marked rows and what they say.
+        let notes: Vec<String> = (0..t.grid().total_lines()).filter_map(|l| t.rerun_note(l)).collect();
+        assert_eq!(notes, ["Last run: epoch 2 loss=0.71", "Not in the last run"]);
+        // A different command isn't a rerun.
+        run(&mut t, &mut p, "make test", "ok\r\n");
+        assert!(t.command(t.current_command().unwrap()).unwrap().rerun.is_none());
     }
 
     #[test]

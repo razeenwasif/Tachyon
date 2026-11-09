@@ -881,6 +881,8 @@ struct TermWindow {
     host_glass: Option<Retained<NSGlassEffectView>>,
     /// Jobs a tab was opened for, so their commands stop offering one.
     followed: Vec<String>,
+    /// The rerun-diff tooltip showing, if any.
+    tooltip: Option<String>,
     glass_tint: f32,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
@@ -1636,8 +1638,19 @@ impl TermWindow {
         }
     }
 
+    /// Over a line rerun diff marked: a tooltip with the line it replaced.
+    fn update_tooltip(&mut self, event: &NSEvent) {
+        let (pos, _) = self.cell_at(event);
+        let note = self.term.lock().rerun_note(pos.line);
+        if note != self.tooltip {
+            self.view.setToolTip(note.as_deref().map(NSString::from_str).as_deref());
+            self.tooltip = note;
+        }
+    }
+
     /// Bare motion, for applications that asked for every move (mode 1003).
     fn mouse_moved(&mut self, event: &NSEvent) {
+        self.update_tooltip(event);
         if self.mouse_held.is_some() || !self.term.lock().mode.contains(TermMode::MOUSE_MOTION) {
             return;
         }
@@ -1805,12 +1818,24 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
             CommandState::Done if info.exit.is_some_and(|e| e != 0) => Outcome::Failed,
             CommandState::Done => Outcome::Succeeded,
         };
-        decor.gutter.push((y, outcome));
+        let changed = mark.has(RowMark::CHANGED) || mark.has(RowMark::NEW);
+        decor.gutter.push((y, if changed { Outcome::Changed } else { outcome }));
         if mark.has(RowMark::INPUT) {
             let running = info.state == CommandState::Running;
-            let receipt = info
+            let plain_receipt = info
                 .elapsed()
                 .and_then(|e| receipts::describe(e, info.exit, running, info.receipt.as_ref()));
+            // Rerun diff: how this run compares with the last.
+            let rerun = info.rerun.as_ref().map(|c| match c.len() {
+                0 => "same as last run".to_string(),
+                1 => "1 line changed".to_string(),
+                n => format!("{n} lines changed"),
+            });
+            let receipt = match (&rerun, &plain_receipt) {
+                (Some(d), Some(r)) => Some(format!("{d} · {r}")),
+                (Some(d), None) => Some(d.clone()),
+                (None, r) => r.clone(),
+            };
             let lens = info.lens.describe();
             // Both if they fit, else the metrics while it runs and the
             // receipt once it's done.
@@ -1836,6 +1861,9 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
                 candidates.extend(receipt);
                 candidates.extend(lens);
                 candidates.extend(compact);
+            }
+            if rerun.is_some() {
+                candidates.extend(plain_receipt);
             }
             // The input line, or if the command fills it, the first of its
             // wrapped continuation lines with room at the right.
@@ -2080,6 +2108,7 @@ impl App {
             host_glass,
             glass_tint: cfg.window.glass_tint,
             followed: Vec::new(),
+            tooltip: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
