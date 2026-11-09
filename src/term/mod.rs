@@ -289,6 +289,15 @@ impl Term {
         };
         match kind {
             b'A' => {
+                // A prompt redrawn, or marked twice (fish 4 marks its own
+                // prompts as well as ours): still the same command.
+                if let Some(id) = self.current_cmd.filter(|id| {
+                    self.commands.get(id).is_some_and(|c| c.state == CommandState::Prompt)
+                }) {
+                    self.mark_row(id, RowMark::PROMPT);
+                    self.dirty = true;
+                    return;
+                }
                 let id = self.next_cmd;
                 self.next_cmd = self.next_cmd.wrapping_add(1).max(1);
                 self.current_cmd = Some(id);
@@ -314,11 +323,21 @@ impl Term {
                     let rest = params.get(2..).unwrap_or(&[]);
                     let rest = rest.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join(";");
                     let cmdline = rest.strip_prefix("cmdline=").map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
-                    if let Some(c) = self.commands.get_mut(&id) {
-                        c.state = CommandState::Running;
-                        c.started = Some(Instant::now());
-                        c.cmdline = cmdline;
+                    let Some(c) = self.commands.get_mut(&id) else {
+                        return;
+                    };
+                    if c.state != CommandState::Prompt {
+                        // Marked twice: keep the first start, take the command
+                        // line if only the second has one.
+                        if c.cmdline.is_none() && cmdline.is_some() {
+                            c.cmdline = cmdline;
+                            self.title_revision = self.title_revision.wrapping_add(1);
+                        }
+                        return;
                     }
+                    c.state = CommandState::Running;
+                    c.started = Some(Instant::now());
+                    c.cmdline = cmdline;
                     self.title_revision = self.title_revision.wrapping_add(1);
                     self.mark_row(id, RowMark::OUTPUT);
                     self.command_events.push(CommandEvent::Started(id));
@@ -1645,6 +1664,23 @@ mod tests {
         feed(&mut t, &mut p, "\x1b]0;vim; main.rs\x07");
         assert_eq!(t.title.as_deref(), Some("vim; main.rs"));
         assert_eq!(t.title_cmd, Some(id), "set while the command ran");
+    }
+
+    /// fish 4 marks its own prompts and commands as well as ours: the
+    /// repeats are the same command, and the command line is kept.
+    #[test]
+    fn repeated_marks_are_one_command() {
+        let mut t = Term::new(40, 10, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "\x1b]133;A;click_events=1\x07\x1b]133;A\x07> \x1b]133;B\x07");
+        let id = t.current_command().unwrap();
+        feed(&mut t, &mut p, "\x1b]133;C\x07\x1b]133;C;cmdline=make\x07");
+        assert_eq!(t.current_command(), Some(id));
+        assert_eq!(t.command(id).unwrap().cmdline.as_deref(), Some("make"));
+        let events = t.take_command_events();
+        assert_eq!(events.len(), 1, "one start, not two: {events:?}");
+        feed(&mut t, &mut p, "\x1b]133;D;0\x07\x1b]133;D;0\x07");
+        assert_eq!(t.take_command_events().len(), 1);
     }
 
     #[test]

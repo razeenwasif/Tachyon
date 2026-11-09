@@ -2,10 +2,12 @@
 #
 # Marks each prompt and command with OSC 133 so Tachyon knows where commands
 # start and end: that drives the gutter marks, run receipts and Cmd-Up/Down.
-# Loaded automatically (see zsh/.zshenv); safe to source more than once, and
-# a no-op outside Tachyon.
+# Loaded automatically (see zsh/.zshenv). On a machine you ssh into, source it
+# from ~/.zshrc; ssh passes LC_TERMINAL, which tells it it's in Tachyon. Safe
+# to source more than once, and a no-op outside Tachyon.
 
-[[ -n $_TACHYON_INTEGRATED || $TERM_PROGRAM != Tachyon ]] && return
+[[ -n $_TACHYON_INTEGRATED ]] && return
+[[ $TERM_PROGRAM == Tachyon || $LC_TERMINAL == Tachyon ]] || return
 typeset -g _TACHYON_INTEGRATED=1
 
 _tachyon_precmd() {

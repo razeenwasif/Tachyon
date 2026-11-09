@@ -174,22 +174,64 @@ impl Pty {
     }
 }
 
-/// Environment that makes zsh load Tachyon's shell integration: point
-/// `ZDOTDIR` at `dir/zsh`, whose `.zshenv` restores the real one. Empty for
-/// other shells.
-pub fn zsh_integration_env(program: &str, dir: &std::path::Path) -> Vec<(String, String)> {
-    if !program.rsplit('/').next().is_some_and(|b| b == "zsh") {
-        return Vec::new();
+/// How to start a shell with Tachyon's integration loaded.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Integration {
+    pub env: Vec<(String, String)>,
+    /// Arguments to put before the configured ones.
+    pub args: Vec<String>,
+    /// Whether to start it as a login shell (`-name` as argv[0]).
+    pub login: bool,
+}
+
+/// How to load Tachyon's shell integration (the scripts in `dir`) into
+/// `program`, or `None` for a shell it has none for. Each shell gets it
+/// without its startup files being touched:
+///
+/// - zsh: `ZDOTDIR` points at `dir/zsh`, whose `.zshenv` restores the real
+///   one and loads the integration.
+/// - bash: started with `--rcfile` set to the script, in place of
+///   `~/.bashrc`. The script reads the startup files bash would have read (the
+///   login ones when `login`), then adds its hooks. This works in every bash
+///   from macOS's 3.2 on; `ENV` in POSIX mode doesn't in 3.2.
+/// - fish: `dir/xdg` goes first in `XDG_DATA_DIRS`, so fish loads its
+///   `fish/vendor_conf.d`; the script then puts `XDG_DATA_DIRS` back.
+pub fn integration(program: &str, dir: &std::path::Path, login: bool) -> Option<Integration> {
+    let base = program.rsplit('/').next().unwrap_or(program);
+    let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
+    let var = |k: &str, v: String| (k.to_string(), v);
+    let mut env = vec![var("TACHYON_SHELL_INTEGRATION", path(""))];
+    match base {
+        "zsh" => {
+            env.push(var("ZDOTDIR", path("zsh")));
+            if let Some(orig) = std::env::var_os("ZDOTDIR") {
+                env.push(var("TACHYON_ORIG_ZDOTDIR", orig.to_string_lossy().into_owned()));
+                env.push(var("TACHYON_ZDOTDIR_WAS_SET", "1".into()));
+            }
+            Some(Integration { env, args: Vec::new(), login })
+        }
+        "bash" => {
+            env.push(var("_TACHYON_BASH_INJECT", "1".into()));
+            if login {
+                env.push(var("_TACHYON_BASH_LOGIN", "1".into()));
+            }
+            // --rcfile is ignored by login shells, so bash starts as a plain
+            // interactive shell and the script reads the login files itself.
+            let args = vec!["--rcfile".into(), path("tachyon-integration.bash"), "-i".into()];
+            Some(Integration { env, args, login: false })
+        }
+        "fish" => {
+            let orig = std::env::var("XDG_DATA_DIRS").ok().filter(|v| !v.is_empty());
+            // The XDG default, so fish still finds the system's data dirs.
+            let rest = orig.clone().unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+            env.push(var("XDG_DATA_DIRS", format!("{}:{rest}", path("xdg"))));
+            if let Some(orig) = orig {
+                env.push(var("TACHYON_ORIG_XDG_DATA_DIRS", orig));
+            }
+            Some(Integration { env, args: Vec::new(), login })
+        }
+        _ => None,
     }
-    let mut env = vec![
-        ("ZDOTDIR".to_string(), dir.join("zsh").to_string_lossy().into_owned()),
-        ("TACHYON_SHELL_INTEGRATION".to_string(), dir.to_string_lossy().into_owned()),
-    ];
-    if let Some(orig) = std::env::var_os("ZDOTDIR") {
-        env.push(("TACHYON_ORIG_ZDOTDIR".to_string(), orig.to_string_lossy().into_owned()));
-        env.push(("TACHYON_ZDOTDIR_WAS_SET".to_string(), "1".to_string()));
-    }
-    env
 }
 
 /// The user's login shell: `$SHELL`, else the account's shell, else zsh.
@@ -224,7 +266,7 @@ fn resolve(program: &str) -> Option<String> {
 /// The parent's environment with the terminal-identity variables replaced and
 /// `extra` added (overriding anything of the same name).
 fn child_environment(extra: &[(String, String)]) -> Vec<CString> {
-    const OURS: [&str; 4] = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"];
+    const OURS: [&str; 6] = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LC_TERMINAL", "LC_TERMINAL_VERSION"];
     let mut env: Vec<CString> = std::env::vars_os()
         .filter(|(k, _)| !OURS.iter().any(|o| OsStr::new(o) == k))
         .filter(|(k, _)| !extra.iter().any(|(e, _)| OsStr::new(e) == k))
@@ -245,6 +287,10 @@ fn child_environment(extra: &[(String, String)]) -> Vec<CString> {
     set("COLORTERM", "truecolor");
     set("TERM_PROGRAM", "Tachyon");
     set("TERM_PROGRAM_VERSION", crate::APP_VERSION);
+    // ssh forwards LC_* by default, TERM_PROGRAM not, so a shell on a
+    // cluster can tell it's in Tachyon from this. iTerm2 does the same.
+    set("LC_TERMINAL", "Tachyon");
+    set("LC_TERMINAL_VERSION", crate::APP_VERSION);
     // Launched from Finder there is no locale, and without one zsh and many
     // tools fall back to ASCII. Terminal.app sets it for the same reason.
     if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {
@@ -254,4 +300,33 @@ fn child_environment(extra: &[(String, String)]) -> Vec<CString> {
         set(k, v);
     }
     env
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::integration;
+    use std::path::Path;
+
+    #[test]
+    fn each_shell_loads_its_own_way() {
+        let dir = Path::new("/App/Resources/shell");
+        let zsh = integration("/bin/zsh", dir, true).unwrap();
+        assert!(zsh.login && zsh.args.is_empty());
+        assert!(zsh.env.contains(&("ZDOTDIR".into(), "/App/Resources/shell/zsh".into())));
+
+        // bash reads the login files itself, so it doesn't start as a login
+        // shell, which would ignore --rcfile.
+        let bash = integration("/opt/homebrew/bin/bash", dir, true).unwrap();
+        assert!(!bash.login);
+        assert_eq!(bash.args, ["--rcfile", "/App/Resources/shell/tachyon-integration.bash", "-i"]);
+        assert!(bash.env.contains(&("_TACHYON_BASH_LOGIN".into(), "1".into())));
+        let not_login = integration("bash", dir, false).unwrap();
+        assert!(!not_login.env.iter().any(|(k, _)| k == "_TACHYON_BASH_LOGIN"));
+
+        let fish = integration("/opt/homebrew/bin/fish", dir, true).unwrap();
+        let xdg = fish.env.iter().find(|(k, _)| k == "XDG_DATA_DIRS").unwrap();
+        assert!(xdg.1.starts_with("/App/Resources/shell/xdg:"));
+
+        assert!(integration("/usr/bin/nu", dir, true).is_none());
+    }
 }
