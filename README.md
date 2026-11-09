@@ -126,6 +126,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘T / ⌘N | New tab / new window |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
 | ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
+| ⌥⌘A | Keep the Mac awake while this pane's command runs (or its next one) |
 | ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
 | ⌘D / ⌘⇧D | Split the pane: a new shell to the right / below, in the same folder |
 | ⌘⌥← ⌘⌥→ ⌘⌥↑ ⌘⌥↓, or click | Focus the pane on that side, or the one clicked |
@@ -184,6 +185,14 @@ it has nothing left to run. Measured on the M2 Pro under load: keystroke echo
 a 256 MB `cat`. Restored commands have no times in their receipts, and Rewind
 starts over from the restored screen. Set `shell.persist = false` to have
 shells end with the app.
+
+**Keep awake.** ⌥⌘A keeps the Mac from sleeping while the pane's command
+runs: the one running now, or at a prompt the next one you start. It lasts
+that one command, and the receipt says `☕ awake` while it holds (a prompt says
+`☕ the next command keeps the Mac awake` until then). The session host holds
+it, so it keeps going after you quit Tachyon. It stops idle sleep only, like
+`caffeinate -i`: the display still sleeps, and closing the lid on battery
+still sleeps the Mac. `pmset -g assertions` lists it by command.
 
 **Split panes.** ⌘D splits the pane with focus side by side and ⌘⇧D one above
 the other; the new shell starts in the same folder (unless that pane is in an

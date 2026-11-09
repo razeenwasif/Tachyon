@@ -414,8 +414,14 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    ⌥⌘Q ends them, closing a window or tab ends its own. Measured under load:
    echo 6–11 µs median through the host (2–4 µs straight), throughput 4–12%
    lower on a 256 MB `cat`, with 1 MiB socket buffers. Still to do:
-   keep-awake per command, Rewind history across a restart, notifications
-   while the app is closed.
+   Rewind history across a restart, notifications while the app is closed.
+   *Keep-awake done (9 November 2026):* ⌥⌘A arms the focused pane: the
+   running command, or the next to start (`Term::set_keep_awake`, cleared by
+   that command's OSC 133 D). The host follows its own terminal and holds one
+   `PreventUserIdleSystemSleep` assertion (`src/mac/power.rs`, IOKit) while any
+   shell's armed command runs, named after the commands for `pmset -g
+   assertions`, so it holds with the app closed; shells run in the app hold it
+   there. The receipt reads `☕ awake` while held.
 9. **Split panes** on cell boundaries. Shaping already arrived with Core Text
    in step 1.
    *Done (9 November 2026), ahead of the session host:* `src/mac/panes.rs` is

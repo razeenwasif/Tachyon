@@ -23,6 +23,7 @@ mod input;
 mod links;
 mod notify;
 mod panes;
+mod power;
 mod pty;
 mod receipts;
 mod renderer;
@@ -444,6 +445,11 @@ define_class!(
         #[unsafe(method(tachyonPaneDown:))]
         fn pane_down(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.move_focus(0, 1));
+        }
+
+        #[unsafe(method(tachyonKeepAwake:))]
+        fn keep_awake(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.toggle_awake());
         }
 
         #[unsafe(method(tachyonZoomPane:))]
@@ -1041,17 +1047,19 @@ impl Pane {
     fn start(cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>, cwd: Option<&str>) -> Result<Pane, String> {
         let run = job.as_ref().and_then(follow_command);
         let (id, pty) = open_session(cfg, cols, rows, run.as_deref(), cwd)?;
-        Pane::with(id, pty, cfg, cols, rows, job)
+        Pane::with(id, pty, cfg, cols, rows, job, false)
     }
 
     /// A shell the session host kept while the app was closed.
     fn attach(cfg: &Config, r: host::Remote) -> Result<Pane, String> {
-        Pane::with(r.id, r.pty, cfg, r.cols, r.rows, None)
+        let awake = r.awake;
+        let pane = Pane::with(r.id, r.pty, cfg, r.cols, r.rows, None, awake)?;
+        Ok(pane)
     }
 
-    fn with(id: u64, pty: Pty, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>) -> Result<Pane, String> {
+    fn with(id: u64, pty: Pty, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>, awake: bool) -> Result<Pane, String> {
         let wake_pending = Arc::new(AtomicBool::new(false));
-        let (term, pty, log) = start_session(id, pty, cfg, cols, rows, Arc::clone(&wake_pending))?;
+        let (term, pty, log) = start_session(id, pty, cfg, cols, rows, Arc::clone(&wake_pending), awake)?;
         Ok(Pane {
             id,
             term,
@@ -1122,6 +1130,9 @@ impl Tab {
 impl Drop for Pane {
     fn drop(&mut self) {
         dock::set_progress(self.id, None);
+        if !self.pty.is_remote() {
+            power::set(self.id, None);
+        }
         // Quitting leaves the host's shells running, to come back next time.
         if QUITTING.load(Ordering::Acquire) && self.pty.is_remote() {
             return;
@@ -1653,6 +1664,28 @@ impl TermWindow {
             Some(p) => self.focus_pane(p),
             None => objc2_app_kit::NSBeep(),
         }
+    }
+
+    /// ⌥⌘A: keep the Mac awake while the focused pane's command runs (or
+    /// its next one, at a prompt), or stop.
+    fn toggle_awake(&mut self) {
+        let pane = self.tabs[self.active].pane();
+        let (on, cmdline) = {
+            let mut t = pane.term.lock();
+            let on = !t.awake_armed();
+            t.set_keep_awake(on);
+            (on, t.keeps_awake().then(|| t.running_cmdline().unwrap_or("").to_string()))
+        };
+        if pane.pty.is_remote() {
+            let id = pane.id;
+            let sent = HOST.with(|h| h.borrow().as_ref().map(|c| c.set_awake(id, on)));
+            if let Some(Err(e)) = sent {
+                crate::log::force(&format!("session host: could not set keep-awake: {e}"));
+            }
+        } else {
+            power::set(pane.id, cmdline.as_deref());
+        }
+        self.request_redraw();
     }
 
     /// ⌘⇧↩: the focused pane fills the tab, or goes back to its place.
@@ -2545,6 +2578,12 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
                 (Some(d), None) => Some(d.clone()),
                 (None, r) => r.clone(),
             };
+            // Keep-awake: said on the command's line while it holds the Mac.
+            let receipt = match (term.awake_command().is_some() && term.awake_command() == owner, receipt) {
+                (true, Some(r)) => Some(format!("☕ awake · {r}")),
+                (true, None) => Some("☕ keeping the Mac awake".to_string()),
+                (false, r) => r,
+            };
             let lens = info.lens.describe();
             // Both if they fit, else the metrics while it runs and the
             // receipt once it's done.
@@ -2589,6 +2628,10 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
                 }
             }
         }
+    }
+    // Keep-awake asked for at a prompt: the next command will have it.
+    if term.awake_armed() && !term.keeps_awake() {
+        decor.notes.push((term.cursor_state().y, "☕ the next command keeps the Mac awake".into()));
     }
     decor
 }
@@ -3064,6 +3107,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&file, "Split Right", sel!(tachyonSplitRight:), "d");
     item(&file, "Split Down", sel!(tachyonSplitDown:), "D");
     file.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&file, "Keep Awake While Running", sel!(tachyonKeepAwake:), "a")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    file.addItem(&NSMenuItem::separatorItem(mtm));
     item(&file, "Close", sel!(tachyonCloseTab:), "w");
     // A capital letter means Shift as well: ⌘⇧W.
     item(&file, "Close Window", sel!(performClose:), "W");
@@ -3170,6 +3216,8 @@ fn start_session(
     cols: usize,
     rows: usize,
     wake_pending: Arc<AtomicBool>,
+    // Keep-awake was on at the host: on again once the screen is restored.
+    awake_after_restore: bool,
 ) -> Result<(Arc<Mutex<Term>>, Arc<Pty>, Arc<Mutex<RewindLog>>), String> {
     let pty = Arc::new(pty);
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));
@@ -3211,6 +3259,7 @@ fn start_session(
             let mut buf = vec![0u8; 128 * 1024];
             // A host's shell: how much of what follows is the restored screen.
             let mut replay = 0usize;
+            let mut awake_here = false;
             if reader_pty.is_remote() {
                 let mut header = [0u8; 8];
                 let mut got = 0;
@@ -3246,6 +3295,15 @@ fn start_session(
                     if restoring {
                         replay -= n.min(replay);
                         t.restoring = replay > 0;
+                        if replay == 0 && awake_after_restore {
+                            t.set_keep_awake(true);
+                        }
+                    }
+                    // Shells run here hold the power assertion themselves;
+                    // the host holds it for its own.
+                    if !reader_pty.is_remote() && t.keeps_awake() != awake_here {
+                        awake_here = t.keeps_awake();
+                        power::set(id, awake_here.then(|| t.running_cmdline().unwrap_or("").to_string()).as_deref());
                     }
                     {
                         // Rewind keeps the raw output, and every few MB a

@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 
+use super::power;
 use super::pty::Pty;
 use crate::term::{Processor, Term};
 
@@ -143,6 +144,8 @@ pub struct Remote {
     pub cols: usize,
     pub rows: usize,
     pub pty: Pty,
+    /// It has keep-awake on, for the running command or the next.
+    pub awake: bool,
 }
 
 /// A shell the host has, from [`Client::list`].
@@ -241,6 +244,11 @@ impl Client {
             .unwrap_or_default())
     }
 
+    /// Keep the Mac awake while shell `id`'s command runs (or its next one).
+    pub fn set_awake(&self, id: u64, on: bool) -> io::Result<()> {
+        self.ask(&["awake", &id.to_string(), if on { "1" } else { "0" }], &[]).map(|_| ())
+    }
+
     /// Keep the app's windows, tabs and splits, to put them back next time.
     pub fn set_layout(&self, layout: &str) -> io::Result<()> {
         self.ask(&["layout-set", layout], &[]).map(|_| ())
@@ -259,7 +267,14 @@ fn remote((reply, mut fds): (Vec<String>, Vec<OwnedFd>)) -> io::Result<Remote> {
     }
     let output = fds.pop().expect("two");
     let master = fds.pop().expect("two");
-    Ok(Remote { id, pid: pid as libc::pid_t, cols: cols as usize, rows: rows as usize, pty: Pty::remote(master, pid as libc::pid_t, output) })
+    Ok(Remote {
+        id,
+        pid: pid as libc::pid_t,
+        cols: cols as usize,
+        rows: rows as usize,
+        pty: Pty::remote(master, pid as libc::pid_t, output),
+        awake: reply.get(5).map(String::as_str) == Some("1"),
+    })
 }
 
 /// Start the host, detached from the app so it outlives it.
@@ -312,6 +327,8 @@ struct Parsed {
     processor: Processor,
     /// The PTY size the terminal was last resized to.
     size: (u16, u16),
+    /// A command here was keeping the Mac awake, last we looked.
+    awake: bool,
 }
 
 /// Output the parser may fall behind by before reading waits for it.
@@ -330,6 +347,16 @@ impl Parsed {
         self.term.take_command_events();
         self.term.take_dirty();
         self.term.take_replies()
+    }
+
+    /// Hold or release the power assertion for shell `id` when its
+    /// keep-awake command starts or ends.
+    fn sync_awake(&mut self, id: u64) {
+        let now = self.term.keeps_awake();
+        if now != self.awake {
+            self.awake = now;
+            power::set(id, now.then(|| self.term.running_cmdline().unwrap_or("").to_string()).as_deref());
+        }
     }
 }
 
@@ -431,6 +458,18 @@ fn serve(host: Arc<Mutex<Host>>, conn: UnixStream) {
                     .join(&LIST_SEP.to_string());
                 send(&conn, &["sessions", &list], &[])
             }
+            "awake" => {
+                let s = req.get(1).and_then(|s| s.parse::<u64>().ok()).and_then(|id| host.lock().sessions.get(&id).cloned());
+                match s {
+                    Some(s) => {
+                        let mut parsed = s.term.lock();
+                        parsed.term.set_keep_awake(req.get(2).map(String::as_str) == Some("1"));
+                        parsed.sync_awake(s.id);
+                        send(&conn, &["ok"], &[])
+                    }
+                    None => send(&conn, &["error", "no such session"], &[]),
+                }
+            }
             "layout-set" => {
                 host.lock().layout = req.get(1).cloned().unwrap_or_default();
                 send(&conn, &["ok"], &[])
@@ -476,7 +515,12 @@ fn spawn_session(host: &Arc<Mutex<Host>>, conn: &UnixStream, req: &[String]) -> 
             queue: Mutex::new((VecDeque::new(), 0, false)),
             work: Condvar::new(),
             space: Condvar::new(),
-            term: Mutex::new(Parsed { term: Term::new(cols, rows, scrollback), processor: Processor::new(), size: (cols as u16, rows as u16) }),
+            term: Mutex::new(Parsed {
+                term: Term::new(cols, rows, scrollback),
+                processor: Processor::new(),
+                size: (cols as u16, rows as u16),
+                awake: false,
+            }),
         });
         h.sessions.insert(id, Arc::clone(&s));
         update_idle(&mut h);
@@ -527,10 +571,11 @@ fn hand_over(conn: &UnixStream, s: &Session, restore: bool) -> io::Result<()> {
     for chunk in pending {
         parsed.feed(&s.pty, &chunk);
     }
-    let (cols, rows) = (parsed.term.cols(), parsed.term.rows());
+    parsed.sync_awake(s.id);
+    let (cols, rows, awake) = (parsed.term.cols(), parsed.term.rows(), parsed.term.awake_armed());
     send(
         conn,
-        &["session", &s.id.to_string(), &s.pty.pid().to_string(), &cols.to_string(), &rows.to_string()],
+        &["session", &s.id.to_string(), &s.pty.pid().to_string(), &cols.to_string(), &rows.to_string(), if awake { "1" } else { "0" }],
         &[master.as_raw_fd(), theirs.as_raw_fd()],
     )?;
     drop(master);
@@ -597,6 +642,8 @@ fn parse_session(s: Arc<Session>) {
                 s.work.wait(&mut q);
             }
             if q.0.is_empty() {
+                // The shell ended: it keeps nothing awake.
+                power::set(s.id, None);
                 return;
             }
         }
@@ -612,6 +659,7 @@ fn parse_session(s: Arc<Session>) {
         s.space.notify_one();
         let Some(chunk) = chunk else { continue };
         let replies = parsed.feed(&s.pty, &chunk);
+        parsed.sync_awake(s.id);
         drop(parsed);
         // Nobody else is answering: answer queries, so programs don't wait.
         if !replies.is_empty() && !s.attached.load(Ordering::Acquire) {
@@ -727,6 +775,34 @@ mod tests {
         println!("echo straight: median {:.0} µs, p99 {:.0} µs; through the host: median {:.0} µs, p99 {:.0} µs", a.0, a.1, b.0, b.1);
         local.hangup();
         r.pty.hangup();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_host_keeps_the_mac_awake_for_one_command_even_with_no_app() {
+        let dir = std::env::temp_dir().join(format!("tachyon-host-awake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        let p = path.clone();
+        std::thread::spawn(move || run(&p));
+        std::thread::sleep(Duration::from_millis(200));
+        let client = Client::connect_to(&path, false).unwrap();
+        let script = "printf '\\033]133;A\\007$ '; read x; printf '\\033]133;C;cmdline=train\\007'; sleep 1; printf '\\033]133;D;0\\007'; sleep 30";
+        let r = client.spawn(40, 10, 100, "/bin/sh", &["-c".into(), script.into()], false, &[], None).unwrap();
+        let id = r.id;
+        read_until(&r.pty, "$ ");
+        // Asked at the prompt: for the next command. Then the app goes.
+        client.set_awake(id, true).unwrap();
+        r.pty.write(b"go\n").unwrap();
+        drop(r);
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !power::holds(id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(power::holds(id), "held while train runs");
+        std::thread::sleep(Duration::from_millis(1600));
+        assert!(!power::holds(id), "released when it finished");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
