@@ -1102,7 +1102,7 @@ struct FindBar {
 }
 
 impl FindBar {
-    const WIDTH: f64 = 380.0;
+    const WIDTH: f64 = 400.0;
     const HEIGHT: f64 = 36.0;
 
     fn new(mtm: MainThreadMarker, parent: &TachyonView) -> FindBar {
@@ -1131,12 +1131,13 @@ impl FindBar {
         count.setTextColor(Some(&NSColor::secondaryLabelColor()));
         count.setAlignment(objc2_app_kit::NSTextAlignment::Right);
         let target: &AnyObject = parent.as_ref();
+        // A checkbox, so whether the query is a regular expression shows at
+        // a glance.
         let regex = unsafe {
-            objc2_app_kit::NSButton::buttonWithTitle_target_action(&NSString::from_str(".*"), Some(target), Some(sel!(tachyonFindRegex:)), mtm)
+            objc2_app_kit::NSButton::checkboxWithTitle_target_action(&NSString::from_str("Regex"), Some(target), Some(sel!(tachyonFindRegex:)), mtm)
         };
-        regex.setButtonType(objc2_app_kit::NSButtonType::PushOnPushOff);
-        regex.setBezelStyle(objc2_app_kit::NSBezelStyle::Glass);
-        regex.setToolTip(Some(&NSString::from_str("Regular expression")));
+        regex.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(12.0)));
+        regex.setToolTip(Some(&NSString::from_str("Search with a regular expression, like loss=0\\.[0-4] or error|warn")));
         content.addSubview(&field);
         content.addSubview(&count);
         content.addSubview(&regex);
@@ -1154,10 +1155,10 @@ impl FindBar {
         if let Some(content) = unsafe { self.field.superview() } {
             content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
         }
-        let (count_w, regex_w) = (86.0, 36.0);
-        self.field.setFrame(NSRect::new(NSPoint::new(10.0, 6.0), NSSize::new(w - 10.0 - count_w - regex_w - 16.0, 24.0)));
-        self.count.setFrame(NSRect::new(NSPoint::new(w - count_w - regex_w - 10.0, 10.0), NSSize::new(count_w, 16.0)));
-        self.regex.setFrame(NSRect::new(NSPoint::new(w - regex_w - 6.0, 4.0), NSSize::new(regex_w, 28.0)));
+        let (count_w, regex_w) = (80.0, 64.0);
+        self.field.setFrame(NSRect::new(NSPoint::new(10.0, 6.0), NSSize::new(w - 10.0 - count_w - regex_w - 18.0, 24.0)));
+        self.count.setFrame(NSRect::new(NSPoint::new(w - count_w - regex_w - 12.0, 10.0), NSSize::new(count_w, 16.0)));
+        self.regex.setFrame(NSRect::new(NSPoint::new(w - regex_w - 8.0, 8.0), NSSize::new(regex_w, 20.0)));
     }
 }
 
