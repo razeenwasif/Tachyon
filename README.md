@@ -125,6 +125,13 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌃⌘-drag, or drag the top edge | Move the window |
 | ⌘↑ / ⌘↓ | Jump to the previous / next command |
 | Shift-drag in vim, tmux, htop | Select even while the app has the mouse |
+| ⌘-click a path / a URL | Show the file in Quick Look / open the link |
+
+**⌘-click** a file path to see it in Quick Look (an image, a CSV, a PDF) or a
+URL to open it. Paths are taken from the tab's folder, and `file:line:col`
+suffixes from compilers are dropped. **Secure Keyboard Entry** turns on by itself
+while a program reads a password (sudo, ssh, getpass), so other apps can't read
+those keystrokes, and turns off after; the prompt line says so while it's on.
 
 **Tabs.** With two or more tabs, a strip along the bottom edge shows them; with
 one, it goes away and the grid gets the row back. A tab is named after what's
@@ -153,8 +160,12 @@ marks every prompt and command with OSC 133, which gives:
   exact (from the shell's child-process accounting); P-core share, energy and
   memory are sampled every half second, so very short commands show only their
   exit status and time;
-- ⌘↑ / ⌘↓ to jump between commands, and a Dock bounce when a command of 10
-  seconds or more finishes while the window is in the background.
+- ⌘↑ / ⌘↓ to jump between commands;
+- a **notification** with the receipt when a command of 10 seconds or more
+  finishes while you're in another app or window (`notify.after` sets the time,
+  0 turns it off). Clicking it brings the command's tab to the front. macOS asks
+  once whether Tachyon may notify; outside the app bundle, the Dock icon
+  bounces instead.
 
 Set `shell.integration = false` to turn it off.
 

@@ -186,9 +186,19 @@ pub enum OptionAsMeta {
     Both,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MacConfig {
     pub option_as_meta: OptionAsMeta,
+    /// A command that ran at least this long, and finished while you were
+    /// looking elsewhere, posts a notification with its receipt. 0 turns
+    /// notifications off.
+    pub notify_after_secs: u64,
+}
+
+impl Default for MacConfig {
+    fn default() -> Self {
+        MacConfig { option_as_meta: OptionAsMeta::default(), notify_after_secs: 10 }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -325,6 +335,7 @@ impl Config {
                 }
             }
 
+            "notify.after" => self.macos.notify_after_secs = parse_usize(value, 0, 86_400)? as u64,
             "window.cols" => self.window.cols = parse_usize(value, 8, 2000)?,
             "window.rows" => self.window.rows = parse_usize(value, 2, 1000)?,
             "window.padding_x" => self.window.padding_x = parse_f32(value, 0.0, 200.0)?,

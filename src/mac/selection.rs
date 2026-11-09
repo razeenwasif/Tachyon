@@ -175,6 +175,13 @@ fn word_bounds(term: &Term, line: usize, col: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// The word under a cell, as double-click would select it: a path or URL
+/// counts as one word.
+pub fn word_at(term: &Term, line: usize, col: usize) -> String {
+    let (a, b) = word_bounds(term, line, col);
+    (a..=b).map(|c| char_at(term, line, c)).collect::<String>().trim().to_string()
+}
+
 /// First row of the logical line containing `line`, following autowrap back.
 fn logical_start(term: &Term, mut line: usize) -> usize {
     while line > 0 && term.grid().line(line - 1).wrapped {

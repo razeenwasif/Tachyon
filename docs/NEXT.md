@@ -333,8 +333,11 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    *Done for zsh (9 November 2026):* marks stored on rows so they survive
    packing and reflow; receipts with exact CPU time (shell child accounting)
    and sampled P-core share, energy and peak footprint; gutter bars; ⌘↑/⌘↓;
-   Dock bounce for long commands. Still to do: bash and fish, rerun diff, and
-   system notifications.
+   Dock bounce for long commands. Still to do: bash and fish, and rerun diff.
+   *Notifications done (9 November 2026):* a command of `notify.after` seconds
+   (10) or more that finishes while you're elsewhere posts a notification with
+   its receipt; clicking it shows the tab. ⌘-click Quick Look and URLs, and
+   Secure Keyboard Entry at password prompts, landed with it.
 7. **Metric lens and job tabs**: Nexus first, then Slurm. New `src/lens/`,
    `src/jobs/`.
 8. **Session host**: `tachyon-host` as a login agent with keep-awake
