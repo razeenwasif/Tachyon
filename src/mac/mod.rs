@@ -18,6 +18,7 @@
 mod boxdraw;
 mod dock;
 mod font;
+mod images;
 pub mod host;
 mod input;
 mod ledger;
@@ -1361,8 +1362,8 @@ impl Tab {
     }
 
     /// Lay the panes out in a grid of `cols` by `rows`, resizing each whose
-    /// size changed.
-    fn lay_out(&mut self, cols: usize, rows: usize) {
+    /// size changed. `cell` is a cell's size in device pixels.
+    fn lay_out(&mut self, cols: usize, rows: usize, cell: (u32, u32)) {
         let area = panes::Rect { col: 0, row: 0, cols, rows };
         let (rects, dividers) = if self.zoomed {
             (vec![(self.pane().id, area)], Vec::new())
@@ -1375,14 +1376,31 @@ impl Tab {
                 continue;
             };
             let rect = panes::Rect { cols: rect.cols.max(1), rows: rect.rows.max(1), ..rect };
-            if (rect.cols, rect.rows) != (p.rect.cols, p.rect.rows) {
-                p.term.lock().resize(rect.cols, rect.rows);
+            let resized = (rect.cols, rect.rows) != (p.rect.cols, p.rect.rows);
+            let cell_changed = {
+                let mut t = p.term.lock();
+                if resized {
+                    t.resize(rect.cols, rect.rows);
+                }
+                let before = t.cell_pixels();
+                t.set_cell_pixels(cell.0, cell.1);
+                before != t.cell_pixels()
+            };
+            if resized {
                 p.log.lock().record_resize(rect.cols, rect.rows);
-                p.pty.resize(rect.cols as u16, rect.rows as u16);
+            }
+            if resized || cell_changed {
+                p.pty.resize(rect.cols as u16, rect.rows as u16, cell);
             }
             p.rect = rect;
         }
     }
+}
+
+/// A cell's size in whole device pixels, as terminals report it.
+fn cell_pixels(r: &renderer::Renderer) -> (u32, u32) {
+    let m = r.metrics();
+    (m.width.round().max(1.0) as u32, m.height.round().max(1.0) as u32)
 }
 
 impl Drop for Pane {
@@ -2127,7 +2145,7 @@ impl TermWindow {
         let before = tab.dividers.clone();
         tab.layout.set_ratio(&d.path, ratio);
         let (cols, rows) = self.grid;
-        tab.lay_out(cols, rows);
+        tab.lay_out(cols, rows, cell_pixels(&self.renderer));
         if tab.dividers != before {
             self.view.window().map(|w| w.invalidateCursorRectsForView(&self.view));
             self.request_redraw();
@@ -2227,8 +2245,9 @@ impl TermWindow {
             self.grid = grid;
         }
         // Every tab, so one brought forward is already the right size.
+        let cell = cell_pixels(&self.renderer);
         for tab in &mut self.tabs {
-            tab.lay_out(grid.0, grid.1);
+            tab.lay_out(grid.0, grid.1, cell);
         }
         self.window.invalidateCursorRectsForView(&self.view);
         schedule_layout_save();

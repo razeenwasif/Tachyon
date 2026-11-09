@@ -517,6 +517,11 @@ pub struct Grid {
 
     /// Set when every row must be re-uploaded (resize, scroll, viewport move).
     full_damage: bool,
+
+    /// Lines that have ever left the top of the screen, into the scrollback
+    /// or not: screen row `y` is line `scrolled + y`, counted from the first
+    /// the screen ever showed. Inline images are anchored to these.
+    scrolled: u64,
 }
 
 impl Grid {
@@ -534,7 +539,14 @@ impl Grid {
             display_offset: 0,
             view: Vec::new(),
             full_damage: true,
+            scrolled: 0,
         }
+    }
+
+    /// Lines that have left the top of the screen, ever. See the field.
+    #[inline]
+    pub fn scrolled(&self) -> u64 {
+        self.scrolled
     }
 
     #[inline]
@@ -640,6 +652,7 @@ impl Grid {
             display_offset: 0,
             view: Vec::new(),
             full_damage: true,
+            scrolled: self.scrolled,
         }
     }
 
@@ -711,6 +724,7 @@ impl Grid {
     /// screen in a frame. The same as writing it to a row and scrolling the
     /// row off, without the cells.
     pub fn push_history_ascii(&mut self, text: &[u8], style: &Cell, mark: RowMark) {
+        self.scrolled += 1;
         if self.max_scrollback == 0 {
             return;
         }
@@ -738,6 +752,7 @@ impl Grid {
     }
 
     fn scroll_up_ring(&mut self, n: usize, pen: &Pen) {
+        self.scrolled += n as u64;
         for _ in 0..n {
             // The line leaving the top of the screen becomes history, packed.
             let i = self.top;

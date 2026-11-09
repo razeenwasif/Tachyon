@@ -147,13 +147,15 @@ impl Pty {
         Ok(())
     }
 
-    /// Tell the child its window changed size. The kernel delivers SIGWINCH.
-    pub fn resize(&self, cols: u16, rows: u16) {
+    /// Tell the child its window changed size, in cells and pixels (`cell`
+    /// is one cell's, which image tools size what they draw by). The kernel
+    /// delivers SIGWINCH.
+    pub fn resize(&self, cols: u16, rows: u16, cell: (u32, u32)) {
         let ws = libc::winsize {
             ws_row: rows.max(1),
             ws_col: cols.max(1),
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: (cols as u32 * cell.0).min(u16::MAX as u32) as u16,
+            ws_ypixel: (rows as u32 * cell.1).min(u16::MAX as u32) as u16,
         };
         unsafe {
             libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws);

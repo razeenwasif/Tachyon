@@ -5,12 +5,14 @@ pub mod lens;
 pub mod rerun;
 pub mod rewind;
 pub mod find;
+pub mod image;
 mod restore;
 pub mod cell;
 pub mod color;
 pub mod grid;
 pub mod parser;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitflags::bitflags;
@@ -256,7 +258,38 @@ pub struct Term {
 
     /// The column where the command line starts on its row (OSC 133 B).
     input_col: usize,
+
+    /// Inline images on either screen, oldest first.
+    images: Vec<image::Placement>,
+    /// Images kitty clients sent to show later, by their id.
+    kitty_images: FxHashMap<u32, Arc<image::Image>>,
+    /// A kitty image arriving in chunks: its first command, and the payload
+    /// so far.
+    kitty_partial: Option<(image::Kitty, Vec<u8>)>,
+    /// An iTerm2 image arriving in parts (`MultipartFile`): its arguments
+    /// and the payload so far.
+    iterm_partial: Option<(Vec<u8>, Vec<u8>)>,
+    next_image: u64,
+    /// A cell's size in device pixels: what images are sized by, and what
+    /// `CSI 16 t` reports.
+    cell_px: (u32, u32),
 }
+
+/// An image on screen, for the renderer.
+#[derive(Clone, Debug)]
+pub struct VisibleImage {
+    pub image: Arc<image::Image>,
+    /// The viewport row its top is on: negative when it starts above.
+    pub row: i64,
+    pub col: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// The most a pending image (chunks still coming) may grow to.
+const MAX_IMAGE_PAYLOAD: usize = 64 << 20;
+/// Image bytes kept per terminal, placed and waiting: the oldest go first.
+const MAX_IMAGE_BYTES: usize = 320 << 20;
 
 impl Term {
     pub fn new(cols: usize, rows: usize, scrollback: usize) -> Term {
@@ -298,6 +331,12 @@ impl Term {
             awake_next: false,
             bulk_scratch: Vec::new(),
             input_col: 0,
+            images: Vec::new(),
+            kitty_images: FxHashMap::default(),
+            kitty_partial: None,
+            iterm_partial: None,
+            next_image: 1,
+            cell_px: (8, 16),
         }
     }
 
@@ -432,6 +471,12 @@ impl Term {
             awake_next: false,
             bulk_scratch: Vec::new(),
             input_col: 0,
+            images: Vec::new(),
+            kitty_images: FxHashMap::default(),
+            kitty_partial: None,
+            iterm_partial: None,
+            next_image: 1,
+            cell_px: self.cell_px,
         }
     }
 
@@ -799,6 +844,7 @@ impl Term {
         // plainly; the primary screen, which holds the user's history, is
         // reflowed.
         let cursor = (self.cursor.x, self.cursor.y);
+        let line_before = self.grid.scrolled() + self.cursor.y as u64;
         if self.mode.contains(TermMode::ALT_SCREEN) {
             self.grid.resize(cols, rows, &pen);
             self.inactive.reflow(cols, rows, &pen, cursor);
@@ -809,6 +855,14 @@ impl Term {
             self.inactive.resize(cols, rows, &pen);
             self.cursor.x = cx;
             self.cursor.y = cy;
+            // Reflowing moves lines: images keep their place relative to the
+            // cursor's line, where the newest ones are.
+            let shift = (self.grid.scrolled() + cy as u64) as i64 - line_before as i64;
+            if shift != 0 {
+                for p in self.images.iter_mut().filter(|p| !p.alt) {
+                    p.line = (p.line as i64 + shift).max(0) as u64;
+                }
+            }
         }
 
         self.tabs = default_tabs(cols);
@@ -1358,6 +1412,7 @@ impl Term {
             let pen = self.cursor.pen;
             self.grid.clear_all(&pen);
             self.mode |= TermMode::ALT_SCREEN;
+            self.images.retain(|p| !p.alt);
             if save_restore {
                 self.cursor = Cursor {
                     pen: self.cursor.pen,
@@ -1368,6 +1423,8 @@ impl Term {
             self.saved_cursor_alt = self.cursor;
             core::mem::swap(&mut self.grid, &mut self.inactive);
             self.mode -= TermMode::ALT_SCREEN;
+            // A full-screen program's images go with its screen.
+            self.images.retain(|p| !p.alt);
             if save_restore {
                 self.cursor = self.saved_cursor;
             }
@@ -1394,6 +1451,10 @@ impl Term {
         self.grid.clear_all(&pen);
         self.grid.clear_history();
         self.inactive.clear_all(&pen);
+        self.images.clear();
+        self.kitty_images.clear();
+        self.kitty_partial = None;
+        self.iterm_partial = None;
         self.dirty = true;
     }
 
@@ -1437,12 +1498,14 @@ impl Term {
             2 => {
                 let pen = self.cursor.pen;
                 self.grid.clear_all(&pen);
+                self.drop_images(true, false);
             }
             // Whole screen and scrollback.
             3 => {
                 let pen = self.cursor.pen;
                 self.grid.clear_all(&pen);
                 self.grid.clear_history();
+                self.drop_images(true, true);
             }
             _ => {}
         }
@@ -1940,11 +2003,17 @@ impl Perform for Term {
                 self.replies.extend_from_slice(b"\x1b[?62;22c");
             }
             ('t', _) => {
-                // Window manipulation; report a plausible size for `18t`.
-                if arg(params, 0, 0) == 18 {
-                    let s = format!("\x1b[8;{};{}t", self.rows(), self.cols());
-                    self.replies.extend_from_slice(s.as_bytes());
-                }
+                // Window reports: the text area in cells (18), in pixels
+                // (14), and a cell's size in pixels (16), which is how image
+                // tools size what they send.
+                let (cw, ch) = self.cell_px;
+                let s = match arg(params, 0, 0) {
+                    18 => format!("\x1b[8;{};{}t", self.rows(), self.cols()),
+                    14 => format!("\x1b[4;{};{}t", self.rows() as u32 * ch, self.cols() as u32 * cw),
+                    16 => format!("\x1b[6;{ch};{cw}t"),
+                    _ => String::new(),
+                };
+                self.replies.extend_from_slice(s.as_bytes());
             }
             _ => {}
         }
@@ -2036,6 +2105,8 @@ impl Perform for Term {
             }
             // Shell integration: prompt, input, output and exit marks.
             b"133" => self.semantic_mark(params),
+            // iTerm2's: inline images, among other things.
+            b"1337" => self.iterm_osc(&params[1..].join(&b';')),
             _ => {}
         }
     }
@@ -2050,6 +2121,227 @@ impl Perform for Term {
         // A DCS ends on the ESC of ST too; see osc_dispatch. (CAN and SUB end
         // it in Ground without a signal, which only means the next bytes take
         // the slow path until something does signal.)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inline images
+// ---------------------------------------------------------------------------
+
+impl Term {
+    /// A cell's size in device pixels, which images are sized by.
+    pub fn set_cell_pixels(&mut self, width: u32, height: u32) {
+        self.cell_px = (width.max(1), height.max(1));
+    }
+
+    pub fn cell_pixels(&self) -> (u32, u32) {
+        self.cell_px
+    }
+
+    /// The images in the viewport now, oldest first (newer ones draw on top).
+    pub fn visible_images(&self) -> Vec<VisibleImage> {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        let first = self.grid.scrolled() as i64 - self.grid.display_offset() as i64;
+        let rows = self.rows() as i64;
+        self.images
+            .iter()
+            .filter(|p| p.alt == alt)
+            .filter_map(|p| {
+                let row = p.line as i64 - first;
+                (row + p.rows as i64 > 0 && row < rows).then(|| VisibleImage { image: p.image.clone(), row, col: p.col, cols: p.cols, rows: p.rows })
+            })
+            .collect()
+    }
+
+    /// Whether there are any images to draw on this screen.
+    pub fn has_images(&self) -> bool {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        self.images.iter().any(|p| p.alt == alt)
+    }
+
+    fn new_image(&mut self, format: image::Format, width: u32, height: u32, data: Vec<u8>) -> Arc<image::Image> {
+        let id = self.next_image;
+        self.next_image += 1;
+        Arc::new(image::Image { id, format, width, height, data })
+    }
+
+    /// Put an image at the cursor, `cols` by `rows` cells, and (unless
+    /// asked not to) move the cursor to just after its bottom-right corner,
+    /// scrolling as text would.
+    fn place_image(&mut self, image: Arc<image::Image>, cols: usize, rows: usize, move_cursor: bool, kitty_id: Option<u32>) {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        let (col, line) = (self.cursor.x, self.grid.scrolled() + self.cursor.y as u64);
+        self.images.push(image::Placement { image, line, col, cols, rows, alt, kitty_id });
+        if move_cursor {
+            for _ in 1..rows {
+                self.linefeed_raw();
+            }
+            self.cursor.x = (col + cols).min(self.cols() - 1);
+            self.cursor.wrap_pending = false;
+        }
+        self.prune_images();
+        self.grid.damage_all();
+        self.dirty = true;
+    }
+
+    /// Forget images whose lines have left the scrollback, then the oldest
+    /// while there are too many bytes of them.
+    fn prune_images(&mut self) {
+        let alt_now = self.mode.contains(TermMode::ALT_SCREEN);
+        let gone_before = |g: &Grid| g.scrolled().saturating_sub(g.history_len() as u64);
+        let (here, other) = (gone_before(&self.grid), gone_before(&self.inactive));
+        self.images.retain(|p| p.line + p.rows as u64 > if p.alt == alt_now { here } else { other });
+        let mut bytes: usize = self.kitty_images.values().map(|i| i.data.len()).sum();
+        bytes += self.images.iter().filter(|p| p.kitty_id.is_none()).map(|p| p.image.data.len()).sum::<usize>();
+        while bytes > MAX_IMAGE_BYTES {
+            if let Some(oldest) = self.kitty_images.keys().min().copied().filter(|_| self.images.is_empty() || self.kitty_images.len() > 1) {
+                bytes -= self.kitty_images.remove(&oldest).map_or(0, |i| i.data.len());
+            } else if !self.images.is_empty() {
+                let p = self.images.remove(0);
+                bytes = bytes.saturating_sub(if p.kitty_id.is_none() { p.image.data.len() } else { 0 });
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// `ED 2` and `ED 3`: drop the images on the screen being erased, and
+    /// with the scrollback, those above it too.
+    fn drop_images(&mut self, screen: bool, history: bool) {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        let top = self.grid.scrolled();
+        let bottom = top + self.rows() as u64;
+        self.images.retain(|p| {
+            if p.alt != alt {
+                return true;
+            }
+            let on_screen = p.line + (p.rows as u64) > top && p.line < bottom;
+            let above = p.line + (p.rows as u64) <= top;
+            !((screen && on_screen) || (history && above))
+        });
+    }
+
+    /// The cells an image of this many pixels takes at the cursor, as asked
+    /// for, else its own size, scaled down to fit what's left of the line.
+    fn image_cells(&self, width: u32, height: u32, want: (Option<usize>, Option<usize>)) -> (usize, usize) {
+        image::fit(width, height, self.cell_px, want, (self.cols() - self.cursor.x).max(1))
+    }
+
+    /// An APC string: a kitty graphics command, or something to ignore.
+    pub(crate) fn apc(&mut self, data: &[u8]) {
+        let Some((k, payload)) = image::parse_kitty(data) else { return };
+        // A chunked transfer: the first chunk's keys apply to the whole.
+        let (k, payload) = match self.kitty_partial.take() {
+            Some((first, mut so_far)) => {
+                if so_far.len() + payload.len() > MAX_IMAGE_PAYLOAD {
+                    return;
+                }
+                so_far.extend_from_slice(payload);
+                if k.more {
+                    self.kitty_partial = Some((first, so_far));
+                    return;
+                }
+                (first, so_far)
+            }
+            None if k.more => {
+                self.kitty_partial = Some((k, payload.to_vec()));
+                return;
+            }
+            None => (k, payload.to_vec()),
+        };
+        match k.action {
+            b'd' => self.kitty_delete(&k),
+            b'p' => match k.id.and_then(|id| self.kitty_images.get(&id).cloned()) {
+                Some(img) => {
+                    let (cols, rows) = self.image_cells(img.width, img.height, (k.cols, k.rows));
+                    self.place_image(img, cols, rows, !k.stay, k.id);
+                    self.kitty_reply(&k, Ok(()));
+                }
+                None => self.kitty_reply(&k, Err("ENOENT:no such image")),
+            },
+            b't' | b'T' | b'q' => match image::kitty_image(&k, &payload) {
+                Ok((format, w, h, data)) => {
+                    if k.action != b'q' {
+                        let img = self.new_image(format, w, h, data);
+                        if let Some(id) = k.id {
+                            self.kitty_images.insert(id, img.clone());
+                        }
+                        if k.action == b'T' {
+                            let (cols, rows) = self.image_cells(w, h, (k.cols, k.rows));
+                            self.place_image(img, cols, rows, !k.stay, k.id);
+                        } else {
+                            self.prune_images();
+                        }
+                    }
+                    self.kitty_reply(&k, Ok(()));
+                }
+                Err(e) => self.kitty_reply(&k, Err(e)),
+            },
+            _ => {}
+        }
+    }
+
+    /// kitty's `a=d`: all placements (`d=a`), or one image's (`d=i`); in
+    /// capitals, the image data goes too.
+    fn kitty_delete(&mut self, k: &image::Kitty) {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        match k.delete {
+            b'a' | b'A' => self.images.retain(|p| p.alt != alt),
+            b'i' | b'I' => self.images.retain(|p| p.kitty_id.is_none() || p.kitty_id != k.id),
+            _ => return,
+        }
+        if k.delete.is_ascii_uppercase() {
+            let placed: Vec<u32> = self.images.iter().filter_map(|p| p.kitty_id).collect();
+            match (k.delete, k.id) {
+                (b'I', Some(id)) => {
+                    self.kitty_images.remove(&id);
+                }
+                _ => self.kitty_images.retain(|id, _| placed.contains(id)),
+            }
+        }
+        self.grid.damage_all();
+        self.dirty = true;
+    }
+
+    /// kitty's acknowledgement, for commands that gave an id and didn't ask
+    /// for quiet.
+    fn kitty_reply(&mut self, k: &image::Kitty, result: Result<(), &str>) {
+        let Some(id) = k.id else { return };
+        let msg = match result {
+            Ok(()) if k.quiet == 0 => "OK",
+            Err(e) if k.quiet < 2 => e,
+            _ => return,
+        };
+        self.replies.extend_from_slice(format!("\x1b_Gi={id};{msg}\x1b\\").as_bytes());
+    }
+
+    /// OSC 1337, given everything after `1337;`: an inline image, whole
+    /// (`File=`) or in parts (`MultipartFile=`, `FilePart=`, `FileEnd`).
+    fn iterm_osc(&mut self, rest: &[u8]) {
+        if let Some(args) = rest.strip_prefix(b"MultipartFile=") {
+            self.iterm_partial = Some((args.to_vec(), Vec::new()));
+            return;
+        }
+        if let Some(part) = rest.strip_prefix(b"FilePart=") {
+            if let Some((_, payload)) = &mut self.iterm_partial {
+                if payload.len() + part.len() <= MAX_IMAGE_PAYLOAD {
+                    payload.extend_from_slice(part);
+                }
+            }
+            return;
+        }
+        let whole;
+        let rest = if rest == b"FileEnd" {
+            let Some((args, payload)) = self.iterm_partial.take() else { return };
+            whole = [b"File=".as_slice(), &args, b":", &payload].concat();
+            &whole[..]
+        } else {
+            rest
+        };
+        let Some(i) = image::parse_iterm(rest, self.cell_px, (self.cols(), self.rows())) else { return };
+        let (cols, rows) = self.image_cells(i.width, i.height, i.want);
+        let img = self.new_image(image::Format::Encoded, i.width, i.height, i.data);
+        self.place_image(img, cols, rows, true, None);
     }
 }
 
@@ -2624,5 +2916,119 @@ mod reverse_tests {
                 "cell {x} lost REVERSE"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn b64(data: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
+
+    /// A PNG header for a `w` by `h` image: enough for the terminal, which
+    /// leaves decoding to the renderer.
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 6, 0, 0, 0]);
+        v
+    }
+
+    fn term() -> (Term, Processor) {
+        let mut t = Term::new(40, 10, 100);
+        t.set_cell_pixels(10, 20);
+        (t, Processor::new())
+    }
+
+    #[test]
+    fn iterm_images_sit_on_lines_and_scroll_with_them() {
+        let (mut t, mut p) = term();
+        p.advance(&mut t, b"before\r\n");
+        let seq = format!("\x1b]1337;File=name=eC5wbmc=;inline=1:{}\x07", b64(&png(100, 60)));
+        p.advance(&mut t, seq.as_bytes());
+        let v = t.visible_images();
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].row, v[0].col, v[0].cols, v[0].rows), (1, 0, 10, 3));
+        // The cursor is after its bottom-right corner.
+        assert_eq!((t.cursor.x, t.cursor.y), (10, 3));
+        // Output scrolls it up, then off the screen into the scrollback.
+        p.advance(&mut t, "\r\n".repeat(8).as_bytes());
+        assert_eq!(t.visible_images()[0].row, -1, "partly above the screen");
+        p.advance(&mut t, "\r\n".repeat(5).as_bytes());
+        assert!(t.visible_images().is_empty());
+        // Scrolled back to, it's there again.
+        t.scroll_display(6);
+        assert_eq!(t.visible_images()[0].row, 0);
+        // Clearing the scrollback drops it.
+        t.scroll_to_bottom();
+        p.advance(&mut t, b"\x1b[3J");
+        t.scroll_display(6);
+        assert!(t.visible_images().is_empty());
+    }
+
+    #[test]
+    fn images_leave_with_their_scrollback() {
+        let mut t = Term::new(20, 4, 3);
+        t.set_cell_pixels(10, 20);
+        let mut p = Processor::new();
+        let seq = format!("\x1b]1337;File=inline=1:{}\x07\r\n", b64(&png(10, 20)));
+        p.advance(&mut t, seq.as_bytes());
+        assert_eq!(t.images.len(), 1);
+        p.advance(&mut t, "line\r\n".repeat(20).as_bytes());
+        // Further back than the scrollback keeps: forgotten on the next one.
+        p.advance(&mut t, seq.as_bytes());
+        assert_eq!(t.images.len(), 1);
+    }
+
+    #[test]
+    fn kitty_chunks_split_across_reads() {
+        let (mut t, mut p) = term();
+        let pixels = b64(&[200u8; 4 * 20 * 40]);
+        let (a, b) = pixels.split_at(pixels.len() / 2);
+        let seq = format!("\x1b_Ga=T,f=32,s=20,v=40,i=5,m=1;{a}\x1b\\\x1b_Gm=0;{b}\x1b\\after");
+        // Fed a few bytes at a time, so terminators straddle reads.
+        for chunk in seq.as_bytes().chunks(7) {
+            p.advance(&mut t, chunk);
+        }
+        let v = t.visible_images();
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].cols, v[0].rows, v[0].image.width), (2, 2, 20));
+        assert_eq!(t.take_replies(), b"\x1b_Gi=5;OK\x1b\\");
+        // The text after it printed normally, right of the image's last row.
+        assert_eq!(t.grid.row(1).cells()[2].ch, 'a' as u32);
+        // Shown again by id, then deleted with its data.
+        p.advance(&mut t, b"\r\n\x1b_Ga=p,i=5,q=2\x1b\\");
+        assert_eq!(t.visible_images().len(), 2);
+        p.advance(&mut t, b"\x1b_Ga=d,d=I,i=5\x1b\\");
+        assert!(t.visible_images().is_empty() && t.kitty_images.is_empty());
+        p.advance(&mut t, b"\x1b_Ga=p,i=5\x1b\\");
+        assert_eq!(t.take_replies(), b"\x1b_Gi=5;ENOENT:no such image\x1b\\");
+    }
+
+    #[test]
+    fn kitty_queries_and_cell_size_reports() {
+        let (mut t, mut p) = term();
+        p.advance(&mut t, format!("\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;{}\x1b\\", b64(&[0, 0, 0])).as_bytes());
+        assert_eq!(t.take_replies(), b"\x1b_Gi=31;OK\x1b\\");
+        assert!(t.visible_images().is_empty(), "a query shows nothing");
+        p.advance(&mut t, b"\x1b[16t\x1b[14t");
+        assert_eq!(t.take_replies(), b"\x1b[6;20;10t\x1b[4;200;400t");
+        // Other APC strings are ignored, and the parser carries on.
+        p.advance(&mut t, b"\x1b_something else\x1b\\ok");
+        assert_eq!(t.grid.row(0).cells()[0].ch, 'o' as u32);
+    }
+
+    #[test]
+    fn full_screen_programs_images_go_with_their_screen() {
+        let (mut t, mut p) = term();
+        p.advance(&mut t, b"\x1b[?1049h");
+        p.advance(&mut t, format!("\x1b]1337;File=inline=1:{}\x07", b64(&png(10, 20))).as_bytes());
+        assert_eq!(t.visible_images().len(), 1);
+        p.advance(&mut t, b"\x1b[?1049l");
+        assert!(t.visible_images().is_empty() && t.images.is_empty());
     }
 }

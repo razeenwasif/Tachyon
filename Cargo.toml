@@ -28,6 +28,8 @@ bitflags = "2.13"
 parking_lot = "0.12"
 similar = { version = "2", default-features = false }
 lz4_flex = "0.11"
+# Inline images: their payloads come base64-encoded.
+base64 = "0.22"
 # Find in scrollback: plain text and regex searches.
 regex = { version = "1", default-features = false, features = ["std", "unicode-case", "unicode-perl", "perf"] }
 
