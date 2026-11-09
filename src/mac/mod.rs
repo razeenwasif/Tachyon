@@ -30,6 +30,7 @@ mod receipts;
 mod renderer;
 mod selection;
 mod strip;
+mod suggest;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -92,6 +93,8 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     /// The session host, when shells persist.
     static HOST: RefCell<Option<host::Client>> = const { RefCell::new(None) };
+    /// Commands run before, for inline suggestions; `None` when they're off.
+    static SUGGESTIONS: RefCell<Option<suggest::History>> = const { RefCell::new(None) };
     /// A layout save is queued.
     static LAYOUT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1233,6 +1236,10 @@ struct TermWindow {
     key_time: Option<u64>,
     /// Frames drawn in a row without the link going idle.
     busy_frames: u32,
+    /// The suggestion showing after the cursor (all of it), for → to take.
+    ghost: Option<String>,
+    /// The last suggestion looked up: (typed, folder) and its answer.
+    ghost_cache: Option<(String, Option<String>, Option<String>)>,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -1365,6 +1372,11 @@ impl TermWindow {
                         decor.notes.push((term.cursor_state().y, line));
                     }
                 }
+                if self.rewound.is_none() && self.preedit.is_empty() {
+                    decor.ghost = ghost_for(term, &mut self.ghost_cache, &mut self.ghost);
+                } else {
+                    self.ghost = None;
+                }
                 self.selection
             } else {
                 tab.panes[p].saved.selection
@@ -1466,6 +1478,18 @@ impl TermWindow {
         let Some((elapsed, failed, mut title, folder, receipt)) = finished else {
             return;
         };
+        // Remember it for suggestions, with where it ran.
+        {
+            let term = self.tabs[i].panes[p].term.lock();
+            if let Some(cmd) = term.command(cmd).and_then(|c| c.cmdline.clone()) {
+                let cwd = term.cwd.clone();
+                SUGGESTIONS.with(|s| {
+                    if let Some(h) = s.borrow_mut().as_mut() {
+                        h.record(&cmd, cwd.as_deref());
+                    }
+                });
+            }
+        }
         if let Some(job) = &self.tabs[i].panes[p].job {
             title = format!("{} {}", job.title(), if failed { "failed" } else { "finished" });
         }
@@ -2017,6 +2041,33 @@ impl TermWindow {
         // Mid-composition, every key belongs to the input method.
         if !self.preedit.is_empty() {
             return true;
+        }
+        // A suggestion showing: →, End or ⌃F take it, ⌥→ a word of it.
+        if let Some(rest) = self.ghost.clone() {
+            const RIGHT: u16 = 124;
+            const END: u16 = 119;
+            const F: u16 = 3;
+            let (opt, ctrl, shift) = (
+                flags.contains(NSEventModifierFlags::Option),
+                flags.contains(NSEventModifierFlags::Control),
+                flags.contains(NSEventModifierFlags::Shift),
+            );
+            let take = match event.keyCode() {
+                RIGHT if !ctrl && !shift => Some(if opt { suggest::next_word(&rest).to_string() } else { rest }),
+                END if !ctrl && !shift && !opt => Some(rest),
+                F if ctrl && !opt && !shift => Some(rest),
+                _ => None,
+            };
+            if let Some(text) = take.filter(|t| !t.is_empty()) {
+                self.term.lock().scroll_to_bottom();
+                let _ = self.pty.write(text.as_bytes());
+                self.stamp_keystroke();
+                self.ghost = None;
+                self.ghost_cache = None;
+                self.cursor_shown = None;
+                self.request_redraw();
+                return false;
+            }
         }
         // ⌃⇥ normally arrives as a key equivalent; this catches it if not.
         if flags.contains(NSEventModifierFlags::Control) && event.keyCode() == 48 {
@@ -2572,6 +2623,44 @@ impl TermWindow {
     }
 }
 
+/// The inline suggestion for what's typed at `term`'s prompt, clipped to the
+/// blank cells after the cursor (short of a right prompt), and the whole of it
+/// in `full` for → to take. `cache` saves looking up the same text again on
+/// every frame.
+fn ghost_for(
+    term: &Term,
+    cache: &mut Option<(String, Option<String>, Option<String>)>,
+    full: &mut Option<String>,
+) -> Option<(usize, usize, String)> {
+    *full = None;
+    let (typed, blank) = term.prompt_input()?;
+    let cwd = term.cwd.clone();
+    let rest = match cache {
+        Some((t, c, r)) if *t == typed && *c == cwd => r.clone(),
+        _ => {
+            let r = SUGGESTIONS.with(|s| s.borrow().as_ref().and_then(|h| h.suggest(&typed, cwd.as_deref()).map(str::to_string)));
+            *cache = Some((typed, cwd, r.clone()));
+            r
+        }
+    }?;
+    let c = term.cursor_state();
+    // Up to the end of the row, or two cells short of a right prompt.
+    let room = if c.x + blank >= term.cols() { blank } else { blank.saturating_sub(2) };
+    let mut width = 0;
+    let shown: String = rest
+        .chars()
+        .take_while(|ch| {
+            width += unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(1);
+            width <= room
+        })
+        .collect();
+    if shown.is_empty() {
+        return None;
+    }
+    *full = Some(rest);
+    Some((c.x, c.y, shown))
+}
+
 /// What a tab is called. While a command runs: a title it set, or else its
 /// command line. At a prompt: the shell's own title if it sets one, or else
 /// the folder. Titles a finished program left behind are ignored, so a tab
@@ -2970,6 +3059,8 @@ impl App {
             dragging_divider: None,
             key_time: None,
             busy_frames: 0,
+            ghost: None,
+            ghost_cache: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -3774,6 +3865,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
         });
     });
 
+    if with_app(|a| a.cfg.shell.suggestions).unwrap_or(false) {
+        SUGGESTIONS.with(|s| *s.borrow_mut() = Some(suggest::History::load()));
+    }
     let persist = with_app(|a| a.cfg.shell.persist).unwrap_or(false);
     if persist {
         match host::Client::connect() {

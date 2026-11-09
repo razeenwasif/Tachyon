@@ -189,5 +189,11 @@ theme.bold_is_bright = false
 # closing a window or tab ends its shells as usual.
 # shell.persist = true
 
+# macOS: as you type at a prompt, the rest of a command you've run before, in
+# grey; Right arrow or End takes it, Option-Right one word. From your shell's
+# history and every command run in Tachyon (~/Library/Application
+# Support/Tachyon/history, private to you).
+# shell.suggestions = true
+
 # Lines of scrollback retained above the viewport.
 scrollback = 10000

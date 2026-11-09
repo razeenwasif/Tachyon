@@ -789,6 +789,11 @@ impl Renderer {
         let dim = std::array::from_fn::<u8, 3, _>(|i| {
             ((theme.foreground[i] as u16 + theme.background[i] as u16 * 2) / 3) as u8
         });
+        if let Some((x, y, text)) = &decor.ghost {
+            if *y < term.rows() {
+                self.push_text(text, pad_x + *x as f32 * m.width, pad_y + *y as f32 * m.height, dim);
+            }
+        }
         for (y, text) in &decor.notes {
             if *y >= term.rows() {
                 continue;
@@ -1268,6 +1273,8 @@ pub struct Decor {
     /// Text being composed in an input method (a dead key's accent, or
     /// Japanese before conversion), drawn underlined at the cursor.
     pub preedit: String,
+    /// An inline suggestion: its text, drawn dim from (column, row).
+    pub ghost: Option<(usize, usize, String)>,
 }
 
 /// What the cursor layer should show: a rectangle in drawable pixels and, for
