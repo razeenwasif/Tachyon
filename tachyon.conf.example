@@ -71,6 +71,12 @@ window.padding_y = 6.0
 # Title Bar switches while Tachyon runs.
 # window.layout = edge
 
+# macOS: what full screen means. native is macOS's own (below the notch);
+# notch makes the green button, Ctrl-Cmd-F and View > Enter Full Screen go
+# around the notch (tabs left of it, status right, every row below), and
+# Tachyon opens that way. Option-Cmd-F goes around the notch either way.
+# window.fullscreen = native
+
 # macOS: Liquid Glass's style. clear (the default) is less frosted and bends
 # more of what's behind at its edges; regular frosts it more and adapts its
 # tint to what's behind.

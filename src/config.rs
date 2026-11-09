@@ -119,6 +119,9 @@ pub struct WindowConfig {
     /// macOS: a visible title bar (on the glass, with the window's title, and
     /// the tabs in it when there are two or more) instead of edge-to-edge.
     pub title_bar: bool,
+    /// macOS: full screen means around the notch: the green button, ⌃⌘F and
+    /// View > Enter Full Screen use it, and Tachyon opens that way.
+    pub notch_full_screen: bool,
     /// Whether the user set `window.opacity` explicitly. Enabling a backdrop
     /// picks a sensible translucency by default, but must not override a value
     /// the user asked for.
@@ -141,6 +144,7 @@ impl Default for WindowConfig {
             glass_clear: cfg!(target_os = "macos"),
             glass_tint: if cfg!(target_os = "macos") { 0.75 } else { 0.0 },
             title_bar: false,
+            notch_full_screen: false,
             opacity_explicit: false,
         }
     }
@@ -549,6 +553,13 @@ impl Config {
                 self.window.opacity = parse_f32(value, 0.0, 1.0)?;
                 self.window.opacity_explicit = true;
             }
+            "window.fullscreen" => {
+                self.window.notch_full_screen = match value {
+                    "notch" | "around_notch" => true,
+                    "native" | "macos" | "system" => false,
+                    _ => return Err(format!("window.fullscreen: expected native or notch, got `{value}`")),
+                }
+            }
             "window.layout" => {
                 self.window.title_bar = match value {
                     "edge" | "edge-to-edge" | "edge_to_edge" => false,
@@ -874,6 +885,10 @@ mod contrast_tests {
         c.set("window.layout", "edge").unwrap();
         assert!(!c.window.title_bar);
         assert!(c.set("window.layout", "floating").is_err());
+        assert!(!c.window.notch_full_screen, "macOS's own full screen by default");
+        c.set("window.fullscreen", "notch").unwrap();
+        assert!(c.window.notch_full_screen);
+        assert!(c.set("window.fullscreen", "kiosk").is_err());
     }
 
     #[test]
