@@ -789,7 +789,6 @@ impl Renderer {
         let dim = std::array::from_fn::<u8, 3, _>(|i| {
             ((theme.foreground[i] as u16 + theme.background[i] as u16 * 2) / 3) as u8
         });
-        let cols = term.cols();
         for (y, text) in &decor.notes {
             if *y >= term.rows() {
                 continue;

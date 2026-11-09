@@ -111,6 +111,12 @@ render.sync_timeout_ms = 150
 # system does; dark and light fix one.
 # theme.appearance = auto
 
+# macOS: high-contrast versions of both themes, derived from them: a black (or
+# white) background, every ANSI colour at 7:1 contrast or better, and a solid
+# selection; the glass becomes a solid background. auto follows System
+# Settings > Accessibility > Display > Increase Contrast; high and normal fix it.
+# theme.contrast = auto
+
 # The dark theme (and the only one on Windows). On macOS, the light theme has
 # its own keys, theme.light.background, theme.light.ansi1 and so on, with
 # built-in defaults: near-white paper and ANSI colours dark enough to read on it.

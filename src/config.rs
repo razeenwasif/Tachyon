@@ -34,6 +34,15 @@ pub enum Backdrop {
 
 /// Which palette a window uses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Contrast {
+    /// Follow System Settings > Accessibility > Display > Increase Contrast.
+    #[default]
+    Auto,
+    High,
+    Normal,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Appearance {
     /// Follow the system: the light theme in Light Mode, the dark one in Dark.
     #[default]
@@ -236,6 +245,43 @@ impl ThemeConfig {
         }
     }
 
+    /// The high-contrast version of this theme, for Increase Contrast: a
+    /// black (or, for a light theme, white) background, white (or black)
+    /// text, every ANSI colour moved toward the text colour until it reaches
+    /// 7:1 contrast (WCAG AAA), and a solid selection with its own text
+    /// colour. The slot shells use for dim text (bright black on dark, white
+    /// on light) gets 4.5:1, so it still reads as dimmer; the slot that
+    /// matches the background (black on dark) is left alone.
+    pub fn high_contrast(&self, dark: bool) -> ThemeConfig {
+        let (bg, fg) = if dark { ([0u8; 3], [0xFF; 3]) } else { ([0xFF; 3], [0u8; 3]) };
+        let palette = self.palette();
+        let mut ansi = [None; 16];
+        for (i, slot) in ansi.iter_mut().enumerate() {
+            let target = match (dark, i) {
+                (true, 0) => None,
+                (true, 8) | (false, 7) => Some(4.5),
+                _ => Some(7.0),
+            };
+            *slot = Some(match target {
+                Some(t) => toward_contrast(palette.0[i], fg, bg, t),
+                None => palette.0[i],
+            });
+        }
+        let cursor = toward_contrast(self.cursor, fg, bg, 4.5);
+        ThemeConfig {
+            background: bg,
+            foreground: fg,
+            cursor,
+            cursor_text: bg,
+            selection_bg: if dark { [0x1F, 0x4E, 0x96] } else { [0xA8, 0xCD, 0xFF] },
+            selection_fg: Some(fg),
+            ansi,
+            bold_is_bright: self.bold_is_bright,
+            cursor_accent: self.cursor_accent,
+            selection_accent: false,
+        }
+    }
+
     /// Apply one `theme.*` key (without the `theme.` or `theme.light.`
     /// prefix). Returns false for a key this doesn't know.
     fn set(&mut self, key: &str, value: &str) -> Result<bool, String> {
@@ -344,6 +390,9 @@ pub struct Config {
     /// macOS: the theme used in Light Mode when `appearance` is Auto.
     pub theme_light: ThemeConfig,
     pub appearance: Appearance,
+    /// macOS: the high-contrast themes, derived from the light and dark
+    /// ones, when Increase Contrast is on.
+    pub contrast: Contrast,
     pub shell: ShellConfig,
     pub macos: MacConfig,
     pub scrollback: usize,
@@ -360,6 +409,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             theme_light: ThemeConfig::light(),
             appearance: Appearance::default(),
+            contrast: Contrast::default(),
             shell: ShellConfig::default(),
             macos: MacConfig::default(),
             scrollback: 10_000,
@@ -534,6 +584,15 @@ impl Config {
                 }
             }
 
+            "theme.contrast" => {
+                self.contrast = match value.to_ascii_lowercase().as_str() {
+                    "auto" | "system" => Contrast::Auto,
+                    "high" | "increased" => Contrast::High,
+                    "normal" => Contrast::Normal,
+                    _ => return Err(format!("theme.contrast: expected auto, high or normal, got `{value}`")),
+                }
+            }
+
             "shell.program" => self.shell.program = value.to_string(),
             "shell.integration" => self.shell.integration = parse_bool(value)?,
             "shell.persist" => self.shell.persist = parse_bool(value)?,
@@ -572,6 +631,36 @@ impl Config {
     pub fn palette(&self) -> Palette {
         self.theme.palette()
     }
+}
+
+/// WCAG relative luminance of an sRGB colour.
+pub fn luminance(c: [u8; 3]) -> f64 {
+    let lin = |v: u8| {
+        let c = v as f64 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2])
+}
+
+/// WCAG contrast ratio between two colours, 1 to 21.
+pub fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `c` mixed toward `toward` just enough to reach `target` contrast against
+/// `bg`, keeping as much of its colour as it can.
+fn toward_contrast(c: [u8; 3], toward: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
+    let mix = |t: f64| -> [u8; 3] { std::array::from_fn(|i| (c[i] as f64 + (toward[i] as f64 - c[i] as f64) * t).round() as u8) };
+    if contrast_ratio(c, bg) >= target {
+        return c;
+    }
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..20 {
+        let mid = (lo + hi) / 2.0;
+        if contrast_ratio(mix(mid), bg) >= target { hi = mid } else { lo = mid }
+    }
+    mix(hi)
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -731,5 +820,40 @@ mod tests {
         let c = Config::parse("theme.foreground = \"#ABCDEF\"\n");
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
         assert_eq!(c.theme.foreground, [0xAB, 0xCD, 0xEF]);
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    #[test]
+    fn high_contrast_themes_reach_aaa() {
+        for (theme, dark) in [(ThemeConfig::default(), true), (ThemeConfig::light(), false)] {
+            let hc = theme.high_contrast(dark);
+            assert_eq!(contrast_ratio(hc.foreground, hc.background), 21.0);
+            for (i, c) in hc.ansi.iter().enumerate() {
+                let r = contrast_ratio(c.unwrap(), hc.background);
+                let want = match (dark, i) {
+                    (true, 0) => 1.0,
+                    (true, 8) | (false, 7) => 4.5,
+                    _ => 7.0,
+                };
+                assert!(r >= want - 0.01, "{} slot {i}: {r:.2}:1", if dark { "dark" } else { "light" });
+            }
+            let sel = contrast_ratio(hc.selection_fg.unwrap(), hc.selection_bg);
+            assert!(sel >= 7.0, "selection text {sel:.2}:1");
+            // Colours keep their hue: red stays reddest in its own slot.
+            let red = hc.ansi[1].unwrap();
+            assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
+        }
+    }
+
+    #[test]
+    fn contrast_is_a_setting() {
+        let mut c = Config::default();
+        c.set("theme.contrast", "high").unwrap();
+        assert_eq!(c.contrast, Contrast::High);
+        assert!(c.set("theme.contrast", "loud").is_err());
     }
 }
