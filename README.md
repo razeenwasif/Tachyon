@@ -308,7 +308,7 @@ scrollback and the screen as you type. Matches are highlighted, the current
 one stronger, and the bar counts them (`3 of 12`). Return or ⌘G goes to the
 next match up, toward older output, since a search starts at the bottom;
 ⇧Return or ⌘⇧G goes down. Esc closes it. Case is ignored unless you type a
-capital, and the `.*` switch makes the query a regular expression. A line the
+capital, and the **Regex** checkbox makes the query a regular expression. A line the
 terminal wrapped is searched as one line, so a match can cross the wrap. A
 search over a full 100,000-line scrollback takes 12–18 ms, most of it reading
 lines straight from their packed bytes.
