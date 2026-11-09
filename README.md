@@ -95,7 +95,12 @@ scripts/bundle-macos.sh --install    # ...and install it to /Applications
 ```
 
 The window is edge-to-edge: no title bar, and the window buttons appear when
-the pointer reaches the top-left corner. **Liquid Glass** sits behind the text
+the pointer reaches the top-left corner. If you'd rather have a title bar,
+View > Show Title Bar switches to the **standard layout** (`window.layout =
+standard` makes it the default): a title bar on the glass with the window
+buttons and the tab's name, and with two or more tabs, the glass tab capsule in
+the title bar instead of along the bottom. It costs about three rows, and
+double-clicking the title bar does what System Settings says. **Liquid Glass** sits behind the text
 (NSGlassEffectView on macOS 26 and later): only the default background lets it
 through; text, the cursor, the selection and colours a program sets stay solid.
 The glass is tinted with the theme's background (`window.glass_tint`, 0.75) in

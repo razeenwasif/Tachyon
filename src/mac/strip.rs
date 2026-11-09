@@ -217,13 +217,17 @@ impl Capsule {
 
     /// Centre the capsule along the bottom of a view `width` points wide.
     pub fn place(&self, width: f64, tabs: usize) {
-        let room = (width - 2.0 * SIDE_MARGIN).max(0.0);
+        self.place_at(width, tabs, ((BAND_HEIGHT - CAPSULE_HEIGHT) / 2.0).round(), SIDE_MARGIN);
+    }
+
+    /// Centre the capsule across a view `width` points wide, at `y` from
+    /// its bottom, keeping `margin` points from both sides (clear of the
+    /// window buttons, in a title bar).
+    pub fn place_at(&self, width: f64, tabs: usize, y: f64, margin: f64) {
+        let room = (width - 2.0 * margin).max(0.0);
         let tab_w = (room / tabs.max(1) as f64).min(MAX_TAB_WIDTH);
         let w = (tab_w * tabs as f64).min(room);
-        let frame = NSRect::new(
-            NSPoint::new(((width - w) / 2.0).round(), ((BAND_HEIGHT - CAPSULE_HEIGHT) / 2.0).round()),
-            NSSize::new(w, CAPSULE_HEIGHT),
-        );
+        let frame = NSRect::new(NSPoint::new(((width - w) / 2.0).round(), y.round()), NSSize::new(w, CAPSULE_HEIGHT));
         self.glass.setFrame(frame);
         self.view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
     }
