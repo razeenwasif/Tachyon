@@ -101,6 +101,16 @@ fn main() {
 #[cfg(target_os = "macos")]
 fn main() {
     tachyon::log::install_panic_hook();
+    // The session host: see src/mac/host.rs.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--host") {
+        let path = argv.get(2).map(std::path::PathBuf::from).unwrap_or_else(tachyon::mac::host::socket_path);
+        if let Err(e) = tachyon::mac::host::run(&path) {
+            tachyon::log::force(&format!("host: {e}"));
+            std::process::exit(1);
+        }
+        return;
+    }
     tachyon::log!("--- tachyon {} starting (macOS) ---", tachyon::APP_VERSION);
 
     let mut cfg = tachyon::config::Config::load_default();

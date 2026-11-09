@@ -4,6 +4,7 @@ pub mod jobs;
 pub mod lens;
 pub mod rerun;
 pub mod rewind;
+mod restore;
 pub mod cell;
 pub mod color;
 pub mod grid;
@@ -239,6 +240,15 @@ pub struct Term {
     /// The command whose prompt is showing or which is running.
     current_cmd: Option<u32>,
     next_cmd: u32,
+
+    /// Output being parsed is a restored session's past, not happening now:
+    /// commands in it get no start or finish times and raise no events.
+    pub restoring: bool,
+
+    /// Keep-awake: the command that keeps the Mac from sleeping while it
+    /// runs, or the next one to start, if asked.
+    awake_cmd: Option<u32>,
+    awake_next: bool,
 }
 
 impl Term {
@@ -276,6 +286,9 @@ impl Term {
             command_events: Vec::new(),
             current_cmd: None,
             next_cmd: 1,
+            restoring: false,
+            awake_cmd: None,
+            awake_next: false,
         }
     }
 
@@ -405,6 +418,9 @@ impl Term {
             command_events: Vec::new(),
             current_cmd: None,
             next_cmd: 1,
+            restoring: false,
+            awake_cmd: None,
+            awake_next: false,
         }
     }
 
@@ -456,6 +472,34 @@ impl Term {
 
     /// Whether a command is running, so its output is worth reading for
     /// metrics.
+    /// Keep the Mac awake while the running command runs, or while the next
+    /// one does when none is running; `false` takes that back.
+    pub fn set_keep_awake(&mut self, on: bool) {
+        let running = self.current_cmd.filter(|id| self.commands.get(id).is_some_and(|c| c.state == CommandState::Running));
+        (self.awake_cmd, self.awake_next) = match (on, running) {
+            (false, _) => (None, false),
+            (true, Some(id)) => (Some(id), false),
+            (true, None) => (None, true),
+        };
+        self.dirty = true;
+        self.title_revision = self.title_revision.wrapping_add(1);
+    }
+
+    /// A command running now keeps the Mac awake.
+    pub fn keeps_awake(&self) -> bool {
+        self.awake_cmd.is_some()
+    }
+
+    /// Keep-awake is on: for the running command, or the next one.
+    pub fn awake_armed(&self) -> bool {
+        self.awake_cmd.is_some() || self.awake_next
+    }
+
+    /// The command keeping the Mac awake, if one is.
+    pub fn awake_command(&self) -> Option<u32> {
+        self.awake_cmd
+    }
+
     pub fn command_running(&self) -> bool {
         self.current_cmd
             .and_then(|id| self.commands.get(&id))
@@ -548,7 +592,7 @@ impl Term {
                         return;
                     }
                     c.state = CommandState::Running;
-                    c.started = Some(Instant::now());
+                    c.started = (!self.restoring).then(Instant::now);
                     if cmdline.as_deref().is_some_and(is_ssh) && self.ssh_session.is_none() {
                         self.ssh_session = cmdline.clone().map(|c| (c, self.cwd_host.clone()));
                     }
@@ -556,7 +600,12 @@ impl Term {
                     c.cmdline = cmdline;
                     self.title_revision = self.title_revision.wrapping_add(1);
                     self.mark_row(id, RowMark::OUTPUT);
-                    self.command_events.push(CommandEvent::Started(id));
+                    if std::mem::take(&mut self.awake_next) {
+                        self.awake_cmd = Some(id);
+                    }
+                    if !self.restoring {
+                        self.command_events.push(CommandEvent::Started(id));
+                    }
                 }
             }
             b'D' => {
@@ -568,9 +617,14 @@ impl Term {
                     if let Some(c) = self.commands.get_mut(&id) {
                         if c.state == CommandState::Running {
                             c.state = CommandState::Done;
-                            c.finished = Some(Instant::now());
+                            c.finished = (!self.restoring).then(Instant::now);
                             c.exit = exit;
-                            self.command_events.push(CommandEvent::Finished(id, exit));
+                            if self.awake_cmd == Some(id) {
+                                self.awake_cmd = None;
+                            }
+                            if !self.restoring {
+                                self.command_events.push(CommandEvent::Finished(id, exit));
+                            }
                             self.compare_run(id);
                             self.title_revision = self.title_revision.wrapping_add(1);
                         }
@@ -1879,6 +1933,33 @@ fn parse_file_url(url: &[u8]) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod awake_tests {
+    use super::*;
+
+    fn feed(t: &mut Term, s: &str) {
+        Processor::new().advance(t, s.as_bytes());
+    }
+
+    #[test]
+    fn keep_awake_lasts_one_command() {
+        let mut t = Term::new(40, 10, 100);
+        feed(&mut t, "\x1b]133;A\x07$ \x1b]133;B\x07");
+        // At a prompt: the next command.
+        t.set_keep_awake(true);
+        assert!(t.awake_armed() && !t.keeps_awake());
+        feed(&mut t, "train\r\n\x1b]133;C;cmdline=train\x07");
+        assert!(t.keeps_awake());
+        feed(&mut t, "\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07");
+        assert!(!t.awake_armed(), "only that one");
+        // While one runs: that one; and it can be taken back.
+        t.set_keep_awake(true);
+        assert!(t.keeps_awake());
+        t.set_keep_awake(false);
+        assert!(!t.awake_armed());
+    }
 }
 
 #[cfg(test)]

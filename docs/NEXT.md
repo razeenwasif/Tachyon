@@ -396,6 +396,32 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    and hovering shows the old line as a tooltip.
 8. **Session host**: `tachyon-host` as a login agent with keep-awake
    assertions. After Rewind, because it owns the logs.
+   *First version done (9 November 2026):* not a login agent but the app's
+   own binary started as `tachyon --host <socket>` in its own session
+   (`setsid`), on demand, exiting 20 s after it has no shells and no app.
+   `src/mac/host.rs`: a Unix socket in `$TMPDIR` named by the app binary and
+   protocol version, checked with `getpeereid`; requests are 0x1F-separated
+   fields in length-prefixed frames. Each shell's PTY master and a socketpair
+   carrying its output go to the app with `SCM_RIGHTS`, so the app writes keys
+   and resizes to the PTY directly and reads output as before. The host reads
+   each PTY, forwards at once, and parses on a utility-QoS thread into its own
+   `Term`; a hand-over stops forwarding, parses what's queued, and starts the
+   new stream with `Term::to_vt()` (`src/term/restore.rs`: scrollback, both
+   screens, SGR, wraps, modes, cursor, title, OSC 7, OSC 133 marks with exit
+   codes), which the app parses as the past (`Term::restoring`: no replies,
+   events or times). The app keeps the layout (window frames, tabs, split
+   trees, focus, zoom) at the host and reopens it at launch; ⌘Q keeps shells,
+   ⌥⌘Q ends them, closing a window or tab ends its own. Measured under load:
+   echo 6–11 µs median through the host (2–4 µs straight), throughput 4–12%
+   lower on a 256 MB `cat`, with 1 MiB socket buffers. Still to do:
+   Rewind history across a restart, notifications while the app is closed.
+   *Keep-awake done (9 November 2026):* ⌥⌘A arms the focused pane: the
+   running command, or the next to start (`Term::set_keep_awake`, cleared by
+   that command's OSC 133 D). The host follows its own terminal and holds one
+   `PreventUserIdleSystemSleep` assertion (`src/mac/power.rs`, IOKit) while any
+   shell's armed command runs, named after the commands for `pmset -g
+   assertions`, so it holds with the app closed; shells run in the app hold it
+   there. The receipt reads `☕ awake` while held.
 9. **Split panes** on cell boundaries. Shaping already arrived with Core Text
    in step 1.
    *Done (9 November 2026), ahead of the session host:* `src/mac/panes.rs` is

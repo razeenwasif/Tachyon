@@ -167,5 +167,11 @@ theme.bold_is_bright = false
 # gutter, run receipts and Cmd-Up/Down). Your .zshrc is not modified.
 # shell.integration = true
 
+# macOS: run shells in Tachyon's session host, so quitting, crashing or
+# updating Tachyon leaves them running and reopening it puts them back, with
+# their windows, tabs, splits and screens. Option-Cmd-Q quits and ends them;
+# closing a window or tab ends its shells as usual.
+# shell.persist = true
+
 # Lines of scrollback retained above the viewport.
 scrollback = 10000

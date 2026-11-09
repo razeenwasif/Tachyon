@@ -17,6 +17,9 @@ use std::ptr;
 pub struct Pty {
     master: OwnedFd,
     pid: libc::pid_t,
+    /// A shell the session host runs: its output comes on this stream rather
+    /// than from the PTY, and the host, not this process, reaps it.
+    output: Option<OwnedFd>,
 }
 
 impl Pty {
@@ -86,14 +89,34 @@ impl Pty {
         unsafe {
             libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        Ok(Pty { master, pid })
+        Ok(Pty { master, pid, output: None })
+    }
+
+    /// A shell the session host runs: its PTY (for keys, resizes and
+    /// terminal state) and the stream its output comes on.
+    pub fn remote(master: OwnedFd, pid: libc::pid_t, output: OwnedFd) -> Pty {
+        Pty { master, pid, output: Some(output) }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.output.is_some()
+    }
+
+    /// The size the PTY was last given, as (columns, rows).
+    pub fn size(&self) -> (u16, u16) {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws);
+        }
+        (ws.ws_col, ws.ws_row)
     }
 
     /// Blocking read. `Ok(0)` means the child is gone: macOS reports a closed
     /// PTY as `EIO` rather than end-of-file, and both mean the same here.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let fd = self.output.as_ref().unwrap_or(&self.master).as_raw_fd();
         loop {
-            let n = unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n >= 0 {
                 return Ok(n as usize);
             }
@@ -151,6 +174,10 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        // The host's shells are the host's to reap.
+        if self.output.is_some() {
+            return;
+        }
         // Reap the child so it does not linger as a zombie. Usually it has
         // already exited; if not, hang up and wait for it off this thread.
         let pid = self.pid;

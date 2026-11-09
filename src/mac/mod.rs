@@ -18,10 +18,12 @@
 mod boxdraw;
 mod dock;
 mod font;
+pub mod host;
 mod input;
 mod links;
 mod notify;
 mod panes;
+mod power;
 mod pty;
 mod receipts;
 mod renderer;
@@ -87,7 +89,16 @@ thread_local! {
     /// All main-thread state. AppKit calls into the views and delegates; each
     /// carries its window's id and forwards here.
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// The session host, when shells persist.
+    static HOST: RefCell<Option<host::Client>> = const { RefCell::new(None) };
+    /// A layout save is queued.
+    static LAYOUT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Tachyon is quitting: the host's shells stay, for next time.
+static QUITTING: AtomicBool = AtomicBool::new(false);
+/// Ids for shells run here rather than at the host, apart from the host's.
+static LOCAL_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
 
 /// Run `f` against the app state, unless it is already borrowed further up the
 /// stack (AppKit can re-enter us from inside a call we made).
@@ -434,6 +445,11 @@ define_class!(
         #[unsafe(method(tachyonPaneDown:))]
         fn pane_down(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.move_focus(0, 1));
+        }
+
+        #[unsafe(method(tachyonKeepAwake:))]
+        fn keep_awake(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.toggle_awake());
         }
 
         #[unsafe(method(tachyonZoomPane:))]
@@ -804,6 +820,9 @@ define_class!(
         /// without running destructors).
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _n: &NSNotification) {
+            // The host keeps the shells; it keeps where they were too.
+            save_layout();
+            QUITTING.store(true, Ordering::Release);
             if let Some(root) = rewind_root() {
                 let prefix = format!("{}-", std::process::id());
                 if let Ok(entries) = std::fs::read_dir(&root) {
@@ -827,6 +846,24 @@ define_class!(
     }
 
     impl AppDelegate {
+        /// ⌥⌘Q: quit and end every shell, rather than keeping them for next
+        /// time.
+        #[unsafe(method(tachyonQuitEndingSessions:))]
+        fn quit_ending_sessions(&self, _sender: Option<&AnyObject>) {
+            with_app(|app| {
+                for w in &app.windows {
+                    for tab in &w.tabs {
+                        for pane in &tab.panes {
+                            pane.pty.hangup();
+                        }
+                    }
+                }
+            });
+            if let Some(mtm) = MainThreadMarker::new() {
+                NSApplication::sharedApplication(mtm).terminate(None);
+            }
+        }
+
         #[unsafe(method(newWindow:))]
         fn new_window(&self, _sender: Option<&AnyObject>) {
             open_window();
@@ -852,7 +889,6 @@ struct App {
     gpu: Rc<Gpu>,
     windows: Vec<TermWindow>,
     next_id: u64,
-    next_tab: u64,
     /// Where the next window's top-left corner goes, so new windows cascade.
     cascade: NSPoint,
     _delegate: Retained<AppDelegate>,
@@ -1008,17 +1044,22 @@ impl Default for PaneState {
 impl Pane {
     /// Start a shell, in `cwd` when given (a split starts where the pane it
     /// came from is), otherwise at home.
-    fn start(
-        id: u64,
-        cfg: &Config,
-        cols: usize,
-        rows: usize,
-        job: Option<JobRef>,
-        cwd: Option<&str>,
-    ) -> Result<Pane, String> {
-        let wake_pending = Arc::new(AtomicBool::new(false));
+    fn start(cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>, cwd: Option<&str>) -> Result<Pane, String> {
         let run = job.as_ref().and_then(follow_command);
-        let (term, pty, log) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending), run.as_deref(), cwd)?;
+        let (id, pty) = open_session(cfg, cols, rows, run.as_deref(), cwd)?;
+        Pane::with(id, pty, cfg, cols, rows, job, false)
+    }
+
+    /// A shell the session host kept while the app was closed.
+    fn attach(cfg: &Config, r: host::Remote) -> Result<Pane, String> {
+        let awake = r.awake;
+        let pane = Pane::with(r.id, r.pty, cfg, r.cols, r.rows, None, awake)?;
+        Ok(pane)
+    }
+
+    fn with(id: u64, pty: Pty, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>, awake: bool) -> Result<Pane, String> {
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let (term, pty, log) = start_session(id, pty, cfg, cols, rows, Arc::clone(&wake_pending), awake)?;
         Ok(Pane {
             id,
             term,
@@ -1089,6 +1130,13 @@ impl Tab {
 impl Drop for Pane {
     fn drop(&mut self) {
         dock::set_progress(self.id, None);
+        if !self.pty.is_remote() {
+            power::set(self.id, None);
+        }
+        // Quitting leaves the host's shells running, to come back next time.
+        if QUITTING.load(Ordering::Acquire) && self.pty.is_remote() {
+            return;
+        }
         // The reader thread holds the PTY too, so dropping ours does not end
         // the session; hanging up does.
         self.pty.hangup();
@@ -1547,6 +1595,7 @@ impl TermWindow {
         self.active = i;
         self.load_live();
         self.window.invalidateCursorRectsForView(&self.view);
+        schedule_layout_save();
     }
 
     /// ⌘1 to ⌘8 pick that tab; ⌘9 picks the last.
@@ -1602,6 +1651,7 @@ impl TermWindow {
             self.layout();
         }
         self.load_live();
+        schedule_layout_save();
     }
 
     /// ⌘⌥ and an arrow: focus the pane on that side.
@@ -1614,6 +1664,28 @@ impl TermWindow {
             Some(p) => self.focus_pane(p),
             None => objc2_app_kit::NSBeep(),
         }
+    }
+
+    /// ⌥⌘A: keep the Mac awake while the focused pane's command runs (or
+    /// its next one, at a prompt), or stop.
+    fn toggle_awake(&mut self) {
+        let pane = self.tabs[self.active].pane();
+        let (on, cmdline) = {
+            let mut t = pane.term.lock();
+            let on = !t.awake_armed();
+            t.set_keep_awake(on);
+            (on, t.keeps_awake().then(|| t.running_cmdline().unwrap_or("").to_string()))
+        };
+        if pane.pty.is_remote() {
+            let id = pane.id;
+            let sent = HOST.with(|h| h.borrow().as_ref().map(|c| c.set_awake(id, on)));
+            if let Some(Err(e)) = sent {
+                crate::log::force(&format!("session host: could not set keep-awake: {e}"));
+            }
+        } else {
+            power::set(pane.id, cmdline.as_deref());
+        }
+        self.request_redraw();
     }
 
     /// ⌘⇧↩: the focused pane fills the tab, or goes back to its place.
@@ -1798,6 +1870,7 @@ impl TermWindow {
             tab.lay_out(grid.0, grid.1);
         }
         self.window.invalidateCursorRectsForView(&self.view);
+        schedule_layout_save();
         self.update_resize_increments();
         self.request_redraw();
     }
@@ -2178,6 +2251,7 @@ impl TermWindow {
 
     fn mouse_up(&mut self, event: &NSEvent, button: MouseButton) {
         if self.dragging_divider.take().is_some() {
+            schedule_layout_save();
             return;
         }
         if self.mouse_held == Some(button) {
@@ -2504,6 +2578,12 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
                 (Some(d), None) => Some(d.clone()),
                 (None, r) => r.clone(),
             };
+            // Keep-awake: said on the command's line while it holds the Mac.
+            let receipt = match (term.awake_command().is_some() && term.awake_command() == owner, receipt) {
+                (true, Some(r)) => Some(format!("☕ awake · {r}")),
+                (true, None) => Some("☕ keeping the Mac awake".to_string()),
+                (false, r) => r,
+            };
             let lens = info.lens.describe();
             // Both if they fit, else the metrics while it runs and the
             // receipt once it's done.
@@ -2548,6 +2628,10 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
                 }
             }
         }
+    }
+    // Keep-awake asked for at a prompt: the next command will have it.
+    if term.awake_armed() && !term.keeps_awake() {
+        decor.notes.push((term.cursor_state().y, "☕ the next command keeps the Mac awake".into()));
     }
     decor
 }
@@ -2623,7 +2707,13 @@ impl App {
     /// Build a window and its session, and add it to the list. Ordering it on
     /// screen is left to the caller, outside the app-state borrow, because
     /// AppKit calls back into the delegate while it does that.
-    fn create_window(&mut self, mtm: MainThreadMarker) -> Result<(Retained<NSWindow>, Retained<TachyonView>, u64), String> {
+    /// A new window: with a fresh shell, or with `restored` tabs (and the
+    /// index of the one in front).
+    fn create_window(
+        &mut self,
+        mtm: MainThreadMarker,
+        restored: Option<(Vec<Tab>, usize)>,
+    ) -> Result<(Retained<NSWindow>, Retained<TachyonView>, u64), String> {
         let id = self.next_id;
         self.next_id += 1;
         let cfg = &self.cfg;
@@ -2732,10 +2822,12 @@ impl App {
             self.cascade = window.cascadeTopLeftFromPoint(self.cascade);
         }
 
-        let tab_id = self.next_tab;
-        self.next_tab += 1;
-        let tab = Tab::new(Pane::start(tab_id, cfg, cfg.window.cols, cfg.window.rows, None, None)?);
-        let (term, pty) = (Arc::clone(&tab.pane().term), Arc::clone(&tab.pane().pty));
+        let (tabs, active) = match restored {
+            Some(r) => r,
+            None => (vec![Tab::new(Pane::start(cfg, cfg.window.cols, cfg.window.rows, None, None)?)], 0),
+        };
+        let pane = tabs[active].pane();
+        let (term, pty) = (Arc::clone(&pane.term), Arc::clone(&pane.pty));
 
         let link = unsafe { view.displayLinkWithTarget_selector(&view, sel!(tick:)) };
         unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
@@ -2746,8 +2838,8 @@ impl App {
             view: view.clone(),
             link,
             renderer,
-            tabs: vec![tab],
-            active: 0,
+            tabs,
+            active,
             term,
             pty,
             title_shown: String::new(),
@@ -2795,7 +2887,6 @@ impl App {
     /// A new tab in window `window`, following `job` if given. A job that
     /// already has a tab there is brought forward instead.
     fn open_tab_for(&mut self, window: u64, job: Option<JobRef>) -> Result<(), String> {
-        let tab_id = self.next_tab;
         let Some(w) = self.windows.iter_mut().find(|w| w.id == window) else {
             return Ok(());
         };
@@ -2809,9 +2900,8 @@ impl App {
                 w.followed.push(j.id.clone());
             }
         }
-        self.next_tab += 1;
         let (cols, rows) = w.grid;
-        let tab = Tab::new(Pane::start(tab_id, &self.cfg, cols.max(1), rows.max(1), job, None)?);
+        let tab = Tab::new(Pane::start(&self.cfg, cols.max(1), rows.max(1), job, None)?);
         w.add_tab(tab);
         Ok(())
     }
@@ -2821,7 +2911,9 @@ impl App {
     /// Split the focused pane of window `window`'s tab in front: a new shell,
     /// in the same folder, takes the right or bottom half and focus.
     fn split_pane(&mut self, window: u64, dir: panes::Dir) -> Result<(), String> {
-        let id = self.next_tab;
+        // Where the new pane goes, worked out with a stand-in id until the
+        // shell has its own.
+        const NEW: u64 = u64::MAX;
         let Some(w) = self.windows.iter_mut().find(|w| w.id == window) else {
             return Ok(());
         };
@@ -2830,17 +2922,19 @@ impl App {
         let from = tab.pane();
         let cwd = from.term.lock().local_cwd().map(str::to_string);
         let mut layout = tab.layout.clone();
-        layout.split(from.id, id, dir);
+        let from_id = from.id;
+        layout.split(from_id, NEW, dir);
         let area = panes::Rect { col: 0, row: 0, cols: w.grid.0, rows: w.grid.1 };
-        let rect = layout.layout(area).0.into_iter().find(|r| r.0 == id).map(|r| r.1).unwrap_or_default();
+        let rect = layout.layout(area).0.into_iter().find(|r| r.0 == NEW).map(|r| r.1).unwrap_or_default();
         if rect.cols < 2 || rect.rows < 1 {
             // No room for another pane.
             objc2_app_kit::NSBeep();
             return Ok(());
         }
-        self.next_tab += 1;
-        let mut pane = Pane::start(id, &self.cfg, rect.cols, rect.rows, None, cwd.as_deref())?;
+        let mut pane = Pane::start(&self.cfg, rect.cols, rect.rows, None, cwd.as_deref())?;
         pane.rect = rect;
+        let mut layout = w.tabs[w.active].layout.clone();
+        layout.split(from_id, pane.id, dir);
         let tab = &mut w.tabs[w.active];
         tab.layout = layout;
         tab.zoomed = false;
@@ -2939,7 +3033,7 @@ fn open_window() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    match with_app(|app| app.create_window(mtm)) {
+    match with_app(|app| app.create_window(mtm, None)) {
         Some(Ok((window, view, id))) => {
             with_window(id, |w| {
                 w.apply_appearance();
@@ -2980,6 +3074,7 @@ fn remove_window(id: u64) {
         let i = app.windows.iter().position(|w| w.id == id)?;
         Some(app.windows.remove(i))
     });
+    schedule_layout_save();
     drop(removed);
 }
 
@@ -2999,6 +3094,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let app_menu = NSMenu::new(mtm);
     item(&app_menu, "Hide Tachyon", sel!(hide:), "h");
     item(&app_menu, "Quit Tachyon", sel!(terminate:), "q");
+    // ⌥⌘Q: shells end too, instead of waiting at the host for next time.
+    item(&app_menu, "Quit and End Shells", sel!(tachyonQuitEndingSessions:), "q")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     submenu(&main, &app_menu);
 
     let file = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Shell"));
@@ -3008,6 +3106,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     file.addItem(&NSMenuItem::separatorItem(mtm));
     item(&file, "Split Right", sel!(tachyonSplitRight:), "d");
     item(&file, "Split Down", sel!(tachyonSplitDown:), "D");
+    file.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&file, "Keep Awake While Running", sel!(tachyonKeepAwake:), "a")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     file.addItem(&NSMenuItem::separatorItem(mtm));
     item(&file, "Close", sel!(tachyonCloseTab:), "w");
     // A capital letter means Shift as well: ⌘⇧W.
@@ -3061,15 +3162,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
 }
 
 /// Start a shell on a PTY and the reader thread that feeds its terminal.
-fn start_session(
-    id: u64,
-    cfg: &Config,
-    cols: usize,
-    rows: usize,
-    wake_pending: Arc<AtomicBool>,
-    run: Option<&str>,
-    cwd: Option<&str>,
-) -> Result<(Arc<Mutex<Term>>, Arc<Pty>, Arc<Mutex<RewindLog>>), String> {
+/// Start a shell: at the session host when there is one, so it outlives the
+/// app, else here. Returns its id and PTY.
+fn open_session(cfg: &Config, cols: usize, rows: usize, run: Option<&str>, cwd: Option<&str>) -> Result<(u64, Pty), String> {
     let (program, login) = if cfg.shell.program.is_empty() {
         (pty::default_shell(), true)
     } else {
@@ -3088,14 +3183,43 @@ fn start_session(
     if let (Some(cmd), true) = (run, zsh_runs_it) {
         extra_env.push(("TACHYON_RUN".into(), cmd.to_string()));
     }
-    crate::log!("tab {id}: spawning `{program}` {args:?} at {cols}x{rows}, integration: {}", !extra_env.is_empty());
-    let pty = Arc::new(
-        Pty::spawn(cols as u16, rows as u16, &program, &args, login, &extra_env, cwd)
-            .map_err(|e| format!("could not start {program}: {e}"))?,
-    );
+    let at_host = HOST.with(|h| {
+        h.borrow()
+            .as_ref()
+            .map(|c| c.spawn(cols, rows, cfg.scrollback, &program, &args, login, &extra_env, cwd))
+    });
+    let (id, pty) = match at_host {
+        Some(Ok(r)) => (r.id, r.pty),
+        failed => {
+            if let Some(Err(e)) = failed {
+                crate::log::force(&format!("session host: {e}; starting the shell here"));
+            }
+            let pty = Pty::spawn(cols as u16, rows as u16, &program, &args, login, &extra_env, cwd)
+                .map_err(|e| format!("could not start {program}: {e}"))?;
+            (LOCAL_IDS.fetch_add(1, Ordering::Relaxed), pty)
+        }
+    };
+    crate::log!("tab {id}: spawned `{program}` {args:?} at {cols}x{rows}, integration: {}", !extra_env.is_empty());
     if let (Some(cmd), false) = (run, zsh_runs_it) {
         let _ = pty.write(format!("{cmd}\r").as_bytes());
     }
+    Ok((id, pty))
+}
+
+/// Feed a shell's output to a new terminal, on a reader thread of its own.
+/// A host's shell sends the screen to restore first, which is parsed as the
+/// past: no replies to old queries, no notifications.
+fn start_session(
+    id: u64,
+    pty: Pty,
+    cfg: &Config,
+    cols: usize,
+    rows: usize,
+    wake_pending: Arc<AtomicBool>,
+    // Keep-awake was on at the host: on again once the screen is restored.
+    awake_after_restore: bool,
+) -> Result<(Arc<Mutex<Term>>, Arc<Pty>, Arc<Mutex<RewindLog>>), String> {
+    let pty = Arc::new(pty);
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));
     let log = Arc::new(Mutex::new(RewindLog::new(
         term.lock().rewind_snapshot(),
@@ -3133,8 +3257,26 @@ fn start_session(
             // 128 KiB amortises the syscall over a burst without holding the
             // terminal lock for long.
             let mut buf = vec![0u8; 128 * 1024];
+            // A host's shell: how much of what follows is the restored screen.
+            let mut replay = 0usize;
+            let mut awake_here = false;
+            if reader_pty.is_remote() {
+                let mut header = [0u8; 8];
+                let mut got = 0;
+                while got < 8 {
+                    match reader_pty.read(&mut header[got..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                replay = u64::from_le_bytes(header) as usize;
+                if replay > 0 {
+                    reader_term.lock().restoring = true;
+                }
+            }
             loop {
-                let n = match reader_pty.read(&mut buf) {
+                let want = if replay > 0 { replay.min(buf.len()) } else { buf.len() };
+                let n = match reader_pty.read(&mut buf[..want]) {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
@@ -3146,9 +3288,23 @@ fn start_session(
                     use std::io::Write;
                     let _ = f.write_all(&buf[..n]);
                 }
+                let restoring = replay > 0;
                 let (replies, events, running, cmdline) = {
                     let mut t = reader_term.lock();
                     processor.advance(&mut t, &buf[..n]);
+                    if restoring {
+                        replay -= n.min(replay);
+                        t.restoring = replay > 0;
+                        if replay == 0 && awake_after_restore {
+                            t.set_keep_awake(true);
+                        }
+                    }
+                    // Shells run here hold the power assertion themselves;
+                    // the host holds it for its own.
+                    if !reader_pty.is_remote() && t.keeps_awake() != awake_here {
+                        awake_here = t.keeps_awake();
+                        power::set(id, awake_here.then(|| t.running_cmdline().unwrap_or("").to_string()).as_deref());
+                    }
                     {
                         // Rewind keeps the raw output, and every few MB a
                         // copy of the screen to replay it onto.
@@ -3159,7 +3315,13 @@ fn start_session(
                         }
                     }
                     let cmdline = t.running_cmdline().map(str::to_string);
-                    (t.take_replies(), t.take_command_events(), t.command_running(), cmdline)
+                    let (replies, events) = (t.take_replies(), t.take_command_events());
+                    if restoring {
+                        // The past: its queries were answered long ago.
+                        (Vec::new(), Vec::new(), false, None)
+                    } else {
+                        (replies, events, t.command_running(), cmdline)
+                    }
                 };
                 if running {
                     // A training run prints a few lines a second, and every
@@ -3261,6 +3423,176 @@ fn start_session(
     Ok((term, pty, log))
 }
 
+/// Queue a save of the windows' layout to the host, once per run of the
+/// main queue, outside any borrow of the app state.
+fn schedule_layout_save() {
+    if LAYOUT_PENDING.get() || HOST.with(|h| h.borrow().is_none()) {
+        return;
+    }
+    LAYOUT_PENDING.set(true);
+    DispatchQueue::main().exec_async(save_layout);
+}
+
+/// Tell the host where every shell is: each window's frame and tab in front,
+/// and each tab's split tree, focus and zoom. Lines of
+/// `window <active tab> <x> <y> <width> <height>`, each followed by its
+/// `tab <focus> <zoomed> <tree>` lines.
+fn save_layout() {
+    LAYOUT_PENDING.set(false);
+    let Some(text) = with_app(|app| {
+        let mut out = String::new();
+        for w in &app.windows {
+            let f = w.window.frame();
+            out.push_str(&format!(
+                "window {} {} {} {} {}\n",
+                w.active, f.origin.x, f.origin.y, f.size.width, f.size.height
+            ));
+            for t in &w.tabs {
+                out.push_str(&format!("tab {} {} {}\n", t.pane().id, t.zoomed as u8, t.layout.encode()));
+            }
+        }
+        out
+    }) else {
+        return;
+    };
+    HOST.with(|h| {
+        if let Some(c) = &*h.borrow() {
+            if let Err(e) = c.set_layout(&text) {
+                crate::log!("host: could not save the layout: {e}");
+            }
+        }
+    });
+}
+
+/// A window to restore: its frame, tab in front, and tabs.
+struct SavedWindow {
+    frame: Option<NSRect>,
+    active: usize,
+    tabs: Vec<(u64, bool, panes::Node)>,
+}
+
+fn parse_layout(text: &str) -> Vec<SavedWindow> {
+    let mut windows: Vec<SavedWindow> = Vec::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("window") => {
+                let n: Vec<f64> = words.filter_map(|w| w.parse().ok()).collect();
+                let frame = (n.len() == 5).then(|| NSRect::new(NSPoint::new(n[1], n[2]), NSSize::new(n[3], n[4])));
+                windows.push(SavedWindow { frame, active: n.first().copied().unwrap_or(0.0) as usize, tabs: Vec::new() });
+            }
+            Some("tab") => {
+                let (Some(focus), Some(zoomed)) = (words.next().and_then(|w| w.parse().ok()), words.next()) else {
+                    continue;
+                };
+                if let (Some(w), Some(tree)) = (windows.last_mut(), panes::Node::decode(&mut words)) {
+                    w.tabs.push((focus, zoomed == "1", tree));
+                }
+            }
+            _ => {}
+        }
+    }
+    windows
+}
+
+/// Reopen the windows the host's shells were in when Tachyon last closed.
+/// Shells it has that no saved window holds get tabs of their own. Returns
+/// whether any window opened.
+fn restore_sessions(mtm: MainThreadMarker) -> bool {
+    let found = HOST.with(|h| {
+        let h = h.borrow();
+        let c = h.as_ref()?;
+        let ids: Vec<u64> = c.list().ok()?.into_iter().filter(|l| !l.attached).map(|l| l.id).collect();
+        Some((ids, c.layout().unwrap_or_default()))
+    });
+    let Some((ids, layout)) = found.filter(|(ids, _)| !ids.is_empty()) else {
+        return false;
+    };
+    crate::log!("restoring {} shells from the session host", ids.len());
+    let mut saved = parse_layout(&layout);
+    let mut placed = std::collections::HashSet::new();
+    for w in &mut saved {
+        for (_, _, tree) in &mut w.tabs {
+            for id in tree.leaves() {
+                if !ids.contains(&id) || !placed.insert(id) {
+                    tree.remove(id);
+                }
+            }
+        }
+        // A tab whose last pane is gone (removing a lone pane can't).
+        w.tabs.retain(|(_, _, tree)| tree.leaves().iter().all(|id| ids.contains(id)));
+    }
+    let rest: Vec<u64> = ids.iter().copied().filter(|id| !placed.contains(id)).collect();
+    if !rest.is_empty() {
+        if saved.is_empty() {
+            saved.push(SavedWindow { frame: None, active: 0, tabs: Vec::new() });
+        }
+        saved[0].tabs.extend(rest.into_iter().map(|id| (id, false, panes::Node::Leaf(id))));
+    }
+
+    let mut opened = Vec::new();
+    for w in saved {
+        let tabs: Vec<Tab> = w
+            .tabs
+            .into_iter()
+            .filter_map(|(focus, zoomed, mut tree)| {
+                let mut panes_ = Vec::new();
+                for id in tree.leaves() {
+                    let attached = HOST.with(|h| h.borrow().as_ref().map(|c| c.attach(id)));
+                    let pane = match attached {
+                        Some(Ok(r)) => with_app(|app| Pane::attach(&app.cfg, r)).and_then(Result::ok),
+                        _ => None,
+                    };
+                    match pane {
+                        Some(p) => panes_.push(p),
+                        None => {
+                            tree.remove(id);
+                        }
+                    }
+                }
+                if panes_.is_empty() {
+                    return None;
+                }
+                let mut tab = Tab::new(panes_.remove(0));
+                tab.panes.extend(panes_);
+                tab.layout = tree;
+                tab.focus = tab.index_of(focus).unwrap_or(0);
+                tab.zoomed = zoomed && tab.panes.len() > 1;
+                Some(tab)
+            })
+            .collect();
+        if tabs.is_empty() {
+            continue;
+        }
+        let active = w.active.min(tabs.len() - 1);
+        match with_app(|app| app.create_window(mtm, Some((tabs, active)))) {
+            Some(Ok((window, view, id))) => {
+                if let Some(frame) = w.frame {
+                    window.setFrame_display(frame, false);
+                }
+                with_window(id, |w| {
+                    w.apply_appearance();
+                    w.layout();
+                    w.refresh_label(w.active);
+                });
+                opened.push((window, view));
+            }
+            Some(Err(e)) => crate::log::force(&format!("could not restore a window: {e}")),
+            None => {}
+        }
+    }
+    let Some((window, view)) = opened.last() else {
+        return false;
+    };
+    for (w, _) in &opened {
+        w.orderFront(None);
+    }
+    window.makeKeyAndOrderFront(None);
+    window.makeFirstResponder(Some(view));
+    NSApplication::sharedApplication(mtm).activate();
+    true
+}
+
 /// Where Rewind keeps older output, compressed: in the user's caches, one
 /// private folder per tab, removed when the tab closes.
 fn rewind_root() -> Option<std::path::PathBuf> {
@@ -3318,13 +3650,21 @@ pub fn run(cfg: Config) -> Result<(), String> {
             gpu,
             windows: Vec::new(),
             next_id: 1,
-            next_tab: 1,
             cascade: NSPoint::new(0.0, 0.0),
             _delegate: delegate,
         });
     });
 
-    open_window();
+    let persist = with_app(|a| a.cfg.shell.persist).unwrap_or(false);
+    if persist {
+        match host::Client::connect() {
+            Ok(c) => HOST.with(|h| *h.borrow_mut() = Some(c)),
+            Err(e) => crate::log::force(&format!("no session host ({e}); shells will end with the app")),
+        }
+    }
+    if !restore_sessions(mtm) {
+        open_window();
+    }
     if with_app(|a| a.windows.is_empty()).unwrap_or(true) {
         return Err("could not open the first window".into());
     }
