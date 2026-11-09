@@ -473,6 +473,11 @@ define_class!(
             with_window(self.id(), |w| w.move_focus(0, 1));
         }
 
+        #[unsafe(method(tachyonNotch:))]
+        fn toggle_notch(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_notch);
+        }
+
         #[unsafe(method(tachyonTitleBar:))]
         fn toggle_title_bar(&self, _sender: Option<&AnyObject>) {
             let on = with_app(|app| {
@@ -730,6 +735,17 @@ define_class!(
     struct TachyonWindow;
 
     impl TachyonWindow {
+        /// Borderless around the notch, it still takes keys.
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(canBecomeMainWindow))]
+        fn can_become_main(&self) -> bool {
+            true
+        }
+
         #[unsafe(method(sendEvent:))]
         fn send_event(&self, event: &NSEvent) {
             let t = event.r#type();
@@ -1263,6 +1279,12 @@ struct TermWindow {
     /// when the second tab opens.
     native_strip: bool,
     capsule: Option<strip::Capsule>,
+    /// Full screen around the notch: the frame and style to go back to.
+    notch: Option<(NSRect, NSWindowStyleMask)>,
+    /// The status right of the notch.
+    notch_status: Option<Retained<objc2_app_kit::NSTextField>>,
+    /// Keeps the status's clock current while nothing else redraws.
+    notch_timer: Option<Retained<objc2_foundation::NSTimer>>,
     /// The Liquid Glass behind the text, tinted with the theme's background.
     host_glass: Option<Retained<NSGlassEffectView>>,
     /// Jobs a tab was opened for, so their commands stop offering one.
@@ -1367,6 +1389,7 @@ impl TermWindow {
             }
             self.update_secure_input();
             self.draw();
+            self.update_notch_status();
         } else {
             // Nothing changed for a few refreshes: stop the display link. The
             // next byte from the shell or key press resumes it.
@@ -2001,14 +2024,15 @@ impl TermWindow {
         let (w, h) = ((bounds.size.width * scale) as f32, (bounds.size.height * scale) as f32);
         self.renderer.resize(w, h);
 
-        let strip = self.tabs.len() > 1;
+        // Around the notch the tabs always show, left of it.
+        let strip = self.tabs.len() > 1 || self.notch.is_some();
         self.renderer.set_strip(strip);
         self.apply_chrome();
         let inset = self.title_bar_height();
         self.renderer.set_top_inset((inset * scale).round() as f32);
         if self.native_strip {
             // In a title bar the capsule sits there, taking no rows.
-            let band = if self.title_bar { 0.0 } else { strip::BAND_HEIGHT };
+            let band = if self.title_bar || self.notch.is_some() { 0.0 } else { strip::BAND_HEIGHT };
             self.renderer.set_strip_band(Some((band * scale).round() as f32));
             self.place_capsule(strip);
         }
@@ -2039,7 +2063,12 @@ impl TermWindow {
             if show {
                 let size = self.view.bounds().size;
                 let bar = self.title_bar_height();
-                if self.title_bar && bar > 0.0 {
+                let left = self.window.screen().map(|s| s.auxiliaryTopLeftArea().size.width).unwrap_or(0.0);
+                if self.notch.is_some() && bar > 0.0 && left > 0.0 {
+                    // Left of the notch.
+                    let y = size.height - bar + (bar - strip::CAPSULE_HEIGHT) / 2.0;
+                    c.place_within(0.0, left, self.tabs.len(), y, 12.0);
+                } else if self.title_bar && bar > 0.0 {
                     // In the title bar, clear of the window buttons.
                     let y = size.height - bar + (bar - strip::CAPSULE_HEIGHT) / 2.0;
                     c.place_at(size.width, self.tabs.len(), y, BUTTON_ZONE.0 + 8.0);
@@ -2054,6 +2083,9 @@ impl TermWindow {
 
     /// How tall the title bar is, in points: zero edge-to-edge.
     fn title_bar_height(&self) -> f64 {
+        if self.notch.is_some() {
+            return self.window.screen().map_or(0.0, |s| s.safeAreaInsets().top);
+        }
         if !self.title_bar {
             return 0.0;
         }
@@ -2064,6 +2096,9 @@ impl TermWindow {
     /// title unless the tabs are there instead; or hide them, edge-to-edge,
     /// until the pointer reaches the corner.
     fn apply_chrome(&mut self) {
+        if self.notch.is_some() {
+            return;
+        }
         if self.title_bar {
             set_titlebar_hidden(&self.window, false);
             self.buttons_visible = true;
@@ -2076,6 +2111,94 @@ impl TermWindow {
                 set_titlebar_hidden(&self.window, true);
             }
         }
+    }
+
+    /// View > Full Screen Around the Notch: the window covers the whole
+    /// screen, the menu bar and Dock hidden while Tachyon is in front; the
+    /// tabs go left of the notch, a status line right of it, and every row
+    /// below is the terminal. On a screen without a notch, the band is just
+    /// the space the menu bar had. Again to go back.
+    fn toggle_notch(&mut self) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let app = NSApplication::sharedApplication(mtm);
+        match self.notch.take() {
+            None => {
+                let Some(screen) = self.window.screen().or_else(|| NSScreen::mainScreen(mtm)) else { return };
+                self.notch = Some((self.window.frame(), self.window.styleMask()));
+                self.window.setStyleMask(NSWindowStyleMask::Borderless);
+                self.window.setFrame_display(screen.frame(), true);
+                app.setPresentationOptions(
+                    objc2_app_kit::NSApplicationPresentationOptions::HideDock
+                        | objc2_app_kit::NSApplicationPresentationOptions::HideMenuBar,
+                );
+                self.window.makeKeyAndOrderFront(None);
+                self.window.makeFirstResponder(Some(&self.view));
+                let id = self.id;
+                let tick = block2::RcBlock::new(move |_t: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+                    with_window(id, |w| {
+                        w.update_notch_status();
+                    });
+                });
+                self.notch_timer = Some(unsafe { objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(15.0, true, &tick) });
+            }
+            Some((frame, style)) => {
+                app.setPresentationOptions(objc2_app_kit::NSApplicationPresentationOptions::Default);
+                self.window.setStyleMask(style);
+                self.window.setFrame_display(frame, true);
+                set_titlebar_hidden(&self.window, true);
+                self.buttons_visible = false;
+                if let Some(label) = &self.notch_status {
+                    label.setHidden(true);
+                }
+                if let Some(t) = self.notch_timer.take() {
+                    t.invalidate();
+                }
+            }
+        }
+        self.layout();
+    }
+
+    /// Right of the notch: what the pane in front is doing (its command and
+    /// for how long, or its folder) and the time, since the menu bar's clock
+    /// is hidden.
+    fn update_notch_status(&mut self) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        if self.notch.is_none() {
+            return;
+        }
+        let Some(screen) = self.window.screen() else { return };
+        let right = screen.auxiliaryTopRightArea();
+        let bar = self.title_bar_height();
+        if right.size.width <= 0.0 || bar <= 0.0 {
+            return;
+        }
+        let label = self.notch_status.get_or_insert_with(|| {
+            let l = objc2_app_kit::NSTextField::labelWithString(&NSString::from_str(""), mtm);
+            l.setFont(Some(&objc2_app_kit::NSFont::monospacedSystemFontOfSize_weight(12.0, unsafe { objc2_app_kit::NSFontWeightMedium })));
+            l.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            l.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+            l.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingHead);
+            self.view.addSubview(&l);
+            l
+        });
+        let text = {
+            let term = self.term.lock();
+            let doing = match term.running_cmdline().zip(term.running_elapsed()) {
+                Some((cmd, t)) => format!("▶ {cmd} · {}", receipts::duration(t)),
+                None => term.cwd.as_deref().map(short_path).unwrap_or_default(),
+            };
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            let now = unsafe { libc::time(std::ptr::null_mut()) };
+            unsafe { libc::localtime_r(&now, &mut tm) };
+            format!("{doing}   {:02}:{:02}", tm.tm_hour, tm.tm_min)
+        };
+        label.setStringValue(&NSString::from_str(&text));
+        let size = self.view.bounds().size;
+        // Room at the right edge for macOS's camera and microphone dots.
+        let x = right.origin.x - screen.frame().origin.x + 12.0;
+        let w = (right.size.width - 12.0 - 40.0).max(0.0);
+        label.setFrame(NSRect::new(NSPoint::new(x, size.height - bar + (bar - 16.0) / 2.0), NSSize::new(w, 16.0)));
+        label.setHidden(false);
     }
 
     /// View > Show Title Bar: switch layouts.
@@ -2342,7 +2465,7 @@ impl TermWindow {
     /// Edge-to-edge: the traffic lights stay hidden until the pointer reaches
     /// the top-left corner.
     fn hover(&mut self, location: Option<NSPoint>) {
-        if self.title_bar {
+        if self.title_bar || self.notch.is_some() {
             return;
         }
         let height = self.view.bounds().size.height;
@@ -3152,6 +3275,9 @@ impl App {
             glass,
             native_strip: glass && objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some(),
             capsule: None,
+            notch: None,
+            notch_status: None,
+            notch_timer: None,
             host_glass,
             glass_tint: cfg.window.glass_tint,
             followed: Vec::new(),
@@ -3423,6 +3549,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Next Command", sel!(tachyonNextCommand:), "\u{F701}");
     view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Show Title Bar", sel!(tachyonTitleBar:), "");
+    item(&view, "Full Screen Around the Notch", sel!(tachyonNotch:), "f")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&view, "Latency Ledger", sel!(tachyonLedger:), "l")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view.addItem(&NSMenuItem::separatorItem(mtm));

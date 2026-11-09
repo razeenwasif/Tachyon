@@ -224,10 +224,15 @@ impl Capsule {
     /// its bottom, keeping `margin` points from both sides (clear of the
     /// window buttons, in a title bar).
     pub fn place_at(&self, width: f64, tabs: usize, y: f64, margin: f64) {
+        self.place_within(0.0, width, tabs, y, margin);
+    }
+
+    /// Like `place_at`, centred in the span from `x0`, `width` points wide.
+    pub fn place_within(&self, x0: f64, width: f64, tabs: usize, y: f64, margin: f64) {
         let room = (width - 2.0 * margin).max(0.0);
         let tab_w = (room / tabs.max(1) as f64).min(MAX_TAB_WIDTH);
         let w = (tab_w * tabs as f64).min(room);
-        let frame = NSRect::new(NSPoint::new(((width - w) / 2.0).round(), y.round()), NSSize::new(w, CAPSULE_HEIGHT));
+        let frame = NSRect::new(NSPoint::new((x0 + (width - w) / 2.0).round(), y.round()), NSSize::new(w, CAPSULE_HEIGHT));
         self.glass.setFrame(frame);
         self.view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
     }

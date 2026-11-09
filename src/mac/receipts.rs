@@ -270,7 +270,7 @@ pub fn describe(elapsed: Duration, exit: Option<i32>, running: bool, r: Option<&
     Some(parts.join(" · "))
 }
 
-fn duration(d: Duration) -> String {
+pub fn duration(d: Duration) -> String {
     let s = d.as_secs_f64();
     if s < 10.0 {
         format!("{s:.1}s")
