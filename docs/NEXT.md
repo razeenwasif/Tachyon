@@ -360,7 +360,15 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    keeps up to 8 named series per command, and the prompt line shows the latest
    values with a sparkline of the loss; a tqdm percentage drives a Dock progress
    bar. Lines are all read below 256 KB per 100 ms and sampled above, which
-   measured the same as no lens on a 160 MB `cat`. Job tabs still to do.
+   measured the same as no lens on a 160 MB `cat`.
+   *Job tabs done (9 November 2026):* `src/term/jobs.rs` spots a Nexus id in
+   the output of a `nexus cpu/gpu` submission (any part of a chained line) and
+   Slurm's `Submitted batch job N`, remembering the ssh it came through. The
+   prompt line offers ⌘J; the tab runs `shell/tachyon-job`, which streams the
+   log (`nexus logs`, or `tail -f` of the StdOut from `scontrol`), names the tab
+   from `nexus jobs` or `squeue` through OSC 2, and exits with the job's code
+   (from `sacct` for Slurm). zsh runs the command at its first prompt through a
+   line-init hook added from precmd; other shells get it typed ahead.
 8. **Session host**: `tachyon-host` as a login agent with keep-awake
    assertions. After Rewind, because it owns the logs.
 9. **Split panes** on cell boundaries. Shaping already arrived with Core Text

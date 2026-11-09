@@ -1,5 +1,6 @@
 //! Terminal state: grid, cursor, modes, and the VT dispatch implementation.
 
+pub mod jobs;
 pub mod lens;
 pub mod cell;
 pub mod color;
@@ -148,6 +149,8 @@ pub struct CommandInfo {
     pub cmdline: Option<String>,
     /// Metrics seen in its output while it ran.
     pub lens: lens::Lens,
+    /// The first job it submitted to a cluster, if it did.
+    pub job: Option<jobs::JobRef>,
 }
 
 impl CommandInfo {
@@ -202,6 +205,14 @@ pub struct Term {
     pub title_cmd: Option<u32>,
     /// The working directory the shell last reported with OSC 7.
     pub cwd: Option<String>,
+    /// The host in that report.
+    cwd_host: Option<String>,
+    /// An ssh command running in this terminal, and the host the shell
+    /// reported before it, so jobs submitted on the far side can be followed
+    /// through the same ssh. Over when OSC 7 reports that host again.
+    ssh_session: Option<(String, Option<String>)>,
+    /// Jobs submitted here, newest last.
+    pub jobs: Vec<jobs::JobRef>,
     /// Incremented whenever anything a tab's name is made from changes (the
     /// title, the working directory, a command starting or ending), so the
     /// app can cheaply notice.
@@ -245,6 +256,9 @@ impl Term {
             title: None,
             title_cmd: None,
             cwd: None,
+            cwd_host: None,
+            ssh_session: None,
+            jobs: Vec::new(),
             title_revision: 0,
             bell_revision: 0,
             ground_signal: false,
@@ -271,6 +285,43 @@ impl Term {
 
     pub fn take_command_events(&mut self) -> Vec<CommandEvent> {
         core::mem::take(&mut self.command_events)
+    }
+
+    /// A job id seen in the running command's output: remember it, and tie
+    /// it to the command if it's the first.
+    pub fn record_job(&mut self, kind: jobs::JobKind, id: String) {
+        let via = self.ssh_session.as_ref().map(|(cmd, _)| cmd.clone());
+        let job = jobs::JobRef { kind, id, via };
+        if self.jobs.iter().any(|j| j.kind == job.kind && j.id == job.id) {
+            return;
+        }
+        if let Some(c) = self.current_cmd.and_then(|id| self.commands.get_mut(&id)) {
+            if c.job.is_none() {
+                c.job = Some(job.clone());
+            }
+        }
+        if self.jobs.len() == 16 {
+            self.jobs.remove(0);
+        }
+        self.jobs.push(job);
+        self.dirty = true;
+    }
+
+    /// The running command's line, for telling a submission from other output.
+    pub fn running_cmdline(&self) -> Option<&str> {
+        self.current_cmd
+            .and_then(|id| self.commands.get(&id))
+            .filter(|c| c.state == CommandState::Running)
+            .and_then(|c| c.cmdline.as_deref())
+    }
+
+    /// The most recent command that has finished.
+    pub fn last_finished(&self) -> Option<&CommandInfo> {
+        self.commands
+            .iter()
+            .filter(|(_, c)| c.state == CommandState::Done)
+            .max_by_key(|(id, _)| self.next_cmd.wrapping_sub(**id).wrapping_neg())
+            .map(|(_, c)| c)
     }
 
     /// Whether a command is running, so its output is worth reading for
@@ -332,6 +383,7 @@ impl Term {
                         receipt: None,
                         cmdline: None,
                         lens: lens::Lens::default(),
+                        job: None,
                     },
                 );
                 self.mark_row(id, RowMark::PROMPT);
@@ -366,6 +418,10 @@ impl Term {
                     }
                     c.state = CommandState::Running;
                     c.started = Some(Instant::now());
+                    if cmdline.as_deref().is_some_and(is_ssh) && self.ssh_session.is_none() {
+                        self.ssh_session = cmdline.clone().map(|c| (c, self.cwd_host.clone()));
+                    }
+                    let c = self.commands.get_mut(&id).expect("looked up above");
                     c.cmdline = cmdline;
                     self.title_revision = self.title_revision.wrapping_add(1);
                     self.mark_row(id, RowMark::OUTPUT);
@@ -1622,6 +1678,12 @@ impl Perform for Term {
             }
             // OSC 7: the working directory, as file://host/path.
             b"7" => {
+                let host = params.get(1).and_then(|p| file_url_host(p));
+                // Back on the machine the ssh started from: the session ended.
+                if self.ssh_session.as_ref().is_some_and(|(_, from)| from.is_some() && *from == host) {
+                    self.ssh_session = None;
+                }
+                self.cwd_host = host;
                 if let Some(path) = params.get(1).and_then(|p| parse_file_url(p)) {
                     if self.cwd.as_deref() != Some(path.as_str()) {
                         self.cwd = Some(path);
@@ -1646,6 +1708,22 @@ impl Perform for Term {
         // it in Ground without a signal, which only means the next bytes take
         // the slow path until something does signal.)
     }
+}
+
+/// Whether a command line starts an ssh session.
+fn is_ssh(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .find(|w| !w.contains('='))
+        .is_some_and(|w| w.rsplit('/').next() == Some("ssh"))
+}
+
+/// The host of an OSC 7 `file://host/path` URL.
+fn file_url_host(url: &[u8]) -> Option<String> {
+    let rest = url.strip_prefix(b"file://")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let host = std::str::from_utf8(&rest[..slash]).ok()?;
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// The path of an OSC 7 `file://host/path` URL, percent-decoded.
@@ -1734,6 +1812,30 @@ mod tests {
         // And BEL-ended ones still go straight back to the fast path.
         feed(&mut t, &mut p, "\x1b]2;x\x07def");
         assert_eq!(row0(&t), "abcdef");
+    }
+
+    /// A job submitted over ssh is followed through the same ssh, until the
+    /// shell back home reports its folder again.
+    #[test]
+    fn jobs_remember_the_ssh_they_came_through() {
+        let mut t = Term::new(60, 10, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "\x1b]133;A\x07\x1b]7;file://mac.local/Users/me\x07$ \x1b]133;B\x07");
+        feed(&mut t, &mut p, "\x1b]133;C;cmdline=ssh -J bastion hpc\x07");
+        // The remote shell, with its own integration.
+        feed(&mut t, &mut p, "\x1b]133;A\x07\x1b]7;file://login1/home/me\x07$ \x1b]133;B\x07\x1b]133;C;cmdline=sbatch run.sh\x07");
+        t.record_job(jobs::JobKind::Slurm, "4821337".into());
+        let job = t.jobs.last().unwrap().clone();
+        assert_eq!(job.via.as_deref(), Some("ssh -J bastion hpc"));
+        assert_eq!(t.command(t.current_command().unwrap()).unwrap().job.as_ref(), Some(&job));
+        // Recorded once.
+        t.record_job(jobs::JobKind::Slurm, "4821337".into());
+        assert_eq!(t.jobs.len(), 1);
+        // Home again: later jobs are local.
+        feed(&mut t, &mut p, "\x1b]133;D;0\x07\x1b]133;A\x07\x1b]7;file://mac.local/Users/me\x07$ \x1b]133;B\x07\x1b]133;C;cmdline=nexus cpu --detach make\x07");
+        t.record_job(jobs::JobKind::Nexus, "j-1a2b3c4d".into());
+        assert_eq!(t.jobs.last().unwrap().via, None);
+        assert_eq!(t.running_cmdline(), Some("nexus cpu --detach make"));
     }
 
     #[test]

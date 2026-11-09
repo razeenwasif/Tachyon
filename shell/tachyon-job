@@ -1,0 +1,74 @@
+#!/bin/sh
+# tachyon-job nexus|slurm ID
+#
+# Follows a cluster job in a Tachyon tab: streams its log, keeps the tab named
+# after its state (queued, running on forge, ...), and exits with the job's own
+# exit code, so the tab's receipt and notification say how it ended.
+#
+# POSIX sh, so it can also be piped to a login node over ssh:
+#   ssh cluster sh -s slurm 4821337 < tachyon-job
+
+kind=$1
+id=$2
+nexus=${TACHYON_NEXUS:-nexus}
+
+title() {
+  printf '\033]2;%s\007' "$*"
+}
+
+case $kind in
+nexus)
+  title "nexus $id · following"
+  # The state, from `nexus jobs`: "j-1a2b3c4d  running  forge  name ...".
+  (
+    while :; do
+      state=$($nexus jobs 2>/dev/null | awk -v id="$id" '$1 == id { s = $2; if ($3 != "-") s = s " on " $3; print s; exit }')
+      [ -n "$state" ] && title "nexus $id · $state"
+      sleep 5
+    done
+  ) &
+  poller=$!
+  trap 'kill $poller 2>/dev/null' EXIT INT TERM
+  $nexus logs "$id"
+  exit $?
+  ;;
+
+slurm)
+  title "slurm $id · following"
+  state() { squeue -h -j "$id" -o '%T' 2>/dev/null | tr 'A-Z' 'a-z'; }
+  # Where the job writes, from scontrol; sbatch's default otherwise.
+  out=$(scontrol show job "$id" 2>/dev/null | sed -n 's/.*StdOut=\([^ ]*\).*/\1/p')
+  [ -n "$out" ] || out="slurm-$id.out"
+  # Wait for the output file while the job is queued.
+  s=$(state)
+  while [ -n "$s" ] && [ ! -e "$out" ]; do
+    title "slurm $id · $s"
+    sleep 3
+    s=$(state)
+  done
+  tail -n +1 -f "$out" 2>/dev/null &
+  tailer=$!
+  trap 'kill $tailer 2>/dev/null' EXIT INT TERM
+  while [ -n "$s" ]; do
+    title "slurm $id · $s"
+    sleep 5
+    s=$(state)
+  done
+  sleep 1
+  kill $tailer 2>/dev/null
+  # How it ended: State|ExitCode|NodeList|Elapsed, e.g. COMPLETED|0:0|gpu-07|02:41:12.
+  result=$(sacct -n -P -X -j "$id" -o State,ExitCode,NodeList,Elapsed 2>/dev/null | head -n 1)
+  if [ -n "$result" ]; then
+    echo "$result" | awk -F'|' -v id="$id" '{ printf "slurm %s %s on %s in %s, exit %s\n", id, tolower($1), $3, $4, $2 }'
+    case $result in
+      COMPLETED*) exit 0 ;;
+      *) code=$(echo "$result" | cut -d'|' -f2 | cut -d: -f1); [ "${code:-0}" -gt 0 ] 2>/dev/null && exit "$code"; exit 1 ;;
+    esac
+  fi
+  ;;
+
+*)
+  echo "usage: tachyon-job nexus|slurm ID" >&2
+  exit 2
+  ;;
+esac

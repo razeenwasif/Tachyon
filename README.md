@@ -136,6 +136,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘↑ / ⌘↓ | Jump to the previous / next command |
 | Shift-drag in vim, tmux, htop | Select even while the app has the mouse |
 | ⌘-click a path / a URL | Show the file in Quick Look / open the link |
+| ⌘J, or ⌘-click a job id | Follow the job this tab submitted last, or that one, in its own tab |
 
 **⌘-click** a file path to see it in Quick Look (an image, a CSV, a PDF) or a
 URL to open it. Paths are taken from the tab's folder, and `file:line:col`
@@ -180,6 +181,13 @@ with OSC 133, which gives:
   `loss 0.398 ▇▆▅▄▃▂ · 48.2 it/s · 45%`. A tqdm bar's percentage also shows as
   a progress bar on the Dock icon. Every line of a training log is read; a flood
   like `cat` of a big file is only sampled, so it costs no throughput;
+- **job tabs**: when a command submits a cluster job (`nexus cpu/gpu ...
+  --detach` prints its `j-1a2b3c4d`; `sbatch` prints `Submitted batch job N`),
+  its prompt line offers `⌘J follows j-1a2b3c4d`. ⌘J (or ⌘-click on the id)
+  opens a tab that follows the job's log with `shell/tachyon-job`, named after
+  its state (`nexus j-1a2b3c4d · running on forge`, then `· finished` or
+  `· failed`), with a receipt and a notification when it ends. A Slurm job
+  submitted over ssh is followed through the same ssh;
 - ⌘↑ / ⌘↓ to jump between commands;
 - a **notification** with the receipt when a command of 10 seconds or more
   finishes while you're in another app or window (`notify.after` sets the time,

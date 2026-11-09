@@ -38,3 +38,25 @@ _tachyon_preexec() {
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _tachyon_precmd
 add-zsh-hook preexec _tachyon_preexec
+
+# A tab Tachyon opened to run something (following a cluster job): run it as
+# if typed at the first prompt, so it's in history and gets a receipt. The
+# line editor isn't set up yet while this file loads, so the hook that types
+# it is added at the first prompt.
+if [[ -n $TACHYON_RUN ]]; then
+  typeset -g _tachyon_run=$TACHYON_RUN
+  unset TACHYON_RUN
+  _tachyon_run_once() {
+    [[ -n $_tachyon_run ]] || return
+    BUFFER=$_tachyon_run
+    _tachyon_run=
+    add-zle-hook-widget -d line-init _tachyon_run_once
+    zle .accept-line
+  }
+  _tachyon_run_setup() {
+    add-zsh-hook -d precmd _tachyon_run_setup
+    autoload -Uz add-zle-hook-widget
+    add-zle-hook-widget line-init _tachyon_run_once
+  }
+  add-zsh-hook precmd _tachyon_run_setup
+fi

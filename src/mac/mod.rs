@@ -63,7 +63,8 @@ use objc2_quartz_core::{
 use parking_lot::Mutex;
 
 use crate::config::{Appearance, Backdrop, Config, OptionAsMeta, ThemeConfig};
-use crate::term::{lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
+use crate::term::jobs::JobRef;
+use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
 use rustc_hash::FxHashMap;
 use pty::Pty;
 use input::{MouseButton, MouseEventKind};
@@ -360,6 +361,11 @@ define_class!(
         #[unsafe(method(newTab:))]
         fn new_tab(&self, _sender: Option<&AnyObject>) {
             open_tab(self.id());
+        }
+
+        #[unsafe(method(tachyonFollowJob:))]
+        fn follow_job(&self, _sender: Option<&AnyObject>) {
+            follow_job(self.id(), None);
         }
 
         #[unsafe(method(tachyonCloseTab:))]
@@ -766,6 +772,8 @@ struct Tab {
     unseen: Option<Outcome>,
     /// The window's per-tab state, kept here while another tab is in front.
     saved: TabState,
+    /// The cluster job this tab follows, if Tachyon opened it for one.
+    job: Option<JobRef>,
 }
 
 /// Per-tab state the window works on directly while the tab is in front.
@@ -792,9 +800,10 @@ impl Default for TabState {
 }
 
 impl Tab {
-    fn start(id: u64, cfg: &Config, cols: usize, rows: usize) -> Result<Tab, String> {
+    fn start(id: u64, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>) -> Result<Tab, String> {
         let wake_pending = Arc::new(AtomicBool::new(false));
-        let (term, pty) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending))?;
+        let run = job.as_ref().and_then(follow_command);
+        let (term, pty) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending), run.as_deref())?;
         Ok(Tab {
             id,
             term,
@@ -804,6 +813,7 @@ impl Tab {
             title_rev: u64::MAX,
             unseen: None,
             saved: TabState::default(),
+            job,
         })
     }
 }
@@ -869,6 +879,8 @@ struct TermWindow {
     capsule: Option<strip::Capsule>,
     /// The Liquid Glass behind the text, tinted with the theme's background.
     host_glass: Option<Retained<NSGlassEffectView>>,
+    /// Jobs a tab was opened for, so their commands stop offering one.
+    followed: Vec<String>,
     glass_tint: f32,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
@@ -932,7 +944,7 @@ impl TermWindow {
             let term = self.term.lock();
             let blink = self.focused && term.cursor_state().blinking;
             let selection = self.selection.and_then(|s| s.range(&term));
-            let mut decor = command_decor(&term);
+            let mut decor = command_decor(&term, &self.followed);
             decor.preedit = self.preedit.clone();
             if self.secure {
                 decor.notes.push((term.cursor_state().y, "Secure Keyboard Entry".into()));
@@ -976,9 +988,12 @@ impl TermWindow {
                 (elapsed, failed, title, folder, receipt)
             })
         };
-        let Some((elapsed, failed, title, folder, receipt)) = finished else {
+        let Some((elapsed, failed, mut title, folder, receipt)) = finished else {
             return;
         };
+        if let Some(job) = &self.tabs[i].job {
+            title = format!("{} {}", job.title(), if failed { "failed" } else { "finished" });
+        }
         if i != self.active {
             self.tabs[i].unseen = Some(if failed { Outcome::Failed } else { Outcome::Succeeded });
         }
@@ -1059,6 +1074,14 @@ impl TermWindow {
             let term = self.term.lock();
             (selection::word_at(&term, pos.line, pos.cell), term.cwd.clone())
         };
+        // A job id this tab submitted: follow it.
+        let id = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+        let job = self.term.lock().jobs.iter().rev().find(|j| j.id == id).cloned();
+        if let Some(job) = job {
+            let window = self.id;
+            DispatchQueue::main().exec_async(move || follow_job(window, Some(job)));
+            return true;
+        }
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let target = links::resolve(&word, cwd.as_deref().map(std::path::Path::new), home.as_deref(), |p| p.exists());
         match target {
@@ -1131,7 +1154,11 @@ impl TermWindow {
     fn refresh_label(&mut self, i: usize) {
         let (label, rev) = {
             let term = self.tabs[i].term.lock();
-            (tab_label(&term), term.title_revision)
+            let label = match &self.tabs[i].job {
+                Some(job) => job_label(&term, job),
+                None => tab_label(&term),
+            };
+            (label, term.title_revision)
         };
         let tab = &mut self.tabs[i];
         tab.title_rev = rev;
@@ -1722,6 +1749,21 @@ fn tab_label(term: &Term) -> String {
     title.unwrap_or("Tachyon").to_string()
 }
 
+/// A job tab's name: what the follow script reports while it runs
+/// (`nexus j-1a2b3c4d · running on forge`), then how the job ended.
+fn job_label(term: &Term, job: &JobRef) -> String {
+    let base = job.title();
+    if term.command_running() {
+        let label = tab_label(term);
+        return if label.starts_with(&base) { label } else { format!("{base} · following") };
+    }
+    match term.last_finished() {
+        Some(c) if c.exit == Some(0) => format!("{base} · finished"),
+        Some(c) => format!("{base} · failed ({})", c.exit.unwrap_or(1)),
+        None => format!("{base} · starting"),
+    }
+}
+
 /// A folder as a tab shows it: `~` for home, otherwise its own name.
 fn short_path(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -1737,7 +1779,7 @@ fn short_path(path: &str) -> String {
 
 /// Gutter bars and receipts for the rows on screen. Each row belongs to the
 /// command whose prompt is the nearest one at or above it.
-fn command_decor(term: &Term) -> Decor {
+fn command_decor(term: &Term, followed: &[String]) -> Decor {
     let g = term.grid();
     let first = g.history_len() - g.display_offset();
     let mut decor = Decor::default();
@@ -1777,6 +1819,14 @@ fn command_decor(term: &Term) -> Decor {
                 candidates.push(format!("{l}  ·  {r}"));
             }
             let compact = info.lens.compact();
+            // A job it submitted that no tab follows yet: offer one.
+            if let Some(job) = info.job.as_ref().filter(|j| !followed.contains(&j.id)) {
+                let hint = format!("⌘J follows {}", job.id);
+                candidates.insert(0, hint.clone());
+                if let Some(r) = &receipt {
+                    candidates.insert(0, format!("{hint}  ·  {r}"));
+                }
+            }
             if running {
                 // While it runs, the metrics matter more than the time.
                 candidates.extend(lens);
@@ -1988,7 +2038,7 @@ impl App {
 
         let tab_id = self.next_tab;
         self.next_tab += 1;
-        let tab = Tab::start(tab_id, cfg, cfg.window.cols, cfg.window.rows)?;
+        let tab = Tab::start(tab_id, cfg, cfg.window.cols, cfg.window.rows, None)?;
         let (term, pty) = (Arc::clone(&tab.term), Arc::clone(&tab.pty));
 
         let link = unsafe { view.displayLinkWithTarget_selector(&view, sel!(tick:)) };
@@ -2029,6 +2079,7 @@ impl App {
             capsule: None,
             host_glass,
             glass_tint: cfg.window.glass_tint,
+            followed: Vec::new(),
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -2038,16 +2089,54 @@ impl App {
 
     /// Start a shell in a new tab of window `window`.
     fn new_tab(&mut self, window: u64) -> Result<(), String> {
+        self.open_tab_for(window, None)
+    }
+
+    /// A new tab in window `window`, following `job` if given. A job that
+    /// already has a tab there is brought forward instead.
+    fn open_tab_for(&mut self, window: u64, job: Option<JobRef>) -> Result<(), String> {
         let tab_id = self.next_tab;
-        self.next_tab += 1;
         let Some(w) = self.windows.iter_mut().find(|w| w.id == window) else {
             return Ok(());
         };
+        if let Some(j) = &job {
+            if let Some(i) = w.tabs.iter().position(|t| t.job.as_ref().is_some_and(|tj| tj.kind == j.kind && tj.id == j.id)) {
+                w.switch_to(i);
+                return Ok(());
+            }
+            if !w.followed.contains(&j.id) {
+                w.followed.push(j.id.clone());
+            }
+        }
+        self.next_tab += 1;
         let (cols, rows) = w.grid;
-        let tab = Tab::start(tab_id, &self.cfg, cols.max(1), rows.max(1))?;
+        let tab = Tab::start(tab_id, &self.cfg, cols.max(1), rows.max(1), job)?;
         w.add_tab(tab);
         Ok(())
     }
+}
+
+/// ⌘J, or ⌘-click on a job id: follow a job in a tab of its own.
+fn follow_job(window: u64, job: Option<JobRef>) {
+    let job = job.or_else(|| query_window(window, |w| w.term.lock().jobs.last().cloned()).flatten());
+    let Some(job) = job else {
+        objc2_app_kit::NSBeep();
+        return;
+    };
+    if let Some(Err(e)) = with_app(|app| app.open_tab_for(window, Some(job))) {
+        crate::log::force(&format!("could not open a job tab: {e}"));
+    }
+}
+
+/// The command a job tab runs: Tachyon's follow script, through the same ssh
+/// the job was submitted over.
+fn follow_command(job: &JobRef) -> Option<String> {
+    let script = integration_dir()?.join("tachyon-job");
+    let script = script.to_string_lossy().replace('\'', "'\\''");
+    Some(match &job.via {
+        Some(ssh) => format!("{ssh} sh -s {} {} < '{script}'", job.kind.name(), job.id),
+        None => format!("'{script}' {} {}", job.kind.name(), job.id),
+    })
 }
 
 /// ⌘T: a new tab in this window.
@@ -2178,6 +2267,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let file = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Shell"));
     item(&file, "New Tab", sel!(newTab:), "t");
     item(&file, "New Window", sel!(newWindow:), "n");
+    item(&file, "Follow Job", sel!(tachyonFollowJob:), "j");
     file.addItem(&NSMenuItem::separatorItem(mtm));
     item(&file, "Close Tab", sel!(tachyonCloseTab:), "w");
     // A capital letter means Shift as well: ⌘⇧W.
@@ -2221,6 +2311,7 @@ fn start_session(
     cols: usize,
     rows: usize,
     wake_pending: Arc<AtomicBool>,
+    run: Option<&str>,
 ) -> Result<(Arc<Mutex<Term>>, Arc<Pty>), String> {
     let (program, login) = if cfg.shell.program.is_empty() {
         (pty::default_shell(), true)
@@ -2230,15 +2321,24 @@ fn start_session(
     let integration = integration_dir()
         .filter(|_| cfg.shell.integration)
         .and_then(|dir| pty::integration(&program, &dir, login));
-    let (extra_env, args, login) = match integration {
+    let (mut extra_env, args, login) = match integration {
         Some(i) => (i.env, i.args.into_iter().chain(cfg.shell.args.iter().cloned()).collect(), i.login),
         None => (Vec::new(), cfg.shell.args.clone(), login),
     };
+    // A command for the new shell to run: zsh's integration runs it at the
+    // first prompt as if typed; other shells get it typed ahead.
+    let zsh_runs_it = run.is_some() && extra_env.iter().any(|(k, _)| k == "ZDOTDIR");
+    if let (Some(cmd), true) = (run, zsh_runs_it) {
+        extra_env.push(("TACHYON_RUN".into(), cmd.to_string()));
+    }
     crate::log!("tab {id}: spawning `{program}` {args:?} at {cols}x{rows}, integration: {}", !extra_env.is_empty());
     let pty = Arc::new(
         Pty::spawn(cols as u16, rows as u16, &program, &args, login, &extra_env)
             .map_err(|e| format!("could not start {program}: {e}"))?,
     );
+    if let (Some(cmd), false) = (run, zsh_runs_it) {
+        let _ = pty.write(format!("{cmd}\r").as_bytes());
+    }
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));
 
     let reader_term = Arc::clone(&term);
@@ -2284,10 +2384,11 @@ fn start_session(
                     use std::io::Write;
                     let _ = f.write_all(&buf[..n]);
                 }
-                let (replies, events, running) = {
+                let (replies, events, running, cmdline) = {
                     let mut t = reader_term.lock();
                     processor.advance(&mut t, &buf[..n]);
-                    (t.take_replies(), t.take_command_events(), t.command_running())
+                    let cmdline = t.running_cmdline().map(str::to_string);
+                    (t.take_replies(), t.take_command_events(), t.command_running(), cmdline)
                 };
                 if running {
                     // A training run prints a few lines a second, and every
@@ -2313,12 +2414,22 @@ fn start_session(
                         &[]
                     };
                     let mut readings = Vec::new();
+                    let mut found = Vec::new();
                     lines.feed(chunk, |line| {
                         let r = lens::read_line(line);
                         if !r.is_empty() {
                             readings.push(r);
                         }
+                        if let Some(job) = jobs::detect(line, cmdline.as_deref()) {
+                            found.push(job);
+                        }
                     });
+                    if !found.is_empty() {
+                        let mut t = reader_term.lock();
+                        for (kind, job_id) in found {
+                            t.record_job(kind, job_id);
+                        }
+                    }
                     // A progress bar is redrawn after a \r rather than ended
                     // with one, so the line being written is its latest state.
                     if let Some(bar) = lines.pending().filter(|l| l.contains("%|")) {
