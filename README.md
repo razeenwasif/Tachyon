@@ -100,7 +100,13 @@ View > Show Title Bar switches to the **standard layout** (`window.layout =
 standard` makes it the default): a title bar on the glass with the window
 buttons and the tab's name, and with two or more tabs, the glass tab capsule in
 the title bar instead of along the bottom. It costs about three rows, and
-double-clicking the title bar does what System Settings says. **Liquid Glass** sits behind the text
+double-clicking the title bar does what System Settings says. **Full screen
+around the notch** (View menu, ⌥⌘F) covers the whole screen with the menu bar
+and Dock hidden while Tachyon is in front. The tabs sit left of the notch, and
+right of it is a status line: the command running in front and for how long,
+or its folder, and the time, since the menu bar's clock is hidden. Every row
+below the notch is terminal. ⌥⌘F again goes back. ⌃⌘F is still macOS's own
+full screen, which keeps the window below the notch. **Liquid Glass** sits behind the text
 (NSGlassEffectView on macOS 26 and later): only the default background lets it
 through; text, the cursor, the selection and colours a program sets stay solid.
 The glass is tinted with the theme's background (`window.glass_tint`, 0.75) in
@@ -140,6 +146,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
 | ⌥⌘A | Keep the Mac awake while this pane's command runs (or its next one) |
 | ⌥⌘L | Latency ledger: where each keystroke's delay goes |
+| ⌥⌘F | Full screen around the notch, or back |
 | → or End, ⌥→ | Take the grey suggestion after the cursor, or one word of it |
 | ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
 | ⌘D / ⌘⇧D | Split the pane: a new shell to the right / below, in the same folder |

@@ -480,8 +480,13 @@ impl Term {
             .map(|(_, c)| c)
     }
 
-    /// Whether a command is running, so its output is worth reading for
-    /// metrics.
+    /// How long the running command has run, if one is.
+    pub fn running_elapsed(&self) -> Option<Duration> {
+        let id = self.current_cmd?;
+        let c = self.commands.get(&id)?;
+        (c.state == CommandState::Running).then(|| c.elapsed()).flatten()
+    }
+
     /// Keep the Mac awake while the running command runs, or while the next
     /// one does when none is running; `false` takes that back.
     pub fn set_keep_awake(&mut self, on: bool) {
@@ -554,6 +559,8 @@ impl Term {
         Some((text, blank))
     }
 
+    /// Whether a command is running, so its output is worth reading for
+    /// metrics.
     pub fn command_running(&self) -> bool {
         self.current_cmd
             .and_then(|id| self.commands.get(&id))

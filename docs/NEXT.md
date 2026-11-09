@@ -262,6 +262,15 @@ Closest today: Typometer, or a high-speed camera.
   screen keeps windows below the notch, so this needs a borderless window
   covering the screen's full frame and gives up some of how Spaces treats
   full-screen apps. Prototype it before promising it.
+  *Built (9 November 2026), from the View menu (⌥⌘F) rather than a setting:*
+  the window goes borderless at the screen's full frame, and the app's
+  presentation options hide the menu bar and Dock while it's in front. The
+  band is `safeAreaInsets.top` (32 pt on the 14-inch M2 Pro, notch from x =
+  663.5 to 848.5). The tab capsule is centred in `auxiliaryTopLeftArea`, even
+  with one tab; a status label in `auxiliaryTopRightArea` shows the running
+  command and its time, or the folder, and the clock, refreshed every 15 s. It
+  keeps 40 pt clear at the right for the camera and microphone dots. The
+  window doesn't get a Space of its own, which is the trade-off.
 
 Mac details: Quick Look on ⌘-click of a path, Secure Keyboard Entry that turns
 on by itself while the PTY has echo off, ⌘↑/⌘↓ to jump between commands, and
