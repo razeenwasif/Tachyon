@@ -97,8 +97,9 @@ scripts/bundle-macos.sh --install    # ...and install it to /Applications
 The window is edge-to-edge: no title bar, and the window buttons appear when
 the pointer reaches the top-left corner. **Liquid Glass** sits behind the text
 (NSGlassEffectView on macOS 26 and later): only the default background lets it
-through, at `window.opacity` (0.82); text, the cursor, the selection and colours
-a program sets stay solid. `window.backdrop = none` makes it opaque, and so does
+through, at `window.opacity` (0.25); text, the cursor, the selection and colours
+a program sets stay solid. `window.glass = clear` is less frosted. With more than
+one tab, the tabs float in a glass capsule along the bottom edge. `window.backdrop = none` makes it opaque, and so does
 Reduce Transparency. A **light theme** with its own ANSI colours takes over in
 Light Mode and switches back as the system does (`theme.appearance` fixes one);
 `theme.cursor = accent` and `theme.selection_bg = accent` use the system accent

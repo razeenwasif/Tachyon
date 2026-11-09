@@ -24,6 +24,7 @@ mod pty;
 mod receipts;
 mod renderer;
 mod selection;
+mod strip;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -626,7 +627,17 @@ impl TachyonWindow {
             .standardWindowButton(NSWindowButton::CloseButton)
             .is_some_and(|b| !b.isHidden());
         let over_buttons = buttons_showing && p.x < BUTTON_ZONE.0 && p.y > size.height - BUTTON_ZONE.1;
-        inside && !over_buttons
+        // The glass tab capsule, a subview of the terminal view, takes its
+        // own clicks.
+        let over_capsule = view.subviews().iter().any(|sub| {
+            let f = sub.frame();
+            !sub.isHidden()
+                && p.x >= f.origin.x
+                && p.x <= f.origin.x + f.size.width
+                && p.y >= f.origin.y
+                && p.y <= f.origin.y + f.size.height
+        });
+        inside && !over_buttons && !over_capsule
     }
 }
 
@@ -850,6 +861,10 @@ struct TermWindow {
     appearance: Appearance,
     /// Glass is behind the text, so the window itself is clear.
     glass: bool,
+    /// With Liquid Glass, the tab strip is a floating glass capsule, created
+    /// when the second tab opens.
+    native_strip: bool,
+    capsule: Option<strip::Capsule>,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -918,10 +933,11 @@ impl TermWindow {
                 decor.notes.push((term.cursor_state().y, "Secure Keyboard Entry".into()));
             }
             if self.tabs.len() > 1 {
-                decor.strip = Some(Strip {
-                    tabs: self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect(),
-                    active: self.active,
-                });
+                let tabs: Vec<_> = self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect();
+                match &self.capsule {
+                    Some(c) if self.native_strip => c.view.set_tabs(tabs, self.active),
+                    _ => decor.strip = Some(Strip { tabs, active: self.active }),
+                }
             }
             self.renderer.draw(&term, self.focused, selection, blink, &decor);
             let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
@@ -1225,7 +1241,12 @@ impl TermWindow {
         let (w, h) = ((bounds.size.width * scale) as f32, (bounds.size.height * scale) as f32);
         self.renderer.resize(w, h);
 
-        self.renderer.set_strip(self.tabs.len() > 1);
+        let strip = self.tabs.len() > 1;
+        self.renderer.set_strip(strip);
+        if self.native_strip {
+            self.renderer.set_strip_band(Some((strip::BAND_HEIGHT * scale).round() as f32));
+            self.place_capsule(strip);
+        }
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
             crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
@@ -1238,6 +1259,23 @@ impl TermWindow {
         }
         self.update_resize_increments();
         self.request_redraw();
+    }
+
+    /// Show, place or hide the glass tab capsule.
+    fn place_capsule(&mut self, show: bool) {
+        if show && self.capsule.is_none() {
+            if let Some(mtm) = MainThreadMarker::new() {
+                self.capsule = Some(strip::Capsule::new(mtm, &self.view, self.id));
+            }
+        }
+        if let Some(c) = &self.capsule {
+            c.glass.setHidden(!show);
+            if show {
+                c.place(self.view.bounds().size.width, self.tabs.len());
+                let tabs = self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect();
+                c.view.set_tabs(tabs, self.active);
+            }
+        }
     }
 
     fn rescale(&mut self) {
@@ -1900,7 +1938,7 @@ impl App {
         view.addTrackingArea(&tracking);
 
         if glass {
-            window.setContentView(Some(&glass_host(mtm, &view, content)));
+            window.setContentView(Some(&glass_host(mtm, &view, content, cfg.window.glass_clear)));
         } else {
             window.setContentView(Some(&view));
         }
@@ -1955,6 +1993,8 @@ impl App {
             theme_light: cfg.theme_light.clone(),
             appearance: cfg.appearance,
             glass,
+            native_strip: glass && objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some(),
+            capsule: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -2003,10 +2043,16 @@ fn close_active_tab(window: u64) {
 
 /// A view that puts `view` on glass: Liquid Glass on macOS 26 and later,
 /// otherwise the blurred window material macOS used before.
-fn glass_host(mtm: MainThreadMarker, view: &TachyonView, size: NSSize) -> Retained<NSView> {
+fn glass_host(mtm: MainThreadMarker, view: &TachyonView, size: NSSize, clear: bool) -> Retained<NSView> {
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), size);
     if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
         let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
+        if clear {
+            glass.setStyle(objc2_app_kit::NSGlassEffectViewStyle::Clear);
+        }
+        // Round like the window, so the glass's rim and the refraction along
+        // it follow the window's edge.
+        glass.setCornerRadius(16.0);
         glass.setContentView(Some(view));
         return Retained::into_super(glass);
     }

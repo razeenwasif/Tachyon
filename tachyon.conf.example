@@ -61,10 +61,15 @@ window.padding_y = 6.0
 # chooses after we have drawn.
 # window.backdrop = glass
 
-# How opaque the default background is over the backdrop. Defaults to 0.82
-# with a backdrop, 1.0 without. Lower shows more glass. Text is always fully
-# opaque regardless.
-# window.opacity = 0.82
+# macOS: Liquid Glass's style. regular adapts its tint to what's behind it,
+# which keeps text readable; clear is less frosted and bends more of what's
+# behind at its edges.
+# window.glass = regular
+
+# How opaque the default background is over the backdrop. Defaults to 0.25 on
+# Liquid Glass, 0.82 with a Windows backdrop, 1.0 without. Lower shows more
+# glass. Text is always fully opaque regardless.
+# window.opacity = 0.25
 
 # ---------------------------------------------------------------------------
 # Rendering
