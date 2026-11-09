@@ -105,7 +105,12 @@ one tab, the tabs float in a glass capsule along the bottom edge. `window.backdr
 Reduce Transparency. A **light theme** with its own ANSI colours takes over in
 Light Mode and switches back as the system does (`theme.appearance` fixes one);
 `theme.cursor = accent` and `theme.selection_bg = accent` use the system accent
-colour. Drawing is paced by a display link
+colour. With **Increase Contrast** on (System Settings > Accessibility >
+Display), both themes switch to high-contrast versions derived from them: a
+black (or white) background, every ANSI colour at 7:1 contrast or better
+(4.5:1 for the dim slot shells use for suggestions), a solid selection with its
+own text colour, and the glass turned into a solid background. It switches back
+when the setting does; `theme.contrast = high` or `normal` fixes it. Drawing is paced by a display link
 that pauses when nothing changes, so an idle window uses no CPU. Box drawing
 and block elements are drawn as rectangles, so borders and progress bars meet
 exactly. Nerd Font icons come from any installed Nerd Font, sized so its line height

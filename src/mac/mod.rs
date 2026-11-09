@@ -66,7 +66,7 @@ use objc2_quartz_core::{
 };
 use parking_lot::Mutex;
 
-use crate::config::{Appearance, Backdrop, Config, OptionAsMeta, ThemeConfig};
+use crate::config::{Appearance, Backdrop, Config, Contrast, OptionAsMeta, ThemeConfig};
 use crate::term::jobs::JobRef;
 use crate::term::rewind::RewindLog;
 use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
@@ -1208,6 +1208,9 @@ struct TermWindow {
     theme_dark: ThemeConfig,
     theme_light: ThemeConfig,
     appearance: Appearance,
+    /// Use the high-contrast themes: always, never, or with Increase
+    /// Contrast.
+    contrast: Contrast,
     /// Glass is behind the text, so the window itself is clear.
     glass: bool,
     /// With Liquid Glass, the tab strip is a floating glass capsule, created
@@ -1496,7 +1499,15 @@ impl TermWindow {
             Appearance::Light => false,
             Appearance::Auto => appearance_is_dark(&self.view),
         };
+        let high = match self.contrast {
+            Contrast::High => true,
+            Contrast::Normal => false,
+            Contrast::Auto => NSWorkspace::sharedWorkspace().accessibilityDisplayShouldIncreaseContrast(),
+        };
         let mut theme = if dark { self.theme_dark.clone() } else { self.theme_light.clone() };
+        if high {
+            theme = theme.high_contrast(dark);
+        }
         if theme.cursor_accent || theme.selection_accent {
             if let Some(accent) = accent_color() {
                 if theme.cursor_accent {
@@ -1511,7 +1522,11 @@ impl TermWindow {
             self.window.setBackgroundColor(Some(&srgb_color(theme.background, 1.0)));
         }
         if let Some(glass) = &self.host_glass {
-            let tint = (self.glass_tint > 0.0).then(|| srgb_color(theme.background, self.glass_tint as f64));
+            // Increase Contrast: the glass keeps its shape and edge, but the
+            // text sits on a solid background, as macOS does with its own
+            // materials.
+            let alpha = if high { 1.0 } else { self.glass_tint as f64 };
+            let tint = (alpha > 0.0).then(|| srgb_color(theme.background, alpha));
             glass.setTintColor(tint.as_deref());
         }
         self.renderer.set_theme(&theme);
@@ -2942,6 +2957,7 @@ impl App {
             theme_dark: cfg.theme.clone(),
             theme_light: cfg.theme_light.clone(),
             appearance: cfg.appearance,
+            contrast: cfg.contrast,
             glass,
             native_strip: glass && objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some(),
             capsule: None,
@@ -3727,6 +3743,21 @@ pub fn run(cfg: Config) -> Result<(), String> {
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     NOTIFIER.with(|n| *n.borrow_mut() = notify::Notifier::new(mtm));
+    // Increase Contrast (and Reduce Transparency) switched in System
+    // Settings: every window picks its theme again. The observer lives as
+    // long as the app.
+    let contrast_changed = block2::RcBlock::new(|_n: std::ptr::NonNull<NSNotification>| {
+        with_app(|app| app.windows.iter_mut().for_each(TermWindow::apply_appearance));
+    });
+    let observer = unsafe {
+        NSWorkspace::sharedWorkspace().notificationCenter().addObserverForName_object_queue_usingBlock(
+            Some(objc2_app_kit::NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification),
+            None,
+            Some(&objc2_foundation::NSOperationQueue::mainQueue()),
+            &contrast_changed,
+        )
+    };
+    std::mem::forget(observer);
     // Rewind folders left by a Tachyon that crashed.
     if let Some(root) = rewind_root() {
         crate::term::rewind::remove_stale(&root);
