@@ -1,3 +1,6 @@
+# Shows images with both protocols. Run it in Tachyon: python3 scripts/image-test.py
+# (q=2 on the kitty commands: nothing here reads the terminal's replies.)
+
 import base64, io, sys, time
 import matplotlib
 matplotlib.use("Agg")
@@ -27,7 +30,7 @@ w(b"kitty protocol (APC G), raw pixels in chunks:\r\n")
 chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
 for i, c in enumerate(chunks):
     more = 1 if i < len(chunks) - 1 else 0
-    keys = b"a=T,f=32,s=%d,v=%d,i=9,m=%d" % (W, H, more) if i == 0 else b"m=%d" % more
+    keys = b"a=T,f=32,s=%d,v=%d,i=9,q=2,m=%d" % (W, H, more) if i == 0 else b"m=%d" % more
     w(b"\x1b_G" + keys + b";" + c + b"\x1b\\")
 w(b"\r\nkitty PNG next to text: ")
 w(b"\x1b_Ga=T,f=100,c=12,q=2;" + base64.b64encode(png) + b"\x1b\\")
