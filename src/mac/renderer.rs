@@ -432,7 +432,15 @@ impl Renderer {
     /// dividers between them (pixel rectangles), and the tab strip. With
     /// `cursor_on_layer`, a focused cursor is left out of the frame because a
     /// Core Animation layer draws it.
-    pub fn draw_frame(&mut self, panes: &[PaneFrame], strip: Option<&Strip>, dividers: &[[f32; 4]]) {
+    /// `presented`, if given, is called with the time (seconds since boot)
+    /// the frame reached the display.
+    pub fn draw_frame(
+        &mut self,
+        panes: &[PaneFrame],
+        strip: Option<&Strip>,
+        dividers: &[[f32; 4]],
+        presented: Option<Box<dyn Fn(f64)>>,
+    ) {
         if self.atlas.overflowed {
             self.atlas.reset();
             self.atlas.overflowed = false;
@@ -565,6 +573,12 @@ impl Renderer {
         enc.endEncoding();
 
         let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
+        if let Some(f) = presented {
+            let block = block2::RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                f(unsafe { d.as_ref() }.presentedTime());
+            });
+            unsafe { drawable.addPresentedHandler(block2::RcBlock::as_ptr(&block)) };
+        }
         cb.presentDrawable(drawable);
         cb.commit();
         slot.in_flight = Some(cb);

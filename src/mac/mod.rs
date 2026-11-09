@@ -20,6 +20,7 @@ mod dock;
 mod font;
 pub mod host;
 mod input;
+mod ledger;
 mod links;
 mod notify;
 mod panes;
@@ -445,6 +446,12 @@ define_class!(
         #[unsafe(method(tachyonPaneDown:))]
         fn pane_down(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.move_focus(0, 1));
+        }
+
+        #[unsafe(method(tachyonLedger:))]
+        fn toggle_ledger(&self, _sender: Option<&AnyObject>) {
+            ledger::SHOWN.fetch_xor(true, Ordering::Relaxed);
+            with_app(|app| app.windows.iter_mut().for_each(|w| w.request_redraw()));
         }
 
         #[unsafe(method(tachyonKeepAwake:))]
@@ -998,6 +1005,8 @@ struct Pane {
     log: Arc<Mutex<RewindLog>>,
     /// Where it is in the window's grid.
     rect: panes::Rect,
+    /// The keystroke in flight, for the latency ledger.
+    ledger: Arc<ledger::Slot>,
 }
 
 /// A tab: one pane, or several split from it.
@@ -1059,7 +1068,8 @@ impl Pane {
 
     fn with(id: u64, pty: Pty, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>, awake: bool) -> Result<Pane, String> {
         let wake_pending = Arc::new(AtomicBool::new(false));
-        let (term, pty, log) = start_session(id, pty, cfg, cols, rows, Arc::clone(&wake_pending), awake)?;
+        let slot = Arc::new(ledger::Slot::default());
+        let (term, pty, log) = start_session(id, pty, cfg, cols, rows, Arc::clone(&wake_pending), awake, Arc::clone(&slot))?;
         Ok(Pane {
             id,
             term,
@@ -1069,6 +1079,7 @@ impl Pane {
             job,
             log,
             rect: panes::Rect { col: 0, row: 0, cols, rows },
+            ledger: slot,
         })
     }
 }
@@ -1205,6 +1216,8 @@ struct TermWindow {
     glass_tint: f32,
     /// A divider being dragged to resize the panes beside it.
     dragging_divider: Option<panes::Divider>,
+    /// When the key being handled was pressed.
+    key_time: Option<u64>,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -1307,6 +1320,11 @@ impl TermWindow {
                 if self.secure {
                     decor.notes.push((term.cursor_state().y, "Secure Keyboard Entry".into()));
                 }
+                if ledger::SHOWN.load(Ordering::Relaxed) {
+                    if let Some(line) = ledger::summary() {
+                        decor.notes.push((term.cursor_state().y, line));
+                    }
+                }
                 self.selection
             } else {
                 tab.panes[p].saved.selection
@@ -1349,7 +1367,17 @@ impl TermWindow {
             })
             .collect();
         let dividers: Vec<[f32; 4]> = tab.dividers.iter().map(|d| self.divider_pixels(d)).collect();
-        self.renderer.draw_frame(&frames, strip.as_ref(), &dividers);
+        // The echo of a keystroke is in this frame: the ledger finishes when
+        // it reaches the display.
+        let presented: Option<Box<dyn Fn(f64)>> = tab.pane().ledger.take_for_frame().map(|p| {
+            let window = self.id;
+            Box::new(move |at: f64| {
+                if p.finish(ledger::from_seconds(at)).is_some() && ledger::SHOWN.load(Ordering::Relaxed) {
+                    DispatchQueue::main().exec_async(move || with_window(window, |w| w.request_redraw()));
+                }
+            }) as Box<dyn Fn(f64)>
+        });
+        self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, presented);
         let overlay = match focus_at {
             Some(k) if blink => {
                 let rect = tab.panes[tab.focus].rect;
@@ -1916,6 +1944,9 @@ impl TermWindow {
     /// Handle a key press. Returns true when it should go to the input
     /// system instead (ordinary typing, dead keys, input methods).
     fn key_down(&mut self, event: &NSEvent) -> bool {
+        // When the key was pressed, for the latency ledger: text the input
+        // system commits from this event is stamped with it too.
+        self.key_time = Some(ledger::from_seconds(event.timestamp()));
         let flags = event.modifierFlags();
         if flags.contains(NSEventModifierFlags::Command) {
             // Command shortcuts belong to the menu bar; one that reaches us
@@ -1970,6 +2001,7 @@ impl TermWindow {
         if let Some(bytes) = input::encode(event.keyCode(), &chars, &bare, mods, mode, meta) {
             self.term.lock().scroll_to_bottom();
             let _ = self.pty.write(&bytes);
+            self.stamp_keystroke();
             NSCursor::setHiddenUntilMouseMoves(true);
             if self.selection.take().is_some() {
                 self.request_redraw();
@@ -1990,10 +2022,17 @@ impl TermWindow {
         }
         self.term.lock().scroll_to_bottom();
         let _ = self.pty.write(text.as_bytes());
+        self.stamp_keystroke();
         NSCursor::setHiddenUntilMouseMoves(true);
         self.selection = None;
         self.cursor_shown = None;
         self.request_redraw();
+    }
+
+    /// A keystroke went to the focused pane's shell: start timing it.
+    fn stamp_keystroke(&mut self) {
+        let key = self.key_time.take().unwrap_or_else(ledger::now);
+        self.tabs[self.active].pane().ledger.keystroke(key);
     }
 
     fn set_preedit(&mut self, text: String) {
@@ -2872,6 +2911,7 @@ impl App {
             rewound: None,
             rewind_badge: None,
             dragging_divider: None,
+            key_time: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -3131,6 +3171,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Previous Command", sel!(tachyonPreviousCommand:), "\u{F700}");
     item(&view, "Next Command", sel!(tachyonNextCommand:), "\u{F701}");
     view.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&view, "Latency Ledger", sel!(tachyonLedger:), "l")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Rewind", sel!(tachyonRewindBack:), "[");
     item(&view, "Forward", sel!(tachyonRewindForward:), "]");
     submenu(&main, &view);
@@ -3218,6 +3261,7 @@ fn start_session(
     wake_pending: Arc<AtomicBool>,
     // Keep-awake was on at the host: on again once the screen is restored.
     awake_after_restore: bool,
+    stamps: Arc<ledger::Slot>,
 ) -> Result<(Arc<Mutex<Term>>, Arc<Pty>, Arc<Mutex<RewindLog>>), String> {
     let pty = Arc::new(pty);
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));
@@ -3289,6 +3333,7 @@ fn start_session(
                     let _ = f.write_all(&buf[..n]);
                 }
                 let restoring = replay > 0;
+                stamps.output_read();
                 let (replies, events, running, cmdline) = {
                     let mut t = reader_term.lock();
                     processor.advance(&mut t, &buf[..n]);
@@ -3315,6 +3360,7 @@ fn start_session(
                         }
                     }
                     let cmdline = t.running_cmdline().map(str::to_string);
+                    stamps.output_parsed();
                     let (replies, events) = (t.take_replies(), t.take_command_events());
                     if restoring {
                         // The past: its queries were answered long ago.
