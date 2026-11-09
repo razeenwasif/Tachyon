@@ -52,6 +52,9 @@ pub struct GlyphBitmap {
 struct Face {
     font: CFRetained<CTFont>,
     color: bool,
+    /// Pixels to move its glyphs down from the cell's baseline: a Nerd Font
+    /// fallback is placed so its line box is the cell's.
+    y_offset: f32,
 }
 
 /// Which of the four primary styles a lookup wants.
@@ -116,6 +119,7 @@ impl FontSet {
             .map(|font| Face {
                 color: is_color(&font),
                 font,
+                y_offset: 0.0,
             })
             .collect();
 
@@ -275,7 +279,14 @@ impl FontSet {
                     continue;
                 }
                 if let Some(glyph) = glyph_in(&font, ch) {
-                    return Some((self.intern(font), glyph));
+                    // Nerd Font icons, Powerline's above all, are drawn to
+                    // fill their own font's line, which is taller than most
+                    // primary fonts'. Sized so its line is the cell's height
+                    // and placed on the cell's box, they fit, and Powerline
+                    // separators fill the cell exactly.
+                    let (fitted, y_offset) = self.fit_to_cell(&font, size);
+                    let glyph = glyph_in(&fitted, ch).unwrap_or(glyph);
+                    return Some((self.intern_with(fitted, y_offset), glyph));
                 }
             }
         }
@@ -292,8 +303,26 @@ impl FontSet {
         Some((self.intern(font), glyph))
     }
 
+    /// `font` at the size where its line (ascent and descent) is the cell's
+    /// height, and how far down its baseline then sits from the cell's.
+    fn fit_to_cell(&self, font: &CTFont, size: CGFloat) -> (CFRetained<CTFont>, f32) {
+        let m = self.metrics;
+        let (a, d) = unsafe { (font.ascent(), font.descent()) };
+        if a + d <= 0.0 {
+            return (unsafe { CTFont::with_name(&font.post_script_name(), size, ptr::null()) }, 0.0);
+        }
+        let k = m.height as CGFloat / (a + d);
+        let fitted = unsafe { CTFont::with_name(&font.post_script_name(), size * k, ptr::null()) };
+        let baseline = unsafe { fitted.ascent() } as f32;
+        (fitted, (baseline - m.ascent).round())
+    }
+
     /// Index of `font` in the face list, adding it the first time it is seen.
     fn intern(&mut self, font: CFRetained<CTFont>) -> u16 {
+        self.intern_with(font, 0.0)
+    }
+
+    fn intern_with(&mut self, font: CFRetained<CTFont>, y_offset: f32) -> u16 {
         let name = unsafe { font.post_script_name() }.to_string();
         if let Some(&i) = self.by_name.get(&name) {
             return i;
@@ -302,6 +331,7 @@ impl FontSet {
         self.faces.push(Face {
             color: is_color(&font),
             font,
+            y_offset,
         });
         self.by_name.insert(name, i);
         i
@@ -375,7 +405,7 @@ impl FontSet {
             width: w as u32,
             height: h as u32,
             left: x0 as f32,
-            top: -(y1 as f32),
+            top: -(y1 as f32) + f.y_offset,
             data,
             color: f.color,
         })
@@ -516,5 +546,37 @@ mod tests {
         let g = f.shape("->", false, false);
         let plain = [glyph_in(&f.faces[0].font, '-'), glyph_in(&f.faces[0].font, '>')];
         assert!(g.iter().zip(plain).any(|(s, p)| Some(s.glyph) != p), "{g:?}");
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    /// Nerd Font icons from the fallback stay inside the cell, and Powerline
+    /// separators fill its height. Skipped where no Nerd Font is installed.
+    #[test]
+    fn nerd_font_icons_fit_the_cell() {
+        let cfg = FontConfig { family: "Cascadia Mono".into(), size: 12.0, ..FontConfig::default() };
+        let mut f = FontSet::new(&cfg, 2.0);
+        let m = f.metrics;
+        let Some((face, _)) = f.glyph_for('\u{E0A0}', false, false) else { return };
+        if face < 4 {
+            return; // the primary font has it itself
+        }
+        // The bitmap carries a pixel of slack on each side for antialiasing.
+        let extent = |f: &mut FontSet, ch: char| {
+            let (face, glyph) = f.glyph_for(ch, false, false).unwrap();
+            let b = f.rasterize(face, glyph).unwrap();
+            let top = m.ascent + b.top + 1.0;
+            (top, top + b.height as f32 - 2.0)
+        };
+        for ch in ['\u{E0A0}', '\u{E725}', '\u{F07B}', '\u{E702}', '\u{F418}'] {
+            let (top, bottom) = extent(&mut f, ch);
+            assert!(top >= -1.0 && bottom <= m.height + 1.0, "U+{:04X} spans {top}..{bottom} in a {} px cell", ch as u32, m.height);
+        }
+        // A Powerline arrow is as tall as the cell, give or take a pixel.
+        let (top, bottom) = extent(&mut f, '\u{E0B0}');
+        assert!((bottom - top - m.height).abs() <= 2.0, "arrow spans {top}..{bottom} in a {} px cell", m.height);
     }
 }

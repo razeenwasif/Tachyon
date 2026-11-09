@@ -108,7 +108,9 @@ Light Mode and switches back as the system does (`theme.appearance` fixes one);
 colour. Drawing is paced by a display link
 that pauses when nothing changes, so an idle window uses no CPU. Box drawing
 and block elements are drawn as rectangles, so borders and progress bars meet
-exactly. Nerd Font icons come from any installed Nerd Font. The font defaults
+exactly. Nerd Font icons come from any installed Nerd Font, sized so its line height
+is the cell's: icons sit inside the cell, and Powerline separators fill it
+exactly. The font defaults
 to Cascadia Mono and falls back to SF Mono when it is not installed.
 
 On an M2 Pro (`cargo test --release --test throughput -- --ignored
