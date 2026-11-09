@@ -467,6 +467,21 @@ impl Grid {
         }
     }
 
+    /// The screen alone, without scrollback: what Rewind keeps as a snapshot.
+    pub fn screen_copy(&self) -> Grid {
+        Grid {
+            cols: self.cols,
+            rows: self.rows,
+            max_scrollback: 0,
+            screen: self.screen.clone(),
+            top: self.top,
+            history: VecDeque::new(),
+            display_offset: 0,
+            view: Vec::new(),
+            full_damage: true,
+        }
+    }
+
     /// Set the mark on a line by absolute position.
     pub fn set_mark(&mut self, absolute: usize, mark: RowMark) {
         let h = self.history.len();

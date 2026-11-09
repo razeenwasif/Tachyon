@@ -61,6 +61,12 @@ impl Processor {
         }
     }
 
+    /// Whether the parser is between escape sequences, where a snapshot of
+    /// the terminal can be replayed from with a fresh parser.
+    pub fn is_ground(&self) -> bool {
+        self.in_ground
+    }
+
     /// Feed a chunk of PTY output.
     pub fn advance(&mut self, term: &mut Term, mut bytes: &[u8]) {
         while !bytes.is_empty() {

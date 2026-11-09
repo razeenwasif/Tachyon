@@ -64,6 +64,7 @@ use parking_lot::Mutex;
 
 use crate::config::{Appearance, Backdrop, Config, OptionAsMeta, ThemeConfig};
 use crate::term::jobs::JobRef;
+use crate::term::rewind::RewindLog;
 use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
 use rustc_hash::FxHashMap;
 use pty::Pty;
@@ -361,6 +362,16 @@ define_class!(
         #[unsafe(method(newTab:))]
         fn new_tab(&self, _sender: Option<&AnyObject>) {
             open_tab(self.id());
+        }
+
+        #[unsafe(method(tachyonRewindBack:))]
+        fn rewind_back(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.rewind_step(true));
+        }
+
+        #[unsafe(method(tachyonRewindForward:))]
+        fn rewind_forward(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.rewind_step(false));
         }
 
         #[unsafe(method(tachyonFollowJob:))]
@@ -755,6 +766,46 @@ struct App {
     _delegate: Retained<AppDelegate>,
 }
 
+/// An earlier screen Rewind is showing.
+struct Rewound {
+    term: Term,
+    /// Which frame, of how many, and when it was drawn.
+    index: usize,
+    frames: usize,
+    at: Instant,
+}
+
+/// The glass badge at the top while rewound, saying when the screen is from.
+struct RewindBadge {
+    glass: Retained<NSGlassEffectView>,
+    label: Retained<objc2_app_kit::NSTextField>,
+}
+
+impl RewindBadge {
+    fn new(mtm: MainThreadMarker, parent: &NSView) -> Option<RewindBadge> {
+        objc2::runtime::AnyClass::get(c"NSGlassEffectView")?;
+        let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+        glass.setCornerRadius(14.0);
+        let label = objc2_app_kit::NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        label.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize_weight(12.0, unsafe { objc2_app_kit::NSFontWeightMedium })));
+        label.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+        glass.setContentView(Some(&label));
+        parent.addSubview(&glass);
+        Some(RewindBadge { glass, label })
+    }
+
+    /// Show `text`, centred near the top of a view of `size`.
+    fn show(&self, text: &str, size: NSSize) {
+        self.label.setStringValue(&NSString::from_str(text));
+        let w = (self.label.intrinsicContentSize().width + 32.0).min(size.width - 24.0);
+        let h = 28.0;
+        let frame = NSRect::new(NSPoint::new(((size.width - w) / 2.0).round(), size.height - h - 10.0), NSSize::new(w, h));
+        self.glass.setFrame(frame);
+        self.label.setFrame(NSRect::new(NSPoint::new(0.0, 6.0), NSSize::new(w, 16.0)));
+        self.glass.setHidden(false);
+    }
+}
+
 /// One shell session in a window.
 struct Tab {
     id: u64,
@@ -774,6 +825,8 @@ struct Tab {
     saved: TabState,
     /// The cluster job this tab follows, if Tachyon opened it for one.
     job: Option<JobRef>,
+    /// Its recent output, for Rewind.
+    log: Arc<Mutex<RewindLog>>,
 }
 
 /// Per-tab state the window works on directly while the tab is in front.
@@ -803,7 +856,7 @@ impl Tab {
     fn start(id: u64, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>) -> Result<Tab, String> {
         let wake_pending = Arc::new(AtomicBool::new(false));
         let run = job.as_ref().and_then(follow_command);
-        let (term, pty) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending), run.as_deref())?;
+        let (term, pty, log) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending), run.as_deref())?;
         Ok(Tab {
             id,
             term,
@@ -814,6 +867,7 @@ impl Tab {
             unseen: None,
             saved: TabState::default(),
             job,
+            log,
         })
     }
 }
@@ -883,6 +937,9 @@ struct TermWindow {
     followed: Vec<String>,
     /// The rerun-diff tooltip showing, if any.
     tooltip: Option<String>,
+    /// Rewind: the earlier screen being shown instead of the live one.
+    rewound: Option<Rewound>,
+    rewind_badge: Option<RewindBadge>,
     glass_tint: f32,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
@@ -958,10 +1015,19 @@ impl TermWindow {
                     _ => decor.strip = Some(Strip { tabs, active: self.active }),
                 }
             }
-            self.renderer.draw(&term, self.focused, selection, blink, &decor);
-            let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
-            drop(term);
-            self.update_cursor_layer(overlay);
+            if let Some(rw) = &self.rewound {
+                // An earlier screen: no selection, marks or cursor layer,
+                // since they belong to the live one.
+                drop(term);
+                let decor = Decor { strip: decor.strip, ..Decor::default() };
+                self.renderer.draw(&rw.term, self.focused, None, false, &decor);
+                self.update_cursor_layer(None);
+            } else {
+                self.renderer.draw(&term, self.focused, selection, blink, &decor);
+                let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
+                drop(term);
+                self.update_cursor_layer(overlay);
+            }
         } else {
             // Nothing changed for a few refreshes: stop the display link. The
             // next byte from the shell or key press resumes it.
@@ -1242,6 +1308,7 @@ impl TermWindow {
 
     /// Take up the per-tab state of the tab now in front.
     fn load_live(&mut self) {
+        self.rewind_exit();
         let tab = &mut self.tabs[self.active];
         let s = std::mem::take(&mut tab.saved);
         tab.unseen = None;
@@ -1292,6 +1359,7 @@ impl TermWindow {
             // Every tab, so one brought forward is already the right size.
             for tab in &self.tabs {
                 tab.term.lock().resize(grid.0, grid.1);
+                tab.log.lock().record_resize(grid.0, grid.1);
                 tab.pty.resize(grid.0 as u16, grid.1 as u16);
             }
         }
@@ -1345,6 +1413,15 @@ impl TermWindow {
             // Command shortcuts belong to the menu bar; one that reaches us
             // has no binding.
             return false;
+        }
+        // Rewound: Escape goes back to live; any other key does too, and
+        // then goes to the shell as usual.
+        if self.rewound.is_some() {
+            self.rewind_exit();
+            const ESCAPE: u16 = 53;
+            if event.keyCode() == ESCAPE {
+                return false;
+            }
         }
         // Mid-composition, every key belongs to the input method.
         if !self.preedit.is_empty() {
@@ -1635,6 +1712,68 @@ impl TermWindow {
                 self.selection = None;
                 self.request_redraw();
             }
+        }
+    }
+
+    /// ⌘[ and ⌘]: show the screen one frame earlier or later. Stepping
+    /// forward past the newest frame goes back to live.
+    fn rewind_step(&mut self, back: bool) {
+        let log = Arc::clone(&self.tabs[self.active].log);
+        let log = log.lock();
+        let frames = log.frames();
+        if frames.len() < 2 {
+            objc2_app_kit::NSBeep();
+            return;
+        }
+        let live = frames.len() - 1;
+        let index = match (&self.rewound, back) {
+            (None, true) => live - 1,
+            (None, false) => return,
+            (Some(rw), true) => rw.index.saturating_sub(1),
+            (Some(rw), false) if rw.index + 1 >= live => {
+                drop(log);
+                self.rewind_exit();
+                return;
+            }
+            (Some(rw), false) => rw.index + 1,
+        };
+        let (seq, at) = frames[index];
+        let Some(term) = log.replay(seq) else {
+            return;
+        };
+        drop(log);
+        self.rewound = Some(Rewound { term, index, frames: frames.len(), at });
+        self.show_rewind_badge();
+        self.request_redraw();
+    }
+
+    fn rewind_exit(&mut self) {
+        if self.rewound.take().is_some() {
+            if let Some(b) = &self.rewind_badge {
+                b.glass.setHidden(true);
+            }
+            self.cursor_shown = None;
+            self.request_redraw();
+        }
+    }
+
+    fn show_rewind_badge(&mut self) {
+        let Some(rw) = &self.rewound else { return };
+        let ago = rw.at.elapsed().as_secs();
+        let when = match ago {
+            0 => "just now".to_string(),
+            s if s < 120 => format!("{s} s ago"),
+            s if s < 7200 => format!("{} min ago", s / 60),
+            s => format!("{} h ago", s / 3600),
+        };
+        let text = format!("Rewind · {when} · frame {} of {}   ⌘[ back  ⌘] forward  esc live", rw.index + 1, rw.frames);
+        if self.rewind_badge.is_none() {
+            if let Some(mtm) = MainThreadMarker::new() {
+                self.rewind_badge = RewindBadge::new(mtm, &self.view);
+            }
+        }
+        if let Some(b) = &self.rewind_badge {
+            b.show(&text, self.view.bounds().size);
         }
     }
 
@@ -2109,6 +2248,8 @@ impl App {
             glass_tint: cfg.window.glass_tint,
             followed: Vec::new(),
             tooltip: None,
+            rewound: None,
+            rewind_badge: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -2318,6 +2459,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // Up and down arrows: the function-key codepoints AppKit uses for them.
     item(&view, "Previous Command", sel!(tachyonPreviousCommand:), "\u{F700}");
     item(&view, "Next Command", sel!(tachyonNextCommand:), "\u{F701}");
+    view.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&view, "Rewind", sel!(tachyonRewindBack:), "[");
+    item(&view, "Forward", sel!(tachyonRewindForward:), "]");
     submenu(&main, &view);
 
     let window = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Window"));
@@ -2341,7 +2485,7 @@ fn start_session(
     rows: usize,
     wake_pending: Arc<AtomicBool>,
     run: Option<&str>,
-) -> Result<(Arc<Mutex<Term>>, Arc<Pty>), String> {
+) -> Result<(Arc<Mutex<Term>>, Arc<Pty>, Arc<Mutex<RewindLog>>), String> {
     let (program, login) = if cfg.shell.program.is_empty() {
         (pty::default_shell(), true)
     } else {
@@ -2369,6 +2513,8 @@ fn start_session(
         let _ = pty.write(format!("{cmd}\r").as_bytes());
     }
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));
+    let log = Arc::new(Mutex::new(RewindLog::new(term.lock().rewind_snapshot())));
+    let reader_log = Arc::clone(&log);
 
     let reader_term = Arc::clone(&term);
     let reader_pty = Arc::clone(&pty);
@@ -2416,6 +2562,15 @@ fn start_session(
                 let (replies, events, running, cmdline) = {
                     let mut t = reader_term.lock();
                     processor.advance(&mut t, &buf[..n]);
+                    {
+                        // Rewind keeps the raw output, and every few MB a
+                        // copy of the screen to replay it onto.
+                        let mut log = reader_log.lock();
+                        log.record(&buf[..n]);
+                        if log.wants_snapshot() && processor.is_ground() {
+                            log.snapshot(t.rewind_snapshot());
+                        }
+                    }
                     let cmdline = t.running_cmdline().map(str::to_string);
                     (t.take_replies(), t.take_command_events(), t.command_running(), cmdline)
                 };
@@ -2516,7 +2671,7 @@ fn start_session(
         })
         .map_err(|e| format!("could not start the reader thread: {e}"))?;
 
-    Ok((term, pty))
+    Ok((term, pty, log))
 }
 
 /// Where the shell-integration scripts live: inside the app bundle, or the

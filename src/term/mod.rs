@@ -3,6 +3,7 @@
 pub mod jobs;
 pub mod lens;
 pub mod rerun;
+pub mod rewind;
 pub mod cell;
 pub mod color;
 pub mod grid;
@@ -369,6 +370,42 @@ impl Term {
             rerun::Change::Changed(old) => format!("Last run: {old}"),
             rerun::Change::New => "Not in the last run".to_string(),
         })
+    }
+
+    /// The screen state without scrollback or shell-integration bookkeeping,
+    /// for Rewind to replay output onto.
+    pub fn rewind_snapshot(&self) -> Term {
+        Term {
+            grid: self.grid.screen_copy(),
+            inactive: self.inactive.screen_copy(),
+            cursor: self.cursor,
+            saved_cursor: self.saved_cursor,
+            saved_cursor_alt: self.saved_cursor_alt,
+            mode: self.mode,
+            cursor_shape: self.cursor_shape,
+            cursor_blinks: self.cursor_blinks,
+            scroll_top: self.scroll_top,
+            scroll_bot: self.scroll_bot,
+            tabs: self.tabs.clone(),
+            clusters: self.clusters.clone(),
+            underline_colors: self.underline_colors.clone(),
+            replies: Vec::new(),
+            title: self.title.clone(),
+            title_cmd: None,
+            cwd: None,
+            cwd_host: None,
+            ssh_session: None,
+            jobs: Vec::new(),
+            last_outputs: std::collections::VecDeque::new(),
+            title_revision: 0,
+            bell_revision: 0,
+            ground_signal: false,
+            dirty: true,
+            commands: FxHashMap::default(),
+            command_events: Vec::new(),
+            current_cmd: None,
+            next_cmd: 1,
+        }
     }
 
     /// A job id seen in the running command's output: remember it, and tie

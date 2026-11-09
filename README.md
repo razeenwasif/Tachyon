@@ -136,6 +136,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘↑ / ⌘↓ | Jump to the previous / next command |
 | Shift-drag in vim, tmux, htop | Select even while the app has the mouse |
 | ⌘-click a path / a URL | Show the file in Quick Look / open the link |
+| ⌘[ / ⌘] / esc | Rewind: the screen one frame earlier / later / live again |
 | ⌘J, or ⌘-click a job id | Follow the job this tab submitted last, or that one, in its own tab |
 
 **⌘-click** a file path to see it in Quick Look (an image, a CSV, a PDF) or a
@@ -143,6 +144,14 @@ URL to open it. Paths are taken from the tab's folder, and `file:line:col`
 suffixes from compilers are dropped. **Secure Keyboard Entry** turns on by itself
 while a program reads a password (sudo, ssh, getpass), so other apps can't read
 those keystrokes, and turns off after; the prompt line says so while it's on.
+
+**Rewind.** ⌘[ shows the screen as it was a moment ago, including full-screen
+programs (htop, nvtop, vim, agent UIs) that scrollback never keeps; ⌘[ again
+steps further back, ⌘] forward, and Esc or any key returns to live. A glass badge
+says how long ago the frame is. Each tab keeps its last 32 MiB of output in
+memory, with a copy of the screen every 2 MiB, so a step replays at most 2 MiB
+(a few milliseconds); recording costs about 1% of parsing throughput. Still to
+come: keeping the log on disk, a scrub track, and cell provenance.
 
 **Tabs.** With two or more tabs, a strip along the bottom edge shows them; with
 one, it goes away and the grid gets the row back. A tab is named after what's
