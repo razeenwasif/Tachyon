@@ -1,5 +1,6 @@
 //! Terminal state: grid, cursor, modes, and the VT dispatch implementation.
 
+pub mod lens;
 pub mod cell;
 pub mod color;
 pub mod grid;
@@ -145,6 +146,8 @@ pub struct CommandInfo {
     pub receipt: Option<Receipt>,
     /// The command line, when the shell reports it (`OSC 133;C;cmdline=...`).
     pub cmdline: Option<String>,
+    /// Metrics seen in its output while it ran.
+    pub lens: lens::Lens,
 }
 
 impl CommandInfo {
@@ -270,6 +273,24 @@ impl Term {
         core::mem::take(&mut self.command_events)
     }
 
+    /// Whether a command is running, so its output is worth reading for
+    /// metrics.
+    pub fn command_running(&self) -> bool {
+        self.current_cmd
+            .and_then(|id| self.commands.get(&id))
+            .is_some_and(|c| c.state == CommandState::Running)
+    }
+
+    /// Add what a line of output said to the running command's metrics.
+    /// Returns the command's progress percentage, if it has one.
+    pub fn record_reading(&mut self, r: &lens::Reading) -> Option<f32> {
+        let id = self.current_cmd?;
+        let c = self.commands.get_mut(&id).filter(|c| c.state == CommandState::Running)?;
+        c.lens.record(r);
+        self.dirty = true;
+        c.lens.percent
+    }
+
     pub fn set_receipt(&mut self, id: u32, receipt: Receipt) {
         if let Some(c) = self.commands.get_mut(&id) {
             c.receipt = Some(receipt);
@@ -303,7 +324,15 @@ impl Term {
                 self.current_cmd = Some(id);
                 self.commands.insert(
                     id,
-                    CommandInfo { state: CommandState::Prompt, started: None, finished: None, exit: None, receipt: None, cmdline: None },
+                    CommandInfo {
+                        state: CommandState::Prompt,
+                        started: None,
+                        finished: None,
+                        exit: None,
+                        receipt: None,
+                        cmdline: None,
+                        lens: lens::Lens::default(),
+                    },
                 );
                 self.mark_row(id, RowMark::PROMPT);
                 if self.commands.len() > MAX_COMMANDS as usize {
