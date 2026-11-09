@@ -64,6 +64,7 @@ use parking_lot::Mutex;
 
 use crate::config::{Appearance, Backdrop, Config, OptionAsMeta, ThemeConfig};
 use crate::term::jobs::JobRef;
+use crate::term::rewind::RewindLog;
 use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
 use rustc_hash::FxHashMap;
 use pty::Pty;
@@ -149,6 +150,19 @@ fn asking_for_password(fd: i32) -> bool {
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::tcgetattr(fd, &mut t) } == 0;
     ok && t.c_lflag & libc::ECHO == 0 && t.c_lflag & libc::ICANON != 0
+}
+
+/// 418226903 as 418,226,903.
+fn group_digits(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Whether a view is drawn in Dark Mode.
@@ -361,6 +375,25 @@ define_class!(
         #[unsafe(method(newTab:))]
         fn new_tab(&self, _sender: Option<&AnyObject>) {
             open_tab(self.id());
+        }
+
+        #[unsafe(method(tachyonRewindBack:))]
+        fn rewind_back(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.rewind_step(true));
+        }
+
+        #[unsafe(method(tachyonRewindScrub:))]
+        fn rewind_scrub(&self, sender: Option<&AnyObject>) {
+            let Some(slider) = sender.and_then(|s| s.downcast_ref::<objc2_app_kit::NSSlider>()) else {
+                return;
+            };
+            let index = slider.doubleValue().round().max(0.0) as usize;
+            with_window(self.id(), |w| w.rewind_to(index));
+        }
+
+        #[unsafe(method(tachyonRewindForward:))]
+        fn rewind_forward(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.rewind_step(false));
         }
 
         #[unsafe(method(tachyonFollowJob:))]
@@ -713,6 +746,22 @@ define_class!(
             false
         }
 
+        /// Quitting: Rewind's folders for this run go too (the process exits
+        /// without running destructors).
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _n: &NSNotification) {
+            if let Some(root) = rewind_root() {
+                let prefix = format!("{}-", std::process::id());
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for e in entries.flatten() {
+                        if e.file_name().to_string_lossy().starts_with(&prefix) {
+                            let _ = std::fs::remove_dir_all(e.path());
+                        }
+                    }
+                }
+            }
+        }
+
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
         fn should_handle_reopen(&self, _app: &NSApplication, has_visible_windows: bool) -> bool {
             // Clicking the Dock icon with no windows open starts a fresh one.
@@ -755,6 +804,92 @@ struct App {
     _delegate: Retained<AppDelegate>,
 }
 
+/// An earlier screen Rewind is showing.
+struct Rewound {
+    term: Term,
+    /// Which frame, of how many, and when it was drawn.
+    seq: u64,
+    index: usize,
+    frames: usize,
+    at: Instant,
+    /// Cell provenance from the last Option-click, shown under the slider.
+    note: Option<String>,
+}
+
+/// The glass panel at the top while rewound: when the screen is from, a
+/// slider to scrub through the frames, and cell provenance when asked for.
+struct RewindBadge {
+    glass: Retained<NSGlassEffectView>,
+    label: Retained<objc2_app_kit::NSTextField>,
+    slider: Retained<objc2_app_kit::NSSlider>,
+    note: Retained<objc2_app_kit::NSTextField>,
+}
+
+impl RewindBadge {
+    const WIDTH: f64 = 620.0;
+
+    fn new(mtm: MainThreadMarker, parent: &TachyonView) -> Option<RewindBadge> {
+        objc2::runtime::AnyClass::get(c"NSGlassEffectView")?;
+        let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+        glass.setCornerRadius(16.0);
+        // Tinted, so the text under the panel doesn't show through its words.
+        glass.setTintColor(Some(&NSColor::windowBackgroundColor().colorWithAlphaComponent(0.75)));
+        let content = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        let label = objc2_app_kit::NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        label.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize_weight(12.0, unsafe {
+            objc2_app_kit::NSFontWeightMedium
+        })));
+        // The view is the slider's target: its tachyonRewindScrub: replays.
+        let target: &AnyObject = parent.as_ref();
+        let slider = unsafe {
+            objc2_app_kit::NSSlider::sliderWithValue_minValue_maxValue_target_action(
+                0.0,
+                0.0,
+                1.0,
+                Some(target),
+                Some(sel!(tachyonRewindScrub:)),
+                mtm,
+            )
+        };
+        let note = objc2_app_kit::NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        note.setFont(Some(&objc2_app_kit::NSFont::monospacedSystemFontOfSize_weight(11.0, unsafe {
+            objc2_app_kit::NSFontWeightRegular
+        })));
+        note.setTextColor(Some(&NSColor::labelColor()));
+        note.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+        content.addSubview(&label);
+        content.addSubview(&slider);
+        content.addSubview(&note);
+        glass.setContentView(Some(&content));
+        glass.setHidden(true);
+        parent.addSubview(&glass);
+        Some(RewindBadge { glass, label, slider, note })
+    }
+
+    /// Show the panel near the top of a view of `size`: `text` beside a
+    /// slider at frame `index` of `frames`, and `note` below if any.
+    fn show(&self, text: &str, index: usize, frames: usize, note: Option<&str>, size: NSSize) {
+        self.label.setStringValue(&NSString::from_str(text));
+        self.slider.setMaxValue(frames.saturating_sub(1) as f64);
+        self.slider.setDoubleValue(index as f64);
+        let w = Self::WIDTH.min(size.width - 24.0);
+        let h = if note.is_some() { 52.0 } else { 32.0 };
+        let frame = NSRect::new(NSPoint::new(((size.width - w) / 2.0).round(), size.height - h - 10.0), NSSize::new(w, h));
+        self.glass.setFrame(frame);
+        let top = h - 32.0;
+        let label_w = (self.label.intrinsicContentSize().width + 4.0).min(w * 0.5);
+        self.label.setFrame(NSRect::new(NSPoint::new(16.0, top + 8.0), NSSize::new(label_w, 16.0)));
+        let sx = 16.0 + label_w + 12.0;
+        self.slider.setFrame(NSRect::new(NSPoint::new(sx, top + 6.0), NSSize::new((w - sx - 16.0).max(40.0), 20.0)));
+        self.note.setHidden(note.is_none());
+        if let Some(n) = note {
+            self.note.setStringValue(&NSString::from_str(n));
+            self.note.setFrame(NSRect::new(NSPoint::new(16.0, 8.0), NSSize::new(w - 32.0, 15.0)));
+        }
+        self.glass.setHidden(false);
+    }
+}
+
 /// One shell session in a window.
 struct Tab {
     id: u64,
@@ -774,6 +909,8 @@ struct Tab {
     saved: TabState,
     /// The cluster job this tab follows, if Tachyon opened it for one.
     job: Option<JobRef>,
+    /// Its recent output, for Rewind.
+    log: Arc<Mutex<RewindLog>>,
 }
 
 /// Per-tab state the window works on directly while the tab is in front.
@@ -803,7 +940,7 @@ impl Tab {
     fn start(id: u64, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>) -> Result<Tab, String> {
         let wake_pending = Arc::new(AtomicBool::new(false));
         let run = job.as_ref().and_then(follow_command);
-        let (term, pty) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending), run.as_deref())?;
+        let (term, pty, log) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending), run.as_deref())?;
         Ok(Tab {
             id,
             term,
@@ -814,6 +951,7 @@ impl Tab {
             unseen: None,
             saved: TabState::default(),
             job,
+            log,
         })
     }
 }
@@ -883,6 +1021,9 @@ struct TermWindow {
     followed: Vec<String>,
     /// The rerun-diff tooltip showing, if any.
     tooltip: Option<String>,
+    /// Rewind: the earlier screen being shown instead of the live one.
+    rewound: Option<Rewound>,
+    rewind_badge: Option<RewindBadge>,
     glass_tint: f32,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
@@ -958,10 +1099,19 @@ impl TermWindow {
                     _ => decor.strip = Some(Strip { tabs, active: self.active }),
                 }
             }
-            self.renderer.draw(&term, self.focused, selection, blink, &decor);
-            let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
-            drop(term);
-            self.update_cursor_layer(overlay);
+            if let Some(rw) = &self.rewound {
+                // An earlier screen: no selection, marks or cursor layer,
+                // since they belong to the live one.
+                drop(term);
+                let decor = Decor { strip: decor.strip, ..Decor::default() };
+                self.renderer.draw(&rw.term, self.focused, None, false, &decor);
+                self.update_cursor_layer(None);
+            } else {
+                self.renderer.draw(&term, self.focused, selection, blink, &decor);
+                let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
+                drop(term);
+                self.update_cursor_layer(overlay);
+            }
         } else {
             // Nothing changed for a few refreshes: stop the display link. The
             // next byte from the shell or key press resumes it.
@@ -1242,6 +1392,7 @@ impl TermWindow {
 
     /// Take up the per-tab state of the tab now in front.
     fn load_live(&mut self) {
+        self.rewind_exit();
         let tab = &mut self.tabs[self.active];
         let s = std::mem::take(&mut tab.saved);
         tab.unseen = None;
@@ -1292,6 +1443,7 @@ impl TermWindow {
             // Every tab, so one brought forward is already the right size.
             for tab in &self.tabs {
                 tab.term.lock().resize(grid.0, grid.1);
+                tab.log.lock().record_resize(grid.0, grid.1);
                 tab.pty.resize(grid.0 as u16, grid.1 as u16);
             }
         }
@@ -1345,6 +1497,15 @@ impl TermWindow {
             // Command shortcuts belong to the menu bar; one that reaches us
             // has no binding.
             return false;
+        }
+        // Rewound: Escape goes back to live; any other key does too, and
+        // then goes to the shell as usual.
+        if self.rewound.is_some() {
+            self.rewind_exit();
+            const ESCAPE: u16 = 53;
+            if event.keyCode() == ESCAPE {
+                return false;
+            }
         }
         // Mid-composition, every key belongs to the input method.
         if !self.preedit.is_empty() {
@@ -1472,6 +1633,16 @@ impl TermWindow {
         if lines == 0 {
             return;
         }
+        // Rewound: the wheel steps through frames instead.
+        if self.rewound.is_some() {
+            for _ in 0..lines.unsigned_abs().min(5) {
+                self.rewind_step(lines > 0);
+                if self.rewound.is_none() {
+                    break;
+                }
+            }
+            return;
+        }
 
         let mode = self.term.lock().mode;
         if mode.intersects(TermMode::ANY_MOUSE) {
@@ -1560,6 +1731,14 @@ impl TermWindow {
     }
 
     fn mouse_down(&mut self, event: &NSEvent, button: MouseButton) {
+        // Rewound: Option-click tells where a cell came from; other clicks
+        // do nothing, since selection belongs to the live screen.
+        if self.rewound.is_some() && self.strip_hit(event).is_none() {
+            if button == MouseButton::Left && event.modifierFlags().contains(NSEventModifierFlags::Option) {
+                self.rewind_provenance(event);
+            }
+            return;
+        }
         // The tab strip: click a tab to show it, middle-click to close it.
         if let Some(i) = self.strip_hit(event) {
             match button {
@@ -1635,6 +1814,111 @@ impl TermWindow {
                 self.selection = None;
                 self.request_redraw();
             }
+        }
+    }
+
+    /// ⌘[ and ⌘]: show the screen one frame earlier or later. Stepping
+    /// forward past the newest frame goes back to live.
+    fn rewind_step(&mut self, back: bool) {
+        let log = Arc::clone(&self.tabs[self.active].log);
+        let log = log.lock();
+        let frames = log.frames();
+        if frames.len() < 2 {
+            objc2_app_kit::NSBeep();
+            return;
+        }
+        let live = frames.len() - 1;
+        let index = match (&self.rewound, back) {
+            (None, true) => live - 1,
+            (None, false) => return,
+            (Some(rw), true) => rw.index.saturating_sub(1),
+            (Some(rw), false) if rw.index + 1 >= live => {
+                drop(log);
+                self.rewind_exit();
+                return;
+            }
+            (Some(rw), false) => rw.index + 1,
+        };
+        drop(log);
+        self.rewind_to(index);
+    }
+
+    /// Show frame `index`, from ⌘[ / ⌘], the slider or the wheel.
+    fn rewind_to(&mut self, index: usize) {
+        let log = Arc::clone(&self.tabs[self.active].log);
+        let log = log.lock();
+        let frames = log.frames();
+        let Some(&(seq, at)) = frames.get(index) else {
+            return;
+        };
+        if self.rewound.as_ref().is_some_and(|rw| rw.seq == seq) {
+            return;
+        }
+        let Some(term) = log.replay(seq) else {
+            return;
+        };
+        drop(log);
+        self.rewound = Some(Rewound { term, seq, index, frames: frames.len(), at, note: None });
+        self.show_rewind_badge();
+        self.request_redraw();
+    }
+
+    /// Option-click on a rewound screen: which output last wrote that cell.
+    fn rewind_provenance(&mut self, event: &NSEvent) {
+        let (_, (x, y)) = self.cell_at(event);
+        let Some(rw) = &self.rewound else { return };
+        let ch = rw.term.grid().row(y).cells().get(x).and_then(|c| c.scalar()).unwrap_or(' ');
+        let log = Arc::clone(&self.tabs[self.active].log);
+        let found = log.lock().provenance(rw.seq, x, y);
+        let note = match found {
+            Some(p) => {
+                let before = rw.at.saturating_duration_since(p.time).as_secs_f64();
+                let how = if p.scrolled { "scrolled here by" } else { "written by" };
+                // The context last, so a long one is what gets cut short.
+                format!(
+                    "‘{ch}’ column {}, row {} · byte {} · {before:.1} s before this frame · {how} {}",
+                    x + 1,
+                    y + 1,
+                    group_digits(p.offset),
+                    p.context
+                )
+            }
+            None => format!("‘{ch}’ at column {}, row {}: not changed in the output kept", x + 1, y + 1),
+        };
+        if let Some(rw) = &mut self.rewound {
+            rw.note = Some(note);
+        }
+        self.show_rewind_badge();
+    }
+
+    fn rewind_exit(&mut self) {
+        if self.rewound.take().is_some() {
+            if let Some(b) = &self.rewind_badge {
+                b.glass.setHidden(true);
+            }
+            self.cursor_shown = None;
+            self.request_redraw();
+        }
+    }
+
+    fn show_rewind_badge(&mut self) {
+        let Some(rw) = &self.rewound else { return };
+        let ago = rw.at.elapsed().as_secs();
+        let when = match ago {
+            0 => "just now".to_string(),
+            s if s < 120 => format!("{s} s ago"),
+            s if s < 7200 => format!("{} min ago", s / 60),
+            s => format!("{} h ago", s / 3600),
+        };
+        let text = format!("Rewind · {when} · {} of {}", rw.index + 1, rw.frames);
+        let (index, frames, note) = (rw.index, rw.frames, rw.note.clone());
+        if self.rewind_badge.is_none() {
+            if let Some(mtm) = MainThreadMarker::new() {
+                self.rewind_badge = RewindBadge::new(mtm, &self.view);
+            }
+        }
+        if let Some(b) = &self.rewind_badge {
+            b.show(&text, index, frames, note.as_deref(), self.view.bounds().size);
         }
     }
 
@@ -2109,6 +2393,8 @@ impl App {
             glass_tint: cfg.window.glass_tint,
             followed: Vec::new(),
             tooltip: None,
+            rewound: None,
+            rewind_badge: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -2318,6 +2604,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // Up and down arrows: the function-key codepoints AppKit uses for them.
     item(&view, "Previous Command", sel!(tachyonPreviousCommand:), "\u{F700}");
     item(&view, "Next Command", sel!(tachyonNextCommand:), "\u{F701}");
+    view.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&view, "Rewind", sel!(tachyonRewindBack:), "[");
+    item(&view, "Forward", sel!(tachyonRewindForward:), "]");
     submenu(&main, &view);
 
     let window = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Window"));
@@ -2341,7 +2630,7 @@ fn start_session(
     rows: usize,
     wake_pending: Arc<AtomicBool>,
     run: Option<&str>,
-) -> Result<(Arc<Mutex<Term>>, Arc<Pty>), String> {
+) -> Result<(Arc<Mutex<Term>>, Arc<Pty>, Arc<Mutex<RewindLog>>), String> {
     let (program, login) = if cfg.shell.program.is_empty() {
         (pty::default_shell(), true)
     } else {
@@ -2369,6 +2658,11 @@ fn start_session(
         let _ = pty.write(format!("{cmd}\r").as_bytes());
     }
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));
+    let log = Arc::new(Mutex::new(RewindLog::new(
+        term.lock().rewind_snapshot(),
+        rewind_root().map(|r| r.join(format!("{}-{id}", std::process::id()))),
+    )));
+    let reader_log = Arc::clone(&log);
 
     let reader_term = Arc::clone(&term);
     let reader_pty = Arc::clone(&pty);
@@ -2416,6 +2710,15 @@ fn start_session(
                 let (replies, events, running, cmdline) = {
                     let mut t = reader_term.lock();
                     processor.advance(&mut t, &buf[..n]);
+                    {
+                        // Rewind keeps the raw output, and every few MB a
+                        // copy of the screen to replay it onto.
+                        let mut log = reader_log.lock();
+                        log.record(&buf[..n]);
+                        if log.wants_snapshot() && processor.is_ground() {
+                            log.snapshot(t.rewind_snapshot());
+                        }
+                    }
                     let cmdline = t.running_cmdline().map(str::to_string);
                     (t.take_replies(), t.take_command_events(), t.command_running(), cmdline)
                 };
@@ -2516,7 +2819,14 @@ fn start_session(
         })
         .map_err(|e| format!("could not start the reader thread: {e}"))?;
 
-    Ok((term, pty))
+    Ok((term, pty, log))
+}
+
+/// Where Rewind keeps older output, compressed: in the user's caches, one
+/// private folder per tab, removed when the tab closes.
+fn rewind_root() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join("Library/Caches/Tachyon/Rewind"))
 }
 
 /// Where the shell-integration scripts live: inside the app bundle, or the
@@ -2558,6 +2868,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     NOTIFIER.with(|n| *n.borrow_mut() = notify::Notifier::new(mtm));
+    // Rewind folders left by a Tachyon that crashed.
+    if let Some(root) = rewind_root() {
+        crate::term::rewind::remove_stale(&root);
+    }
     let gpu = Gpu::new()?;
     APP.with(|cell| {
         *cell.borrow_mut() = Some(App {
