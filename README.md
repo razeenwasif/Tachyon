@@ -313,17 +313,30 @@ terminal wrapped is searched as one line, so a match can cross the wrap. A
 search over a full 100,000-line scrollback takes 12–18 ms, most of it reading
 lines straight from their packed bytes.
 
-**Inline images.** Programs can show pictures in the terminal, through either
-of the two protocols tools use: iTerm2's (OSC 1337 `File=`, what `imgcat` and
-many plotting backends send, multipart transfers included) and kitty's
-graphics protocol (APC `G`: PNG or raw RGB/RGBA pixels, chunked, sent with an
-id and shown again or deleted later, with its `OK` replies). An image sits on
-the lines it was printed on and scrolls with them, into the scrollback and
-back, and goes when they do; `clear` removes it. Images wider than the
-terminal are scaled down to fit, keeping their shape. Tachyon reports a cell's
-size in pixels (`CSI 16 t`, `CSI 14 t`, and the PTY's pixel size), which is
-how tools size what they send. ImageIO decodes them at the size they show at,
-and each draws as one textured quad under the text.
+**Inline images.** Programs can show pictures in the terminal, through any
+of the three protocols tools use: iTerm2's (OSC 1337 `File=`, what `imgcat` and
+many plotting backends send, multipart transfers included), kitty's graphics
+protocol (APC `G`: PNG or raw RGB/RGBA pixels, chunked, sent with an id and
+shown again or deleted later, with its `OK` replies), and sixel (DCS `q`,
+what `img2sixel`, `chafa` and tmux send). An image sits on the lines it was
+printed on and scrolls with them, into the scrollback and back, and goes when
+they do; `clear` removes it. Text written or erased over an iTerm2 or sixel
+image replaces it, as in those terminals; a kitty image is a layer under the
+text, removed by its own delete commands or when a row it's on is erased whole.
+Images wider than the terminal are scaled down to fit, keeping their shape.
+Tachyon reports a cell's size in pixels (`CSI 16 t`, `CSI 14 t`, the PTY's
+pixel size, and XTSMGRAPHICS), which is how tools size what they send. ImageIO
+decodes them at the size they show at, and each draws as one textured quad
+under the text. `python3 scripts/image-test.py` shows one of each.
+
+**Images in tmux.** tmux 3.4 and later (Homebrew's is built with sixel) keeps
+sixel images itself and passes them on, because Tachyon's device attributes
+say it reads sixel: they scroll with tmux's panes and come back when you
+switch windows. Detach and attach again after updating Tachyon, so tmux asks
+afresh. kitty and iTerm2 images reach Tachyon only through tmux's passthrough
+(`set -g allow-passthrough on`), wrapped by the program; tmux doesn't know
+they're there, so they last until it repaints (switching windows, for one),
+as in kitty and iTerm2 themselves. In tmux, prefer a tool's sixel output.
 
 **Suggestions.** As you type at a prompt, Tachyon shows in grey the rest of a
 command you've run before; → or End (or ⌃F) types it in for you, ⌥→ one word

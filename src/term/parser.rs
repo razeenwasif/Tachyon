@@ -60,7 +60,8 @@ pub struct Processor {
     in_ground: bool,
     /// The last byte given to vte was ESC.
     after_esc: bool,
-    /// Inside an OSC string, which can go to vte in bulk up to its end.
+    /// Inside an OSC or DCS string, which can go to vte in bulk up to its
+    /// end: an image is megabytes of one.
     in_osc: bool,
     /// Inside an APC string (`ESC _ ... ESC \`), which vte ignores: kitty's
     /// graphics protocol. Collected here and given to the terminal whole.
@@ -141,8 +142,7 @@ impl Processor {
                 continue;
             }
             if self.in_osc {
-                // The string's body, up to whatever might end it, in one go:
-                // an image sent with OSC 1337 is megabytes of it.
+                // The string's body, up to whatever might end it, in one go.
                 let n = bytes.iter().position(|&b| matches!(b, 0x07 | 0x1B | 0x18 | 0x1A)).unwrap_or(bytes.len());
                 if n > 0 {
                     self.parser.advance(term, &bytes[..n]);
@@ -158,7 +158,7 @@ impl Processor {
             if self.after_esc && b == b'_' {
                 self.apc = Some(Vec::new());
                 self.apc_overflow = false;
-            } else if self.after_esc && b == b']' {
+            } else if self.after_esc && (b == b']' || b == b'P') {
                 self.in_osc = true;
             }
             self.after_esc = b == 0x1B;
