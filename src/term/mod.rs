@@ -249,6 +249,9 @@ pub struct Term {
     /// runs, or the next one to start, if asked.
     awake_cmd: Option<u32>,
     awake_next: bool,
+
+    /// Reused by `write_bulk_lines`.
+    bulk_scratch: Vec<(usize, usize)>,
 }
 
 impl Term {
@@ -289,6 +292,7 @@ impl Term {
             restoring: false,
             awake_cmd: None,
             awake_next: false,
+            bulk_scratch: Vec::new(),
         }
     }
 
@@ -421,6 +425,7 @@ impl Term {
             restoring: false,
             awake_cmd: None,
             awake_next: false,
+            bulk_scratch: Vec::new(),
         }
     }
 
@@ -939,6 +944,100 @@ impl Term {
                 self.cursor.x = x + take;
             }
         }
+    }
+
+    /// A flood of plain lines, written in bulk. When the cursor is at the
+    /// start of a blank bottom line with the whole screen scrolling, and
+    /// `bytes` starts with at least a screenful of lines of printable ASCII
+    /// that each fit and end in CR LF, the lines that would scroll straight
+    /// through go to the scrollback packed from their bytes, and only the
+    /// last screenful is written as cells; fewer lines are written as usual.
+    /// The result is exactly what writing them one by one gives. Returns the
+    /// bytes consumed, or `Err` when nothing could be taken.
+    #[inline(never)]
+    pub fn write_bulk_lines(&mut self, bytes: &[u8]) -> Result<usize, usize> {
+        let (rows, cols) = (self.rows(), self.cols());
+        let pen = self.cursor.pen;
+        if rows < 2
+            || self.cursor.x != 0
+            || self.cursor.wrap_pending
+            || self.cursor.y != rows - 1
+            || self.scroll_top != 0
+            || self.scroll_bot != rows - 1
+            || !self.mode.contains(TermMode::AUTOWRAP)
+            || self.mode.contains(TermMode::INSERT)
+            || !self.charset_is_ascii()
+            || Cell::blank(&pen) != Cell::EMPTY
+        {
+            return Err(0);
+        }
+        // The lines, as (start, end) within `bytes`, in a buffer kept between
+        // calls so looking costs no allocation.
+        let mut lines = std::mem::take(&mut self.bulk_scratch);
+        lines.clear();
+        let result = self.bulk_lines_in(bytes, &mut lines, cols, rows, pen);
+        self.bulk_scratch = lines;
+        result
+    }
+
+    fn bulk_lines_in(&mut self, bytes: &[u8], lines: &mut Vec<(usize, usize)>, cols: usize, rows: usize, pen: Pen) -> Result<usize, usize> {
+        let mut pos = 0;
+        loop {
+            let n = parser::scan_printable_ascii(&bytes[pos..]);
+            if n > cols || bytes.get(pos + n..pos + n + 2) != Some(b"\r\n") {
+                break;
+            }
+            lines.push((pos, pos + n));
+            pos += n + 2;
+        }
+        if lines.len() < rows || !self.grid.row_is_blank(rows - 1) {
+            if lines.is_empty() {
+                return Err(pos);
+            }
+            // Fewer than a screenful: write them as usual, without scanning
+            // them a second time.
+            for &(a, b) in lines.iter() {
+                self.write_ascii_run(&bytes[a..b]);
+                self.execute(b'\r');
+                self.execute(b'\n');
+            }
+            return Ok(pos);
+        }
+        self.dirty = true;
+        self.grid.scroll_to_bottom();
+        let style = Cell { ch: 0, fg: pen.fg, bg: pen.bg, flags: pen.flags, underline: pen.underline };
+        // The screen's lines above the cursor scroll off as they would; the
+        // blank bottom line moves to the top, keeping its mark for the first
+        // new line, which is written on it.
+        let mark = self.grid.row(rows - 1).mark;
+        self.grid.scroll_up(0, rows - 1, rows - 1, &pen);
+        // The new lines that would scroll off too, straight to history.
+        let shown = lines.len() - (rows - 1);
+        for (k, &(a, b)) in lines[..shown].iter().enumerate() {
+            let m = if k == 0 { mark } else { RowMark::default() };
+            self.grid.push_history_ascii(&bytes[a..b], &style, m);
+        }
+        // The last screenful, as cells, with the cursor below it.
+        for (y, &(a, b)) in lines[shown..].iter().enumerate() {
+            let row = self.grid.row_mut(y);
+            row.mark = RowMark::default();
+            row.wrapped = false;
+            row.dirty = true;
+            let cells = row.cells_mut();
+            for (i, &ch) in bytes[a..b].iter().enumerate() {
+                cells[i] = Cell { ch: ch as u32, ..style };
+            }
+        }
+        self.cursor.x = 0;
+        self.cursor.y = rows - 1;
+        Ok(pos)
+    }
+
+    /// The cursor is where a flood of lines would start: the beginning of
+    /// the bottom line. Cheap enough to ask after every escape sequence.
+    #[inline]
+    pub fn at_line_start_at_bottom(&self) -> bool {
+        self.cursor.x == 0 && !self.cursor.wrap_pending && self.cursor.y + 1 == self.rows()
     }
 
     /// Handle a C0 control byte that does not change the parser state.
@@ -1933,6 +2032,67 @@ fn parse_file_url(url: &[u8]) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::*;
+
+    /// Everything a terminal holds that output can change.
+    fn state(t: &Term) -> (Vec<(Vec<Cell>, bool, RowMark)>, usize, usize, usize) {
+        let g = t.grid();
+        let lines = (0..g.total_lines()).map(|l| (g.line(l).cells().to_vec(), g.line(l).wrapped, g.line(l).mark)).collect();
+        (lines, g.history_len(), t.cursor.x, t.cursor.y)
+    }
+
+    /// Fed in big chunks (the bulk path) and in 16-byte ones (never), the
+    /// same stream must leave the same terminal.
+    fn same_both_ways(cols: usize, rows: usize, scrollback: usize, data: &[u8]) {
+        let mut bulk = Term::new(cols, rows, scrollback);
+        let mut p = Processor::new();
+        for c in data.chunks(64 * 1024) {
+            p.advance(&mut bulk, c);
+        }
+        let mut each = Term::new(cols, rows, scrollback);
+        let mut p = Processor::new();
+        for c in data.chunks(16) {
+            p.advance(&mut each, c);
+        }
+        assert!(state(&bulk) == state(&each), "bulk and one-by-one differ ({cols}x{rows}, {scrollback} lines kept)");
+    }
+
+    fn lines(n: usize, width: impl Fn(usize) -> usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 0..n {
+            out.extend((0..width(i)).map(|k| b'!' + ((i * 7 + k) % 90) as u8));
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    #[test]
+    fn a_flood_of_lines_lands_the_same() {
+        same_both_ways(20, 10, 100, &lines(500, |i| i % 21));
+        // Scrollback full: the oldest lines go, in both.
+        same_both_ways(20, 10, 30, &lines(500, |i| (i * 3) % 21));
+        // Exactly a screenful, and one short of it.
+        same_both_ways(20, 10, 100, &lines(10, |_| 20));
+        same_both_ways(20, 10, 100, &lines(9, |_| 5));
+    }
+
+    #[test]
+    fn what_came_before_and_between_is_kept() {
+        let mut data = b"\x1b[1;31mred prompt\x1b[0m $ \r\n\x1b]133;C\x07".to_vec();
+        data.extend(lines(200, |i| i % 25));
+        data.extend_from_slice(b"\ttab\x1b[42mgreen\r\n");
+        data.extend(lines(200, |i| 30 - i % 7));
+        data.extend_from_slice(b"\x1b[0mwide \xe6\x97\xa5\r\nno newline at the end");
+        same_both_ways(25, 12, 1000, &data);
+        // A coloured background stays on the careful path.
+        let mut bg = b"\x1b[44m".to_vec();
+        bg.extend(lines(100, |_| 8));
+        same_both_ways(20, 10, 100, &bg);
+    }
 }
 
 #[cfg(test)]

@@ -40,6 +40,15 @@ use vte::Parser;
 
 use super::Term;
 
+/// Whether floods of plain lines take the bulk path. Only benchmarks turn it
+/// off, to compare.
+static BULK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn the bulk path for floods of plain lines on or off (for benchmarks).
+pub fn set_bulk_lines(on: bool) {
+    BULK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Drives a [`Term`] from a raw byte stream.
 pub struct Processor {
     parser: Parser,
@@ -69,8 +78,23 @@ impl Processor {
 
     /// Feed a chunk of PTY output.
     pub fn advance(&mut self, term: &mut Term, mut bytes: &[u8]) {
+        // How far into `bytes` the last bulk attempt saw plain lines: no
+        // point looking again before there.
+        let total = bytes.len();
+        let mut bulk_after = if BULK.load(std::sync::atomic::Ordering::Relaxed) { 0 } else { usize::MAX };
         while !bytes.is_empty() {
             if self.in_ground {
+                // A flood of plain lines: most never reach the screen.
+                let at = total - bytes.len();
+                if at >= bulk_after && term.at_line_start_at_bottom() && bytes.len() >= 2 * term.rows() {
+                    match term.write_bulk_lines(bytes) {
+                        Ok(n) => {
+                            bytes = &bytes[n..];
+                            continue;
+                        }
+                        Err(reached) => bulk_after = at + reached.max(1),
+                    }
+                }
                 // Bulk-consume printable ASCII.
                 let n = scan_printable_ascii(bytes);
                 if n > 0 {
