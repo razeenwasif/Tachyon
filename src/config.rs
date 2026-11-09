@@ -27,6 +27,19 @@ pub enum Backdrop {
     /// A plain gaussian blur of what is behind, without acrylic's noise and
     /// tint. Cheaper, and it holds up better on older machines.
     Blur,
+    /// macOS: Liquid Glass (NSGlassEffectView, macOS 26 and later; a blurred
+    /// NSVisualEffectView before). Elsewhere it means Acrylic.
+    Glass,
+}
+
+/// Which palette a window uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Appearance {
+    /// Follow the system: the light theme in Light Mode, the dark one in Dark.
+    #[default]
+    Auto,
+    Dark,
+    Light,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -97,7 +110,9 @@ impl Default for WindowConfig {
             padding_x: 8.0,
             padding_y: 6.0,
             opacity: 1.0,
-            backdrop: Backdrop::None,
+            // Glass behind the text is the Mac look; Windows keeps v0.1's
+            // opaque default.
+            backdrop: if cfg!(target_os = "macos") { Backdrop::Glass } else { Backdrop::None },
             opacity_explicit: false,
         }
     }
@@ -138,6 +153,12 @@ pub struct ThemeConfig {
     pub ansi: [Option<[u8; 3]>; 16],
     /// Render SGR-bold text with the bright palette variant.
     pub bold_is_bright: bool,
+    /// macOS: take the cursor colour from the system accent colour
+    /// (`theme.cursor = accent`).
+    pub cursor_accent: bool,
+    /// macOS: tint the selection with the system accent colour
+    /// (`theme.selection_bg = accent`).
+    pub selection_accent: bool,
 }
 
 impl Default for ThemeConfig {
@@ -151,7 +172,93 @@ impl Default for ThemeConfig {
             selection_fg: None,
             ansi: [None; 16],
             bold_is_bright: false,
+            cursor_accent: false,
+            selection_accent: false,
         }
+    }
+}
+
+impl ThemeConfig {
+    /// The light theme: near-white paper, and ANSI colours darkened until
+    /// they read on it (the default ANSI set is tuned for dark backgrounds).
+    /// The colours sit close to Apple's light-mode system colours.
+    pub fn light() -> ThemeConfig {
+        let ansi: [[u8; 3]; 16] = [
+            [0x1D, 0x1F, 0x24], // black
+            [0xC4, 0x30, 0x2B], // red
+            [0x2D, 0x7D, 0x46], // green
+            [0x9C, 0x65, 0x00], // yellow
+            [0x0A, 0x60, 0xD0], // blue
+            [0x89, 0x44, 0xC7], // magenta
+            [0x0E, 0x7C, 0x86], // cyan
+            [0x6E, 0x72, 0x7A], // white: a grey, since white on white vanishes
+            [0x5A, 0x5E, 0x66], // bright black
+            [0xD7, 0x3A, 0x34], // bright red
+            [0x24, 0x8A, 0x3D], // bright green
+            [0xB2, 0x70, 0x00], // bright yellow
+            [0x00, 0x71, 0xE3], // bright blue
+            [0x9B, 0x4F, 0xD9], // bright magenta
+            [0x0B, 0x8A, 0x96], // bright cyan
+            [0x3A, 0x3D, 0x44], // bright white
+        ];
+        ThemeConfig {
+            background: [0xFA, 0xFA, 0xFB],
+            foreground: [0x1D, 0x1F, 0x24],
+            cursor: [0x0B, 0x7A, 0x5C],
+            cursor_text: [0xFA, 0xFA, 0xFB],
+            selection_bg: [0xC9, 0xDD, 0xF8],
+            selection_fg: None,
+            ansi: ansi.map(Some),
+            bold_is_bright: false,
+            cursor_accent: false,
+            selection_accent: false,
+        }
+    }
+
+    /// Apply one `theme.*` key (without the `theme.` or `theme.light.`
+    /// prefix). Returns false for a key this doesn't know.
+    fn set(&mut self, key: &str, value: &str) -> Result<bool, String> {
+        match key {
+            "background" => self.background = parse_hex(value)?,
+            "foreground" => self.foreground = parse_hex(value)?,
+            "cursor" if value.eq_ignore_ascii_case("accent") => self.cursor_accent = true,
+            "cursor" => {
+                self.cursor = parse_hex(value)?;
+                self.cursor_accent = false;
+            }
+            "cursor_text" => self.cursor_text = parse_hex(value)?,
+            "selection_bg" if value.eq_ignore_ascii_case("accent") => self.selection_accent = true,
+            "selection_bg" => {
+                self.selection_bg = parse_hex(value)?;
+                self.selection_accent = false;
+            }
+            "selection_fg" => self.selection_fg = Some(parse_hex(value)?),
+            "bold_is_bright" => self.bold_is_bright = parse_bool(value)?,
+            _ => {
+                // ansi0 .. ansi15
+                let Some(rest) = key.strip_prefix("ansi") else {
+                    return Ok(false);
+                };
+                let idx: usize = rest.parse().map_err(|_| format!("bad palette index in `{key}`"))?;
+                if idx >= 16 {
+                    return Err(format!("palette index {idx} out of range (0-15)"));
+                }
+                self.ansi[idx] = Some(parse_hex(value)?);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The runtime palette: the default 256 colours with this theme's ANSI
+    /// overrides.
+    pub fn palette(&self) -> Palette {
+        let mut p = Palette::new();
+        for (i, over) in self.ansi.iter().enumerate() {
+            if let Some(rgb) = over {
+                p.0[i] = *rgb;
+            }
+        }
+        p
     }
 }
 
@@ -206,7 +313,11 @@ pub struct Config {
     pub font: FontConfig,
     pub window: WindowConfig,
     pub render: RenderConfig,
+    /// The dark theme, or the only one on Windows.
     pub theme: ThemeConfig,
+    /// macOS: the theme used in Light Mode when `appearance` is Auto.
+    pub theme_light: ThemeConfig,
+    pub appearance: Appearance,
     pub shell: ShellConfig,
     pub macos: MacConfig,
     pub scrollback: usize,
@@ -221,6 +332,8 @@ impl Default for Config {
             window: WindowConfig::default(),
             render: RenderConfig::default(),
             theme: ThemeConfig::default(),
+            theme_light: ThemeConfig::light(),
+            appearance: Appearance::default(),
             shell: ShellConfig::default(),
             macos: MacConfig::default(),
             scrollback: 10_000,
@@ -347,7 +460,8 @@ impl Config {
             "window.backdrop" => {
                 self.window.backdrop = match value {
                     "none" | "off" => Backdrop::None,
-                    "acrylic" | "glass" => Backdrop::Acrylic,
+                    "glass" | "liquid_glass" => Backdrop::Glass,
+                    "acrylic" => Backdrop::Acrylic,
                     "blur" => Backdrop::Blur,
                     "mica" => Backdrop::Mica,
                     "tabbed" => Backdrop::Tabbed,
@@ -368,13 +482,14 @@ impl Config {
                 self.render.sync_timeout_ms = parse_usize(value, 0, 5000)? as u64
             }
 
-            "theme.background" => self.theme.background = parse_hex(value)?,
-            "theme.foreground" => self.theme.foreground = parse_hex(value)?,
-            "theme.cursor" => self.theme.cursor = parse_hex(value)?,
-            "theme.cursor_text" => self.theme.cursor_text = parse_hex(value)?,
-            "theme.selection_bg" => self.theme.selection_bg = parse_hex(value)?,
-            "theme.selection_fg" => self.theme.selection_fg = Some(parse_hex(value)?),
-            "theme.bold_is_bright" => self.theme.bold_is_bright = parse_bool(value)?,
+            "theme.appearance" => {
+                self.appearance = match value.to_ascii_lowercase().as_str() {
+                    "auto" | "system" => Appearance::Auto,
+                    "dark" => Appearance::Dark,
+                    "light" => Appearance::Light,
+                    _ => return Err(format!("theme.appearance: expected auto, dark or light, got `{value}`")),
+                }
+            }
 
             "shell.program" => self.shell.program = value.to_string(),
             "shell.integration" => self.shell.integration = parse_bool(value)?,
@@ -388,16 +503,20 @@ impl Config {
             "scrollback" => self.scrollback = parse_usize(value, 0, 5_000_000)?,
 
             _ => {
-                // theme.ansi0 .. theme.ansi15
-                if let Some(rest) = key.strip_prefix("theme.ansi") {
-                    let idx: usize = rest
-                        .parse()
-                        .map_err(|_| format!("bad palette index in `{key}`"))?;
-                    if idx >= 16 {
-                        return Err(format!("palette index {idx} out of range (0-15)"));
+                // theme.light.* sets the light theme; other theme.* the dark.
+                let known = if let Some(rest) = key.strip_prefix("theme.light.") {
+                    self.theme_light.set(rest, value)?
+                } else if let Some(rest) = key.strip_prefix("theme.") {
+                    // The accent colour isn't light or dark, so `accent` for
+                    // the cursor or selection applies to both themes.
+                    if value.eq_ignore_ascii_case("accent") {
+                        self.theme_light.set(rest, value)?;
                     }
-                    self.theme.ansi[idx] = Some(parse_hex(value)?);
+                    self.theme.set(rest, value)?
                 } else {
+                    false
+                };
+                if !known {
                     return Err(format!("unknown key `{key}`"));
                 }
             }
@@ -407,13 +526,7 @@ impl Config {
 
     /// Build the runtime palette, applying any `theme.ansiN` overrides.
     pub fn palette(&self) -> Palette {
-        let mut p = Palette::new();
-        for (i, over) in self.theme.ansi.iter().enumerate() {
-            if let Some(rgb) = over {
-                p.0[i] = *rgb;
-            }
-        }
-        p
+        self.theme.palette()
     }
 }
 
@@ -489,6 +602,33 @@ fn parse_hex(v: &str) -> Result<[u8; 3], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_theme_keys_and_accent() {
+        let c = Config::parse(
+            "theme.appearance = auto\ntheme.light.background = #FFFFFF\ntheme.background = #000000\ntheme.cursor = accent\n",
+        );
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert_eq!(c.appearance, Appearance::Auto);
+        assert_eq!(c.theme_light.background, [0xFF; 3]);
+        assert_eq!(c.theme.background, [0; 3]);
+        // accent goes to both themes; other keys only to their own.
+        assert!(c.theme.cursor_accent && c.theme_light.cursor_accent);
+        assert!(!c.theme.selection_accent);
+        assert_eq!(c.theme_light.ansi[3], Some([0x9C, 0x65, 0x00]), "the light theme's own yellow");
+    }
+
+    #[test]
+    fn glass_is_the_mac_default() {
+        let c = Config::parse("");
+        if cfg!(target_os = "macos") {
+            assert_eq!(c.window.backdrop, Backdrop::Glass);
+            assert!(c.window.opacity < 1.0);
+        }
+        let opaque = Config::parse("window.backdrop = none\n");
+        assert_eq!(opaque.window.backdrop, Backdrop::None);
+        assert_eq!(opaque.window.opacity, 1.0);
+    }
 
     #[test]
     fn option_as_meta_accepts_sides() {

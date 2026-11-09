@@ -42,22 +42,27 @@ window.rows      = 32
 window.padding_x = 8.0
 window.padding_y = 6.0
 
-# Frosted glass. The compositor draws a backdrop behind the window and the
-# translucent terminal background lets it through.
+# What's behind the terminal's background.
 #
+#   glass    macOS: Liquid Glass behind the text (the Mac default). Text, the
+#            cursor, the selection and colours a program sets stay solid; only
+#            the default background lets the glass through. With Reduce
+#            Transparency on in System Settings, the window is opaque.
+#   none     opaque (the Windows default)
+#
+#   Windows only:
 #   acrylic  live blur of the windows behind this one -- "frosted glass"
 #   blur     the same, without acrylic's noise and tint (cheaper)
 #   mica     tinted from the desktop wallpaper; calm, and it does not shimmer
 #   tabbed   mica's slightly more opaque variant
-#   none     opaque (default)
 #
-# Setting any backdrop switches antialiasing to grayscale, because subpixel
+# On Windows, a backdrop switches antialiasing to grayscale, because subpixel
 # coverage cannot be blended correctly against a background the compositor
 # chooses after we have drawn.
-# window.backdrop = acrylic
+# window.backdrop = glass
 
-# How opaque the terminal background is. Only meaningful with a backdrop.
-# Defaults to 0.82 when a backdrop is set, 1.0 otherwise. Text is always fully
+# How opaque the default background is over the backdrop. Defaults to 0.82
+# with a backdrop, 1.0 without. Lower shows more glass. Text is always fully
 # opaque regardless.
 # window.opacity = 0.82
 
@@ -82,12 +87,24 @@ render.sync_timeout_ms = 150
 # Theme
 # ---------------------------------------------------------------------------
 
+# macOS: which theme to use. auto follows Light and Dark Mode, switching as the
+# system does; dark and light fix one.
+# theme.appearance = auto
+
+# The dark theme (and the only one on Windows). On macOS, the light theme has
+# its own keys, theme.light.background, theme.light.ansi1 and so on, with
+# built-in defaults: near-white paper and ANSI colours dark enough to read on it.
 theme.background     = #0B0E14
 theme.foreground     = #C4CBD8
 theme.cursor         = #7DF9C4
 theme.cursor_text    = #0B0E14
 theme.selection_bg   = #2A3A52
 # theme.selection_fg = #FFFFFF
+
+# macOS: `accent` takes the cursor colour, or tints the selection, from the
+# system accent colour in System Settings > Appearance, in both themes.
+# theme.cursor       = accent
+# theme.selection_bg = accent
 
 # Render SGR-bold text with the bright palette variant of its colour.
 theme.bold_is_bright = false

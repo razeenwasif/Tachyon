@@ -40,7 +40,9 @@ use objc2_app_kit::{
     NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuItem, NSPasteboard,
     NSPasteboardTypeString, NSRequestUserAttentionType, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
     NSTextInputClient, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask,
-    NSWindowTitleVisibility, NSWorkspace,
+    NSWindowTitleVisibility, NSWorkspace, NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua,
+    NSAppearanceNameDarkAqua, NSAutoresizingMaskOptions, NSColorSpace, NSGlassEffectView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
 };
 use objc2_quick_look_ui::{QLPreviewPanel, QLPreviewPanelDataSource};
 use objc2_foundation::{
@@ -58,7 +60,7 @@ use objc2_quartz_core::{
 };
 use parking_lot::Mutex;
 
-use crate::config::{Config, OptionAsMeta};
+use crate::config::{Appearance, Backdrop, Config, OptionAsMeta, ThemeConfig};
 use crate::term::{CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
 use rustc_hash::FxHashMap;
 use pty::Pty;
@@ -146,6 +148,30 @@ fn asking_for_password(fd: i32) -> bool {
     ok && t.c_lflag & libc::ECHO == 0 && t.c_lflag & libc::ICANON != 0
 }
 
+/// Whether a view is drawn in Dark Mode.
+fn appearance_is_dark(view: &NSView) -> bool {
+    let (aqua, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
+    let names = NSArray::from_slice(&[aqua, dark]);
+    view.effectiveAppearance()
+        .bestMatchFromAppearancesWithNames(&names)
+        .is_some_and(|n| &*n == dark)
+}
+
+/// The system accent colour (System Settings > Appearance), in sRGB.
+fn accent_color() -> Option<[u8; 3]> {
+    let c = NSColor::controlAccentColor().colorUsingColorSpace(&NSColorSpace::sRGBColorSpace())?;
+    let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Some([byte(c.redComponent()), byte(c.greenComponent()), byte(c.blueComponent())])
+}
+
+fn mix_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
+}
+
+fn srgb_color(c: [u8; 3], alpha: f64) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(c[0] as f64 / 255.0, c[1] as f64 / 255.0, c[2] as f64 / 255.0, alpha)
+}
+
 /// Show `path` in Quick Look, as the Finder does with the space bar.
 fn quick_look(path: std::path::PathBuf) {
     let Some(mtm) = MainThreadMarker::new() else {
@@ -220,7 +246,14 @@ define_class!(
 
         #[unsafe(method(isOpaque))]
         fn is_opaque(&self) -> bool {
-            true
+            // Glass shows through the default background.
+            false
+        }
+
+        /// Light or Dark Mode changed, or the accent colour with it.
+        #[unsafe(method(viewDidChangeEffectiveAppearance))]
+        fn view_did_change_effective_appearance(&self) {
+            with_window(self.id(), TermWindow::apply_appearance);
         }
 
         #[unsafe(method(acceptsFirstResponder))]
@@ -548,7 +581,7 @@ define_class!(
                 || t == NSEventType::LeftMouseDragged
                 || t == NSEventType::LeftMouseUp;
             if left {
-                if let Some(view) = self.contentView() {
+                if let Some(view) = self.terminal_view() {
                     // An inactive window lets AppKit take the click, so it can
                     // activate the window first.
                     if self.isKeyWindow() && self.owns_click(&view, event.locationInWindow()) {
@@ -569,6 +602,20 @@ define_class!(
 impl TachyonWindow {
     /// Margin along the window edges left to AppKit for resizing, in points.
     const RESIZE_MARGIN: f64 = 4.0;
+
+    /// The terminal view: the content view, or inside the glass that hosts it.
+    fn terminal_view(&self) -> Option<Retained<NSView>> {
+        fn find(view: Retained<NSView>, depth: u32) -> Option<Retained<NSView>> {
+            if view.isKindOfClass(<TachyonView as objc2::ClassType>::class()) {
+                return Some(view);
+            }
+            if depth == 0 {
+                return None;
+            }
+            view.subviews().iter().find_map(|v| find(v, depth - 1))
+        }
+        find(self.contentView()?, 3)
+    }
 
     fn owns_click(&self, view: &NSView, p: NSPoint) -> bool {
         let size = view.frame().size;
@@ -797,6 +844,12 @@ struct TermWindow {
     /// Secure Keyboard Entry is on for this window: it's in front and its
     /// tab is asking for a password.
     secure: bool,
+    /// The two themes and which to use; `apply_appearance` picks one.
+    theme_dark: ThemeConfig,
+    theme_light: ThemeConfig,
+    appearance: Appearance,
+    /// Glass is behind the text, so the window itself is clear.
+    glass: bool,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -925,6 +978,33 @@ impl TermWindow {
         if !posted {
             app.requestUserAttention(NSRequestUserAttentionType::InformationalRequest);
         }
+    }
+
+    /// Use the light or dark theme to match the system (or the setting), with
+    /// the system accent colour where the theme asks for it.
+    fn apply_appearance(&mut self) {
+        let dark = match self.appearance {
+            Appearance::Dark => true,
+            Appearance::Light => false,
+            Appearance::Auto => appearance_is_dark(&self.view),
+        };
+        let mut theme = if dark { self.theme_dark.clone() } else { self.theme_light.clone() };
+        if theme.cursor_accent || theme.selection_accent {
+            if let Some(accent) = accent_color() {
+                if theme.cursor_accent {
+                    theme.cursor = accent;
+                }
+                if theme.selection_accent {
+                    theme.selection_bg = mix_rgb(theme.background, accent, 0.4);
+                }
+            }
+        }
+        if !self.glass {
+            self.window.setBackgroundColor(Some(&srgb_color(theme.background, 1.0)));
+        }
+        self.renderer.set_theme(&theme);
+        self.cursor_shown = None;
+        self.request_redraw();
     }
 
     /// Turn Secure Keyboard Entry on while this window is in front and its
@@ -1766,13 +1846,26 @@ impl App {
         // Edge-to-edge: no visible title bar, content runs to the top edge.
         window.setTitlebarAppearsTransparent(true);
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
-        let bg = cfg.theme.background;
-        window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-            bg[0] as f64 / 255.0,
-            bg[1] as f64 / 255.0,
-            bg[2] as f64 / 255.0,
-            1.0,
-        )));
+        // Glass behind the text, unless Reduce Transparency is on, in which
+        // case the window is opaque as macOS asks.
+        let glass = cfg.window.backdrop != Backdrop::None
+            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency();
+        if glass {
+            window.setOpaque(false);
+            window.setBackgroundColor(Some(&NSColor::clearColor()));
+        } else {
+            window.setBackgroundColor(Some(&srgb_color(cfg.theme.background, 1.0)));
+        }
+        // A fixed theme also fixes the window's own appearance, so the glass
+        // and window buttons match it.
+        let fixed = match cfg.appearance {
+            Appearance::Dark => Some(unsafe { NSAppearanceNameDarkAqua }),
+            Appearance::Light => Some(unsafe { NSAppearanceNameAqua }),
+            Appearance::Auto => None,
+        };
+        if let Some(name) = fixed {
+            window.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
+        }
         window.setContentMinSize(NSSize::new(
             (20.0 * probe.width as f64) / scale,
             (4.0 * probe.height as f64) / scale,
@@ -1786,7 +1879,11 @@ impl App {
         let cursor_layer = CALayer::new();
         cursor_layer.setHidden(true);
         layer.addSublayer(&cursor_layer);
-        let renderer = Renderer::new(Rc::clone(&self.gpu), layer, cfg, scale as f32)?;
+        let mut renderer_cfg = cfg.clone();
+        if !glass {
+            renderer_cfg.window.opacity = 1.0;
+        }
+        let renderer = Renderer::new(Rc::clone(&self.gpu), layer, &renderer_cfg, scale as f32)?;
 
         let tracking = unsafe {
             NSTrackingArea::initWithRect_options_owner_userInfo(
@@ -1802,7 +1899,11 @@ impl App {
         };
         view.addTrackingArea(&tracking);
 
-        window.setContentView(Some(&view));
+        if glass {
+            window.setContentView(Some(&glass_host(mtm, &view, content)));
+        } else {
+            window.setContentView(Some(&view));
+        }
         let delegate = WindowDelegate::new(mtm, id);
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         set_titlebar_hidden(&window, true);
@@ -1850,6 +1951,10 @@ impl App {
             base_font_size: cfg.font.size,
             notify_after: (cfg.macos.notify_after_secs > 0).then(|| Duration::from_secs(cfg.macos.notify_after_secs)),
             secure: false,
+            theme_dark: cfg.theme.clone(),
+            theme_light: cfg.theme_light.clone(),
+            appearance: cfg.appearance,
+            glass,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -1896,6 +2001,25 @@ fn close_active_tab(window: u64) {
     }
 }
 
+/// A view that puts `view` on glass: Liquid Glass on macOS 26 and later,
+/// otherwise the blurred window material macOS used before.
+fn glass_host(mtm: MainThreadMarker, view: &TachyonView, size: NSSize) -> Retained<NSView> {
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), size);
+    if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
+        let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
+        glass.setContentView(Some(view));
+        return Retained::into_super(glass);
+    }
+    let blur = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
+    blur.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
+    blur.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    blur.setState(NSVisualEffectState::Active);
+    view.setFrame(frame);
+    view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+    blur.addSubview(view);
+    Retained::into_super(blur)
+}
+
 /// Open a new terminal window and bring it to the front.
 fn open_window() {
     let Some(mtm) = MainThreadMarker::new() else {
@@ -1903,7 +2027,10 @@ fn open_window() {
     };
     match with_app(|app| app.create_window(mtm)) {
         Some(Ok((window, view, id))) => {
-            with_window(id, TermWindow::layout);
+            with_window(id, |w| {
+                w.apply_appearance();
+                w.layout();
+            });
             window.makeKeyAndOrderFront(None);
             window.makeFirstResponder(Some(&view));
             NSApplication::sharedApplication(mtm).activate();
