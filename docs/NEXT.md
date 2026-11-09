@@ -327,7 +327,11 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    only the default background translucent; Reduce Transparency makes it
    opaque. A light theme with its own ANSI set follows Light and Dark Mode
    through viewDidChangeEffectiveAppearance; `accent` for the cursor and
-   selection. Still to do: the Increase Contrast palette.
+   selection. Then a clearer default (0.25 over regular glass, corner radius
+   16 so the rim follows the window) and the tab strip as a floating glass
+   capsule drawn by AppKit, since Liquid Glass shows its refraction at the
+   edges of shapes floating over content. Still to do: the Increase Contrast
+   palette.
    *Tabs done (9 November 2026):* a strip drawn in cells along the bottom
    edge, shown only with two or more tabs. Tabs are named from OSC 7 (the
    folder), the command line the zsh integration reports with OSC 133;C, or a

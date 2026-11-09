@@ -96,6 +96,9 @@ pub struct WindowConfig {
     /// backdrop, since there is otherwise nothing behind us to show through.
     pub opacity: f32,
     pub backdrop: Backdrop,
+    /// macOS: Liquid Glass's `clear` style instead of `regular`: less frosted,
+    /// so more of what's behind shows, and bent more at the edges.
+    pub glass_clear: bool,
     /// Whether the user set `window.opacity` explicitly. Enabling a backdrop
     /// picks a sensible translucency by default, but must not override a value
     /// the user asked for.
@@ -113,6 +116,7 @@ impl Default for WindowConfig {
             // Glass behind the text is the Mac look; Windows keeps v0.1's
             // opaque default.
             backdrop: if cfg!(target_os = "macos") { Backdrop::Glass } else { Backdrop::None },
+            glass_clear: false,
             opacity_explicit: false,
         }
     }
@@ -402,7 +406,13 @@ impl Config {
             // looks like the feature is broken. Pick a translucency that shows
             // it while keeping text readable -- unless the user chose one.
             if !self.window.opacity_explicit {
-                self.window.opacity = 0.82;
+                // Liquid Glass adapts its own tint behind text, so it can show
+                // a lot more of itself than Windows' acrylic can.
+                self.window.opacity = if cfg!(target_os = "macos") && self.window.backdrop == Backdrop::Glass {
+                    0.25
+                } else {
+                    0.82
+                };
             }
             // Subpixel antialiasing needs to know the colour behind each glyph.
             // Over a translucent window that colour is decided by the
@@ -466,6 +476,13 @@ impl Config {
                     "mica" => Backdrop::Mica,
                     "tabbed" => Backdrop::Tabbed,
                     _ => return Err(format!("unknown backdrop `{value}`")),
+                }
+            }
+            "window.glass" => {
+                self.window.glass_clear = match value.to_ascii_lowercase().as_str() {
+                    "regular" => false,
+                    "clear" => true,
+                    _ => return Err(format!("window.glass: expected regular or clear, got `{value}`")),
                 }
             }
             "window.blur" => {

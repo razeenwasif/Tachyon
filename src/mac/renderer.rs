@@ -232,6 +232,9 @@ pub struct Renderer {
     size: (f32, f32),
     /// The window shows a tab strip along its bottom edge.
     strip: bool,
+    /// When the strip is a glass capsule drawn by AppKit, the height of the
+    /// band kept free for it, in pixels; the renderer then draws no strip.
+    strip_band: Option<f32>,
 
     bg: Vec<RectInstance>,
     glyphs: Vec<GlyphInstance>,
@@ -268,6 +271,7 @@ impl Renderer {
             scale,
             size: (1.0, 1.0),
             strip: false,
+            strip_band: None,
             bg: Vec::new(),
             glyphs: Vec::new(),
             overlay: Vec::new(),
@@ -321,13 +325,21 @@ impl Renderer {
         self.strip = on;
     }
 
+    /// Keep `band` pixels free for a strip drawn over the window instead of
+    /// drawing one in cells; `None` draws it in cells.
+    pub fn set_strip_band(&mut self, band: Option<f32>) {
+        self.strip_band = band;
+    }
+
     /// Height of the tab strip in pixels: a row of text with room around it,
     /// enough to aim a click at.
     fn strip_height(&self) -> f32 {
-        if self.strip {
-            (self.fonts.metrics.height * 1.6).round()
-        } else {
+        if !self.strip {
             0.0
+        } else if let Some(band) = self.strip_band {
+            band
+        } else {
+            (self.fonts.metrics.height * 1.6).round()
         }
     }
 
@@ -353,7 +365,7 @@ impl Renderer {
     /// The tab at drawable pixel (`x`, `y`), counted from the top left, if the
     /// point is in the strip.
     pub fn strip_index(&self, x: f32, y: f32, n: usize) -> Option<usize> {
-        if !self.strip || n == 0 || y < self.size.1 - self.strip_height() {
+        if !self.strip || self.strip_band.is_some() || n == 0 || y < self.size.1 - self.strip_height() {
             return None;
         }
         let cols = self.grid_size_for(self.size.0, self.size.1).0;
@@ -712,7 +724,7 @@ impl Renderer {
             self.push_text(text, pad_x + start as f32 * m.width, row_y, dim);
         }
 
-        if let Some(strip) = &decor.strip {
+        if let Some(strip) = decor.strip.as_ref().filter(|_| self.strip_band.is_none()) {
             self.build_strip(strip, cols);
         }
     }
