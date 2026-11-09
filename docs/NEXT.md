@@ -330,7 +330,9 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    selection. Then a clearer default (0.25 over regular glass, corner radius
    16 so the rim follows the window) and the tab strip as a floating glass
    capsule drawn by AppKit, since Liquid Glass shows its refraction at the
-   edges of shapes floating over content. Still to do: the Increase Contrast
+   edges of shapes floating over content. Then the tint moved into the glass
+   (NSGlassEffectView.tintColor, 0.75 of the theme background, clear style)
+   with the Metal background at 0.05: darker and still refracting. Still to do: the Increase Contrast
    palette.
    *Tabs done (9 November 2026):* a strip drawn in cells along the bottom
    edge, shown only with two or more tabs. Tabs are named from OSC 7 (the

@@ -99,6 +99,10 @@ pub struct WindowConfig {
     /// macOS: Liquid Glass's `clear` style instead of `regular`: less frosted,
     /// so more of what's behind shows, and bent more at the edges.
     pub glass_clear: bool,
+    /// macOS: how strongly the glass itself is tinted with the theme's
+    /// background, 0..=1. Unlike `opacity`, which draws the background over
+    /// the glass, the tint colours the glass and keeps its refraction.
+    pub glass_tint: f32,
     /// Whether the user set `window.opacity` explicitly. Enabling a backdrop
     /// picks a sensible translucency by default, but must not override a value
     /// the user asked for.
@@ -116,7 +120,10 @@ impl Default for WindowConfig {
             // Glass behind the text is the Mac look; Windows keeps v0.1's
             // opaque default.
             backdrop: if cfg!(target_os = "macos") { Backdrop::Glass } else { Backdrop::None },
-            glass_clear: false,
+            // On Liquid Glass the tint goes into the glass, which keeps its
+            // refraction; clear glass shows the most of it.
+            glass_clear: cfg!(target_os = "macos"),
+            glass_tint: if cfg!(target_os = "macos") { 0.75 } else { 0.0 },
             opacity_explicit: false,
         }
     }
@@ -406,10 +413,11 @@ impl Config {
             // looks like the feature is broken. Pick a translucency that shows
             // it while keeping text readable -- unless the user chose one.
             if !self.window.opacity_explicit {
-                // Liquid Glass adapts its own tint behind text, so it can show
-                // a lot more of itself than Windows' acrylic can.
+                // On Liquid Glass the glass carries the tint (glass_tint), so
+                // the background drawn over it stays faint: drawing it solid
+                // would flatten the glass's refraction.
                 self.window.opacity = if cfg!(target_os = "macos") && self.window.backdrop == Backdrop::Glass {
-                    0.25
+                    0.05
                 } else {
                     0.82
                 };
@@ -464,7 +472,7 @@ impl Config {
             "window.padding_x" => self.window.padding_x = parse_f32(value, 0.0, 200.0)?,
             "window.padding_y" => self.window.padding_y = parse_f32(value, 0.0, 200.0)?,
             "window.opacity" => {
-                self.window.opacity = parse_f32(value, 0.1, 1.0)?;
+                self.window.opacity = parse_f32(value, 0.0, 1.0)?;
                 self.window.opacity_explicit = true;
             }
             "window.backdrop" => {
@@ -485,6 +493,7 @@ impl Config {
                     _ => return Err(format!("window.glass: expected regular or clear, got `{value}`")),
                 }
             }
+            "window.glass_tint" => self.window.glass_tint = parse_f32(value, 0.0, 1.0)?,
             "window.blur" => {
                 self.window.backdrop = if parse_bool(value)? {
                     Backdrop::Acrylic
@@ -641,7 +650,11 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(c.window.backdrop, Backdrop::Glass);
             assert!(c.window.opacity < 1.0);
+            assert!(c.window.glass_clear && c.window.glass_tint > 0.5, "tinted clear glass");
         }
+        let regular = Config::parse("window.glass = regular\nwindow.glass_tint = 0.4\n");
+        assert!(!regular.window.glass_clear);
+        assert_eq!(regular.window.glass_tint, 0.4);
         let opaque = Config::parse("window.backdrop = none\n");
         assert_eq!(opaque.window.backdrop, Backdrop::None);
         assert_eq!(opaque.window.opacity, 1.0);
