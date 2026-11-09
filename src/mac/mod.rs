@@ -52,6 +52,7 @@ use objc2_app_kit::{
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
 };
 use objc2_quick_look_ui::{QLPreviewPanel, QLPreviewPanelDataSource};
+use objc2_app_kit::{NSControl, NSControlTextEditingDelegate, NSSearchField, NSSearchFieldDelegate, NSTextFieldDelegate, NSTextView};
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSNotFound, NSRange, NSUserDefaults, NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop,
     NSInteger, NSRunLoopCommonModes, NSSize, NSString, NSURL,
@@ -497,6 +498,26 @@ define_class!(
             with_app(|app| app.windows.iter_mut().for_each(|w| w.request_redraw()));
         }
 
+        #[unsafe(method(tachyonFind:))]
+        fn find(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::open_find);
+        }
+
+        #[unsafe(method(tachyonFindNext:))]
+        fn find_next(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.find_step(true));
+        }
+
+        #[unsafe(method(tachyonFindPrevious:))]
+        fn find_previous(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.find_step(false));
+        }
+
+        #[unsafe(method(tachyonFindRegex:))]
+        fn find_regex(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::find_changed);
+        }
+
         #[unsafe(method(tachyonKeepAwake:))]
         fn keep_awake(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.toggle_awake());
@@ -636,6 +657,36 @@ define_class!(
     }
 
     /// Quick Look asks the view what to show: the path last ⌘-clicked.
+    unsafe impl NSObjectProtocol for TachyonView {}
+
+    /// The find bar's search field reports to its terminal view.
+    unsafe impl NSControlTextEditingDelegate for TachyonView {
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _n: &NSNotification) {
+            with_window(self.id(), TermWindow::find_changed);
+        }
+
+        /// Return finds the next match (older), Shift-Return the previous,
+        /// Escape closes the bar.
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn control_do_command(&self, _control: &NSControl, _view: &NSTextView, command: Sel) -> bool {
+            let id = self.id();
+            if command == sel!(insertNewline:) {
+                let shift = NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Shift);
+                with_window(id, |w| w.find_step(!shift));
+                true
+            } else if command == sel!(cancelOperation:) {
+                with_window(id, TermWindow::close_find);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for TachyonView {}
+    unsafe impl NSSearchFieldDelegate for TachyonView {}
+
     unsafe impl QLPreviewPanelDataSource for TachyonView {
         #[unsafe(method(numberOfPreviewItemsInPreviewPanel:))]
         fn number_of_preview_items(&self, _panel: Option<&QLPreviewPanel>) -> NSInteger {
@@ -1000,6 +1051,116 @@ struct Rewound {
 
 /// The glass panel at the top while rewound: when the screen is from, a
 /// slider to scrub through the frames, and cell provenance when asked for.
+/// What find found in the focused pane.
+struct FindState {
+    /// What was searched for, to notice the field changing without a
+    /// keystroke (⌘G after editing, say).
+    query: String,
+    regex: bool,
+    matches: Vec<crate::term::find::Match>,
+    current: Option<usize>,
+    /// The scrollback's length when searched: a different one means the
+    /// lines moved (output arrived), so the next step searches again.
+    lines: usize,
+}
+
+/// The most matches looked for; the count shows "10,000+" past it.
+const FIND_LIMIT: usize = 10_000;
+
+impl FindState {
+    /// The matches on screen, as (row, first column, end column, current).
+    fn on_screen(&self, term: &Term) -> Vec<(usize, usize, usize, bool)> {
+        let g = term.grid();
+        if g.total_lines() != self.lines {
+            return Vec::new();
+        }
+        let first = g.history_len() - g.display_offset();
+        let last = first + term.rows();
+        let mut out = Vec::new();
+        let from = self.matches.partition_point(|m| m.end.0 < first);
+        for (i, m) in self.matches.iter().enumerate().skip(from) {
+            if m.start.0 >= last {
+                break;
+            }
+            for line in m.start.0.max(first)..=m.end.0.min(last - 1) {
+                let x0 = if line == m.start.0 { m.start.1 } else { 0 };
+                let x1 = if line == m.end.0 { m.end.1 } else { term.cols() };
+                out.push((line - first, x0, x1, Some(i) == self.current));
+            }
+        }
+        out
+    }
+}
+
+/// The glass find bar at the top right: a search field, the match count,
+/// and a regex switch.
+struct FindBar {
+    host: Retained<NSView>,
+    field: Retained<NSSearchField>,
+    count: Retained<objc2_app_kit::NSTextField>,
+    regex: Retained<objc2_app_kit::NSButton>,
+}
+
+impl FindBar {
+    const WIDTH: f64 = 380.0;
+    const HEIGHT: f64 = 36.0;
+
+    fn new(mtm: MainThreadMarker, parent: &TachyonView) -> FindBar {
+        let content = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        let host: Retained<NSView> = if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+            glass.setCornerRadius(Self::HEIGHT / 2.0);
+            glass.setTintColor(Some(&NSColor::windowBackgroundColor().colorWithAlphaComponent(0.75)));
+            glass.setContentView(Some(&content));
+            Retained::into_super(glass)
+        } else {
+            let blur = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), NSRect::ZERO);
+            blur.setMaterial(NSVisualEffectMaterial::HUDWindow);
+            blur.setState(NSVisualEffectState::Active);
+            blur.addSubview(&content);
+            Retained::into_super(blur)
+        };
+        let field = NSSearchField::initWithFrame(NSSearchField::alloc(mtm), NSRect::ZERO);
+        field.setPlaceholderString(Some(&NSString::from_str("Find in scrollback")));
+        // SAFETY: the view outlives its own subview's delegate use.
+        unsafe { field.setDelegate(Some(ProtocolObject::from_ref(parent))) };
+        // Every keystroke searches, without waiting for Return.
+        field.setSendsSearchStringImmediately(true);
+        let count = objc2_app_kit::NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        count.setFont(Some(&objc2_app_kit::NSFont::monospacedDigitSystemFontOfSize_weight(11.0, unsafe { objc2_app_kit::NSFontWeightRegular })));
+        count.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        count.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+        let target: &AnyObject = parent.as_ref();
+        let regex = unsafe {
+            objc2_app_kit::NSButton::buttonWithTitle_target_action(&NSString::from_str(".*"), Some(target), Some(sel!(tachyonFindRegex:)), mtm)
+        };
+        regex.setButtonType(objc2_app_kit::NSButtonType::PushOnPushOff);
+        regex.setBezelStyle(objc2_app_kit::NSBezelStyle::Glass);
+        regex.setToolTip(Some(&NSString::from_str("Regular expression")));
+        content.addSubview(&field);
+        content.addSubview(&count);
+        content.addSubview(&regex);
+        host.setHidden(true);
+        parent.addSubview(&host);
+        FindBar { host, field, count, regex }
+    }
+
+    /// Place it at the top right of a view of `size`, below `top` points.
+    fn place(&self, size: NSSize, top: f64) {
+        let (w, h) = (Self::WIDTH.min(size.width - 24.0), Self::HEIGHT);
+        let frame = NSRect::new(NSPoint::new(size.width - w - 12.0, size.height - top - h - 10.0), NSSize::new(w, h));
+        self.host.setFrame(frame);
+        // SAFETY: a plain view-hierarchy read on the main thread.
+        if let Some(content) = unsafe { self.field.superview() } {
+            content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        }
+        let (count_w, regex_w) = (86.0, 36.0);
+        self.field.setFrame(NSRect::new(NSPoint::new(10.0, 6.0), NSSize::new(w - 10.0 - count_w - regex_w - 16.0, 24.0)));
+        self.count.setFrame(NSRect::new(NSPoint::new(w - count_w - regex_w - 10.0, 10.0), NSSize::new(count_w, 16.0)));
+        self.regex.setFrame(NSRect::new(NSPoint::new(w - regex_w - 6.0, 4.0), NSSize::new(regex_w, 28.0)));
+    }
+}
+
 struct RewindBadge {
     glass: Retained<NSGlassEffectView>,
     label: Retained<objc2_app_kit::NSTextField>,
@@ -1316,6 +1477,9 @@ struct TermWindow {
     key_time: Option<u64>,
     /// Frames drawn in a row without the link going idle.
     busy_frames: u32,
+    /// Find in scrollback: the bar, and what it found.
+    find_bar: Option<FindBar>,
+    find: Option<FindState>,
     /// The suggestion showing after the cursor (all of it), for → to take.
     ghost: Option<String>,
     /// The last suggestion looked up: (typed, folder) and its answer.
@@ -1452,6 +1616,9 @@ impl TermWindow {
                     if let Some(line) = ledger::summary() {
                         decor.notes.push((term.cursor_state().y, line));
                     }
+                }
+                if let (Some(f), None) = (&self.find, &self.rewound) {
+                    decor.highlights = f.on_screen(term);
                 }
                 if self.rewound.is_none() && self.preedit.is_empty() {
                     decor.ghost = ghost_for(term, &mut self.ghost_cache, &mut self.ghost);
@@ -2000,6 +2167,8 @@ impl TermWindow {
 
     /// Take up the per-tab state of the tab now in front.
     fn load_live(&mut self) {
+        // What the find bar found belongs to the pane it searched.
+        self.close_find();
         self.rewind_exit();
         let tab = &mut self.tabs[self.active];
         tab.unseen = None;
@@ -2126,6 +2295,128 @@ impl TermWindow {
                 set_titlebar_hidden(&self.window, true);
             }
         }
+    }
+
+    /// ⌘F: show the find bar, its text selected, ready to type.
+    fn open_find(&mut self) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let top = self.title_bar_height();
+        let size = self.view.bounds().size;
+        let bar = self.find_bar.get_or_insert_with(|| FindBar::new(mtm, &self.view));
+        bar.place(size, top);
+        bar.host.setHidden(false);
+        self.window.makeFirstResponder(Some(&bar.field));
+        // SAFETY: selecting a field's own text on the main thread.
+        unsafe { bar.field.selectText(None) };
+        if self.find.is_none() {
+            self.find_changed();
+        }
+    }
+
+    /// The query or the regex switch changed: search again, and show the
+    /// match nearest the bottom of the screen.
+    fn find_changed(&mut self) {
+        let Some(bar) = &self.find_bar else { return };
+        let query = bar.field.stringValue().to_string();
+        let regex = bar.regex.state() == objc2_app_kit::NSControlStateValueOn;
+        if query.is_empty() {
+            self.find = None;
+            bar.count.setStringValue(&NSString::from_str(""));
+            self.request_redraw();
+            return;
+        }
+        let re = match crate::term::find::pattern(&query, regex) {
+            Ok(re) => re,
+            Err(e) => {
+                self.find = None;
+                bar.count.setStringValue(&NSString::from_str(&e));
+                self.request_redraw();
+                return;
+            }
+        };
+        let (matches, lines, bottom) = {
+            let t = self.term.lock();
+            let g = t.grid();
+            let bottom = g.history_len() - g.display_offset() + t.rows();
+            (crate::term::find::find(&t, &re, FIND_LIMIT), g.total_lines(), bottom)
+        };
+        // The newest match that starts on or above the screen's last row.
+        let current = matches.iter().rposition(|m| m.start.0 < bottom).or((!matches.is_empty()).then_some(0));
+        self.find = Some(FindState { query, regex, matches, current, lines });
+        self.reveal_match();
+    }
+
+    /// Return or ⌘G: the next match up (older); with Shift or ⌘⇧G, down.
+    fn find_step(&mut self, older: bool) {
+        let Some(f) = &self.find else {
+            let has_text = self.find_bar.as_ref().is_some_and(|b| !b.host.isHidden() && !b.field.stringValue().is_empty());
+            if has_text {
+                self.find_changed();
+            } else {
+                self.open_find();
+            }
+            return;
+        };
+        // The text changed without a keystroke: search it, and stop there.
+        if let Some(bar) = &self.find_bar {
+            let regex = bar.regex.state() == objc2_app_kit::NSControlStateValueOn;
+            if bar.field.stringValue().to_string() != f.query || regex != f.regex {
+                self.find_changed();
+                return;
+            }
+        }
+        // Output arrived since: the lines moved, so search again first.
+        let lines = self.term.lock().grid().total_lines();
+        if lines != f.lines {
+            self.find_changed();
+        }
+        let Some(f) = self.find.as_mut() else { return };
+        let n = f.matches.len();
+        if n == 0 {
+            objc2_app_kit::NSBeep();
+            return;
+        }
+        let i = f.current.unwrap_or(0);
+        f.current = Some(if older { (i + n - 1) % n } else { (i + 1) % n });
+        self.reveal_match();
+    }
+
+    /// Scroll the current match into view, near the middle, and update the
+    /// count.
+    fn reveal_match(&mut self) {
+        let Some(f) = &self.find else { return };
+        if let Some(bar) = &self.find_bar {
+            let total = if f.matches.len() >= FIND_LIMIT { format!("{}+", group_digits(FIND_LIMIT as u64)) } else { group_digits(f.matches.len() as u64) };
+            let text = match f.current {
+                Some(i) => format!("{} of {total}", group_digits(i as u64 + 1)),
+                None => "No matches".to_string(),
+            };
+            bar.count.setStringValue(&NSString::from_str(&text));
+        }
+        if let Some(m) = f.current.map(|i| f.matches[i]) {
+            let mut t = self.term.lock();
+            let g = t.grid();
+            let (h, rows, off) = (g.history_len(), t.rows(), g.display_offset());
+            let top = h - off;
+            if m.start.0 < top || m.start.0 >= top + rows {
+                let want = (h + rows / 2).saturating_sub(m.start.0).min(h);
+                t.scroll_display(want as isize - off as isize);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Escape: close the bar and clear the highlights; keys go back to the
+    /// terminal.
+    fn close_find(&mut self) {
+        let Some(bar) = &self.find_bar else { return };
+        if bar.host.isHidden() {
+            return;
+        }
+        bar.host.setHidden(true);
+        self.find = None;
+        self.window.makeFirstResponder(Some(&self.view));
+        self.request_redraw();
     }
 
     /// View > Full Screen Around the Notch: the window covers the whole
@@ -3314,6 +3605,8 @@ impl App {
             busy_frames: 0,
             ghost: None,
             ghost_cache: None,
+            find_bar: None,
+            find: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -3561,6 +3854,10 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&edit, "Copy", sel!(copy:), "c");
     item(&edit, "Paste", sel!(paste:), "v");
     item(&edit, "Select All", sel!(selectAll:), "a");
+    edit.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&edit, "Find…", sel!(tachyonFind:), "f");
+    item(&edit, "Find Next", sel!(tachyonFindNext:), "g");
+    item(&edit, "Find Previous", sel!(tachyonFindPrevious:), "G");
     submenu(&main, &edit);
 
     let view = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("View"));

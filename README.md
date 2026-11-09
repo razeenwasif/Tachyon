@@ -160,6 +160,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | Drag, double-click, triple-click | Select by character, word (paths count as one word), or line |
 | Shift-click | Extend the selection |
 | ⌘C / ⌘V / ⌘A | Copy / paste / select all |
+| ⌘F, then Return / ⇧Return (or ⌘G / ⌘⇧G), Esc | Find in scrollback: the next match up / down, close |
 | ⌘+ (or ⌘=) / ⌘− / ⌘0 | Bigger / smaller / configured font size |
 | ⌃⌘-drag, or drag the top edge | Move the window |
 | ⌘↑ / ⌘↓ | Jump to the previous / next command |
@@ -301,6 +302,16 @@ scp shell/tachyon-integration.bash cluster:~/.tachyon-integration.bash
 For zsh, source `shell/tachyon-integration.zsh` from `~/.zshrc`; for fish, copy
 `shell/xdg/fish/vendor_conf.d/tachyon-integration.fish` into
 `~/.config/fish/conf.d/`. Some servers' `sshd_config` doesn't accept `LC_*`.
+
+**Find.** ⌘F opens a glass find bar at the top right and searches the
+scrollback and the screen as you type. Matches are highlighted, the current
+one stronger, and the bar counts them (`3 of 12`). Return or ⌘G goes to the
+next match up, toward older output, since a search starts at the bottom;
+⇧Return or ⌘⇧G goes down. Esc closes it. Case is ignored unless you type a
+capital, and the `.*` switch makes the query a regular expression. A line the
+terminal wrapped is searched as one line, so a match can cross the wrap. A
+search over a full 100,000-line scrollback takes 12–18 ms, most of it reading
+lines straight from their packed bytes.
 
 **Suggestions.** As you type at a prompt, Tachyon shows in grey the rest of a
 command you've run before; → or End (or ⌃F) types it in for you, ⌥→ one word
