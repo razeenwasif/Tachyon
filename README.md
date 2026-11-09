@@ -236,7 +236,11 @@ with OSC 133, which gives:
   the share on performance cores, energy, and peak memory footprint. CPU time is
   exact (from the shell's child-process accounting); P-core share, energy and
   memory are sampled every half second, so very short commands show only their
-  exit status and time;
+  exit status and time. Memory is the footprint Activity Monitor shows, and on
+  Apple silicon it includes what the command allocates on the GPU: PyTorch's
+  MPS backend, MLX, anything through Metal. Measured: two 2 GiB MPS tensors
+  read 4.14 GiB, the same as macOS's `footprint` tool. With a right prompt
+  (conda's `(base)` in fish, zsh's RPROMPT), the receipt sits just left of it;
 - a **metric lens**: while a command runs, numbers in its output that look like
   metrics (`loss=0.41`, `acc: 87%`, `{'loss': 0.39}`, `48.2it/s`, `512 tok/s`)
   show on its prompt line, with a sparkline of the loss (or the first metric):

@@ -2692,7 +2692,7 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
             // The input line, or if the command fills it, the first of its
             // wrapped continuation lines with room at the right.
             let width = |t: &str| t.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)).sum::<usize>();
-            let room = |r: usize, t: &str| g.row(r).trimmed_len() + width(t) + 3 <= term.cols();
+            let room = |r: usize, t: &str| renderer::note_start(g.row(r).cells(), width(t)).is_some();
             'place: for text in candidates {
                 let mut r = y;
                 while !room(r, &text) && r + 1 < term.rows() && g.row(r).wrapped {

@@ -344,3 +344,87 @@ mod tests {
         assert_eq!(describe(Duration::from_secs(12), None, true, None).unwrap(), "running 12s");
     }
 }
+
+/// Whether memory a command allocates on the GPU (PyTorch's MPS backend,
+/// MLX, anything through Metal) is in the footprint receipts report. Run with
+/// `TACHYON_TORCH_PYTHON=<python with torch> cargo test --release
+/// gpu_memory_in_footprint -- --ignored --nocapture`.
+#[cfg(test)]
+mod gpu_memory {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+
+    const GIB: u64 = 1 << 30;
+
+    /// macOS's own `footprint` tool's figure for `pid`, in bytes.
+    fn footprint_tool(pid: libc::pid_t) -> Option<u64> {
+        let out = std::process::Command::new("/usr/bin/footprint").arg(pid.to_string()).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // "...: 2148 MB (phys_footprint)..." style summary line.
+        let line = text.lines().find(|l| l.contains("phys_footprint") || l.trim_start().starts_with("Footprint:"))?;
+        let mut words = line.split_whitespace().peekable();
+        while let Some(w) = words.next() {
+            if let Ok(n) = w.replace(',', "").parse::<f64>() {
+                let unit = words.peek().copied().unwrap_or("");
+                let mult = match unit.to_ascii_uppercase().as_str() {
+                    "KB" => 1 << 10,
+                    "MB" => 1 << 20,
+                    "GB" => 1 << 30,
+                    _ => 1,
+                };
+                return Some((n * mult as f64) as u64);
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[ignore]
+    fn gpu_memory_in_footprint() {
+        // A Metal buffer in this process, the way MLX and MPS allocate.
+        use objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
+        let me = unsafe { libc::getpid() };
+        let before = rusage(me).unwrap().v4.0.ri_phys_footprint;
+        let device = MTLCreateSystemDefaultDevice().expect("a Metal device");
+        let buf = device.newBufferWithLength_options(2 * GIB as usize, MTLResourceOptions::StorageModeShared).expect("2 GiB buffer");
+        // Touch every page, as a computation would.
+        let p = buf.contents().as_ptr() as *mut u8;
+        for i in (0..2 * GIB as usize).step_by(16 * 1024) {
+            unsafe { p.add(i).write(1) };
+        }
+        let after = rusage(me).unwrap().v4.0;
+        println!(
+            "Metal buffer, 2 GiB: footprint {:.2} -> {:.2} GiB (peak {:.2}); footprint tool {:.2} GiB",
+            before as f64 / GIB as f64,
+            after.ri_phys_footprint as f64 / GIB as f64,
+            after.ri_lifetime_max_phys_footprint as f64 / GIB as f64,
+            footprint_tool(me).unwrap_or(0) as f64 / GIB as f64
+        );
+        assert!(after.ri_lifetime_max_phys_footprint >= before + GIB * 19 / 10, "a touched 2 GiB Metal buffer is in the footprint");
+        drop(buf);
+
+        // PyTorch on MPS, in a process of its own like a real run.
+        let Some(python) = std::env::var_os("TACHYON_TORCH_PYTHON") else {
+            println!("TACHYON_TORCH_PYTHON not set: skipping PyTorch MPS");
+            return;
+        };
+        let script = "import torch,time,sys\nx=torch.ones(512*1024*1024,device='mps')\ny=x*2\ntorch.mps.synchronize()\nprint('ready',torch.mps.current_allocated_memory(),flush=True)\ntime.sleep(4)\n";
+        let mut child = std::process::Command::new(python).arg("-c").arg(script).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let allocated: u64 = line.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or(0);
+        let r = rusage(pid).unwrap().v4.0;
+        let tool = footprint_tool(pid).unwrap_or(0);
+        println!(
+            "PyTorch MPS, two 2 GiB tensors ({:.2} GiB allocated by MPS): receipt peak {:.2} GiB, footprint now {:.2} GiB; footprint tool {:.2} GiB",
+            allocated as f64 / GIB as f64,
+            ProcSample::of(&rusage(pid).unwrap()).peak as f64 / GIB as f64,
+            r.ri_phys_footprint as f64 / GIB as f64,
+            tool as f64 / GIB as f64
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(r.ri_lifetime_max_phys_footprint >= allocated * 9 / 10, "MPS memory is in the footprint");
+    }
+}
