@@ -125,6 +125,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
+| ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
 | ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
 | ⌘D / ⌘⇧D | Split the pane: a new shell to the right / below, in the same folder |
 | ⌘⌥← ⌘⌥→ ⌘⌥↑ ⌘⌥↓, or click | Focus the pane on that side, or the one clicked |
@@ -167,6 +168,22 @@ a crash, at the next launch), but while a tab is open its output, passwords
 you typed excepted (they aren't echoed), is on disk. On the M2 Pro a seek takes
 about 4 ms in memory and 16 ms on disk, and recording costs 1 to 4% of parsing
 throughput: compression runs on a thread of its own.
+
+**Shells outlive the app.** Shells run in Tachyon's session host, a small
+background process (the same binary, started as `tachyon --host`), so quitting
+Tachyon, a crash, or installing an update leaves them running: a training run
+or an ssh session carries on. Open Tachyon again and its windows, tabs and
+splits come back where they were, each with its screen, scrollback (up to
+`scrollback` lines), colours, the full-screen program it was showing, and its
+command marks and exit codes. ⌥⌘Q quits and ends the shells instead; closing a
+window or tab ends its shells as always. The host parses each shell's output
+on an efficiency-core thread while it forwards it, answers terminal queries
+while no app is attached so programs don't stall, and exits 20 seconds after
+it has nothing left to run. Measured on the M2 Pro under load: keystroke echo
+6–11 µs through the host against 2–4 µs straight, and 4–12% less throughput on
+a 256 MB `cat`. Restored commands have no times in their receipts, and Rewind
+starts over from the restored screen. Set `shell.persist = false` to have
+shells end with the app.
 
 **Split panes.** ⌘D splits the pane with focus side by side and ⌘⇧D one above
 the other; the new shell starts in the same folder (unless that pane is in an

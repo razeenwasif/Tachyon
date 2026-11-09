@@ -4,6 +4,7 @@ pub mod jobs;
 pub mod lens;
 pub mod rerun;
 pub mod rewind;
+mod restore;
 pub mod cell;
 pub mod color;
 pub mod grid;
@@ -239,6 +240,10 @@ pub struct Term {
     /// The command whose prompt is showing or which is running.
     current_cmd: Option<u32>,
     next_cmd: u32,
+
+    /// Output being parsed is a restored session's past, not happening now:
+    /// commands in it get no start or finish times and raise no events.
+    pub restoring: bool,
 }
 
 impl Term {
@@ -276,6 +281,7 @@ impl Term {
             command_events: Vec::new(),
             current_cmd: None,
             next_cmd: 1,
+            restoring: false,
         }
     }
 
@@ -405,6 +411,7 @@ impl Term {
             command_events: Vec::new(),
             current_cmd: None,
             next_cmd: 1,
+            restoring: false,
         }
     }
 
@@ -548,7 +555,7 @@ impl Term {
                         return;
                     }
                     c.state = CommandState::Running;
-                    c.started = Some(Instant::now());
+                    c.started = (!self.restoring).then(Instant::now);
                     if cmdline.as_deref().is_some_and(is_ssh) && self.ssh_session.is_none() {
                         self.ssh_session = cmdline.clone().map(|c| (c, self.cwd_host.clone()));
                     }
@@ -556,7 +563,9 @@ impl Term {
                     c.cmdline = cmdline;
                     self.title_revision = self.title_revision.wrapping_add(1);
                     self.mark_row(id, RowMark::OUTPUT);
-                    self.command_events.push(CommandEvent::Started(id));
+                    if !self.restoring {
+                        self.command_events.push(CommandEvent::Started(id));
+                    }
                 }
             }
             b'D' => {
@@ -568,9 +577,11 @@ impl Term {
                     if let Some(c) = self.commands.get_mut(&id) {
                         if c.state == CommandState::Running {
                             c.state = CommandState::Done;
-                            c.finished = Some(Instant::now());
+                            c.finished = (!self.restoring).then(Instant::now);
                             c.exit = exit;
-                            self.command_events.push(CommandEvent::Finished(id, exit));
+                            if !self.restoring {
+                                self.command_events.push(CommandEvent::Finished(id, exit));
+                            }
                             self.compare_run(id);
                             self.title_revision = self.title_revision.wrapping_add(1);
                         }

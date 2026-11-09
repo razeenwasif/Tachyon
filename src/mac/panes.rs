@@ -150,6 +150,52 @@ impl Node {
     }
 }
 
+impl Node {
+    /// Every pane, in reading order.
+    pub fn leaves(&self) -> Vec<u64> {
+        match self {
+            Node::Leaf(id) => vec![*id],
+            Node::Split { a, b, .. } => {
+                let mut v = a.leaves();
+                v.extend(b.leaves());
+                v
+            }
+        }
+    }
+
+    /// As text, to keep with the session host: `s12` for a pane, `( R 0.5
+    /// s12 s13 )` for a split.
+    pub fn encode(&self) -> String {
+        match self {
+            Node::Leaf(id) => format!("s{id}"),
+            Node::Split { dir, ratio, a, b } => {
+                let d = if *dir == Dir::Right { "R" } else { "D" };
+                format!("( {d} {ratio:.4} {} {} )", a.encode(), b.encode())
+            }
+        }
+    }
+
+    /// The tree `encode` wrote, from its words.
+    pub fn decode<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<Node> {
+        let w = words.next()?;
+        if let Some(id) = w.strip_prefix('s') {
+            return id.parse().ok().map(Node::Leaf);
+        }
+        if w != "(" {
+            return None;
+        }
+        let dir = match words.next()? {
+            "R" => Dir::Right,
+            "D" => Dir::Down,
+            _ => return None,
+        };
+        let ratio = words.next()?.parse::<f32>().ok()?.clamp(0.0, 1.0);
+        let a = Box::new(Node::decode(words)?);
+        let b = Box::new(Node::decode(words)?);
+        (words.next()? == ")").then_some(Node::Split { dir, ratio, a, b })
+    }
+}
+
 /// How `len` cells divide at `ratio`: the first half's cells and the
 /// divider's. Each half keeps at least `MIN` cells where there's room; with
 /// no room for a divider, the first half takes everything.
@@ -272,6 +318,19 @@ mod tests {
         assert_eq!(panes[1].1.cols, 0);
         let (panes, _) = t.layout(Rect { cols: 4, ..AREA });
         assert!(panes.iter().all(|(_, r)| r.cols >= 1));
+    }
+
+    #[test]
+    fn layouts_survive_being_written_down() {
+        let mut t = Node::Leaf(7);
+        t.split(7, 9, Dir::Right);
+        t.split(9, 12, Dir::Down);
+        t.set_ratio(&[], 0.3);
+        let text = t.encode();
+        assert_eq!(text, "( R 0.3000 s7 ( D 0.5000 s9 s12 ) )");
+        assert_eq!(Node::decode(&mut text.split_whitespace()), Some(t.clone()));
+        assert_eq!(t.leaves(), vec![7, 9, 12]);
+        assert_eq!(Node::decode(&mut "( R 0.5 s1".split_whitespace()), None, "cut short");
     }
 
     #[test]

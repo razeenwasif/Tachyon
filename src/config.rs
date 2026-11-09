@@ -281,6 +281,10 @@ pub struct ShellConfig {
     /// Load Tachyon's shell integration (OSC 133 prompt and command marks)
     /// into zsh automatically.
     pub integration: bool,
+    /// Run shells in the session host (macOS), so quitting, crashing or
+    /// updating Tachyon leaves them running and reopening it brings them
+    /// back. Off: shells end with the app.
+    pub persist: bool,
 }
 
 impl Default for ShellConfig {
@@ -289,6 +293,7 @@ impl Default for ShellConfig {
             program: String::new(),
             args: Vec::new(),
             integration: true,
+            persist: true,
         }
     }
 }
@@ -519,6 +524,7 @@ impl Config {
 
             "shell.program" => self.shell.program = value.to_string(),
             "shell.integration" => self.shell.integration = parse_bool(value)?,
+            "shell.persist" => self.shell.persist = parse_bool(value)?,
             "shell.args" => {
                 self.shell.args = value
                     .split_whitespace()
