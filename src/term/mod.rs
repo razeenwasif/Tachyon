@@ -1570,8 +1570,11 @@ impl Perform for Term {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        self.ground_signal = true;
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        // Ended by BEL, the parser is back in Ground. Ended by ESC (the start
+        // of ST, `ESC \`), it is in Escape until the `\`, whose esc_dispatch
+        // signals Ground; signalling here would print that `\` as text.
+        self.ground_signal = bell_terminated;
         let Some(cmd) = params.first() else { return };
 
         match *cmd {
@@ -1610,7 +1613,9 @@ impl Perform for Term {
     fn put(&mut self, _byte: u8) {}
 
     fn unhook(&mut self) {
-        self.ground_signal = true;
+        // A DCS ends on the ESC of ST too; see osc_dispatch. (CAN and SUB end
+        // it in Ground without a signal, which only means the next bytes take
+        // the slow path until something does signal.)
     }
 }
 
@@ -1681,6 +1686,25 @@ mod tests {
         assert_eq!(events.len(), 1, "one start, not two: {events:?}");
         feed(&mut t, &mut p, "\x1b]133;D;0\x07\x1b]133;D;0\x07");
         assert_eq!(t.take_command_events().len(), 1);
+    }
+
+    /// Strings ended by ST (`ESC \`) instead of BEL: fish 4, tmux and vim
+    /// send them. The `\` belongs to the terminator, not the screen.
+    #[test]
+    fn st_terminated_strings_leave_no_backslash() {
+        let mut t = Term::new(40, 5, 100);
+        let mut p = Processor::new();
+        feed(&mut t, &mut p, "\x1b]0;title\x1b\\\x1b]133;A\x1b\\\x1bP+q696e646e\x1b\\abc");
+        let row0 = |t: &Term| {
+            let h = t.grid().history_len();
+            t.text_range(h, 0, h, 39).trim_end().to_string()
+        };
+        assert_eq!(row0(&t), "abc");
+        assert_eq!(t.title.as_deref(), Some("title"));
+        assert!(t.current_command().is_some(), "the OSC 133 still counts");
+        // And BEL-ended ones still go straight back to the fast path.
+        feed(&mut t, &mut p, "\x1b]2;x\x07def");
+        assert_eq!(row0(&t), "abcdef");
     }
 
     #[test]
