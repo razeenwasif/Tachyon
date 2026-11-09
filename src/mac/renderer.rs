@@ -791,14 +791,13 @@ impl Renderer {
         });
         let cols = term.cols();
         for (y, text) in &decor.notes {
-            let len = text.chars().count();
-            if *y >= term.rows() || len + 2 > cols {
+            if *y >= term.rows() {
                 continue;
             }
-            let start = cols - len - 1;
-            if term.grid().row(*y).trimmed_len() + 2 > start {
+            let width = text.chars().map(|c| c.width().unwrap_or(1)).sum::<usize>();
+            let Some(start) = note_start(term.grid().row(*y).cells(), width) else {
                 continue;
-            }
+            };
             let row_y = pad_y + *y as f32 * m.height;
             self.push_text(text, pad_x + start as f32 * m.width, row_y, dim);
         }
@@ -1203,6 +1202,46 @@ pub struct Strip {
     pub active: usize,
 }
 
+/// Where a note `width` cells wide starts on a row, or `None` if it won't
+/// fit without covering text. It goes at the right, leaving a cell to the
+/// edge; with a right prompt there (text reaching the right edge after a gap
+/// of three or more blank cells, like zsh's RPROMPT or fish's
+/// `fish_right_prompt`), it goes just left of the prompt instead. Either way
+/// two blank cells stay between it and the text on its left.
+pub fn note_start(cells: &[Cell], width: usize) -> Option<usize> {
+    let cols = cells.len();
+    let blank = |c: &Cell| c.ch == 0 || c.ch == ' ' as u32;
+    let used = cells.iter().rposition(|c| !blank(c)).map_or(0, |i| i + 1);
+    // Room at the right edge.
+    if width + 3 <= cols && used + 2 <= cols - width - 1 {
+        return Some(cols - width - 1);
+    }
+    // A right prompt: text ending at the edge, after a gap of 3+ blanks.
+    if used + 2 < cols {
+        return None;
+    }
+    let mut x = used;
+    let mut gap = 0;
+    let mut prompt_start = None;
+    while x > 0 {
+        x -= 1;
+        if blank(&cells[x]) {
+            gap += 1;
+            if gap >= 3 {
+                prompt_start = Some(x + gap);
+                break;
+            }
+        } else {
+            gap = 0;
+        }
+    }
+    let prompt_start = prompt_start?;
+    let left = cells[..prompt_start].iter().rposition(|c| !blank(c)).map_or(0, |i| i + 1);
+    let end = prompt_start.checked_sub(2)?;
+    let start = end.checked_sub(width)?;
+    (start >= left + 2).then_some(start)
+}
+
 /// Characters that take part in programming ligatures (`->`, `!=`, `|>`,
 /// `/*`): only runs of these are shaped as ligatures.
 const LIGATURE_CHARS: &[u8] = b"!#$%&*+-./:;<=>?@\\^_|~";
@@ -1327,7 +1366,30 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::{fit, note_start};
+    use crate::term::Cell;
+
+    fn row(text: &str, cols: usize) -> Vec<Cell> {
+        let mut cells = vec![Cell::EMPTY; cols];
+        for (i, ch) in text.chars().enumerate() {
+            cells[i].ch = ch as u32;
+        }
+        cells
+    }
+
+    #[test]
+    fn notes_go_left_of_a_right_prompt() {
+        // Room at the right: at the right, a cell from the edge.
+        assert_eq!(note_start(&row("~ make", 40), 10), Some(29));
+        // fish with conda's right prompt: just left of it, a gap kept.
+        let r = row(&format!("{:<33}(base)", "~ make"), 40);
+        assert_eq!(note_start(&r, 10), Some(21));
+        // No room between the command and the right prompt.
+        let r = row(&format!("{:<33}(base)", "~ python train.py --lr 3e-4"), 40);
+        assert_eq!(note_start(&r, 10), None);
+        // A line full of text: nowhere.
+        assert_eq!(note_start(&row(&"x".repeat(40), 40), 5), None);
+    }
 
     #[test]
     fn labels_fit_their_tab() {
