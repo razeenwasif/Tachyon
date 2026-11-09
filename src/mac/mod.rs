@@ -786,6 +786,16 @@ define_class!(
             DispatchQueue::main().exec_async(move || remove_window(id));
         }
 
+        #[unsafe(method(windowWillEnterFullScreen:))]
+        fn window_will_enter_full_screen(&self, _n: &NSNotification) {
+            with_window(self.ivars().id.get(), |w| w.renderer.set_full_screen(true));
+        }
+
+        #[unsafe(method(windowDidExitFullScreen:))]
+        fn window_did_exit_full_screen(&self, _n: &NSNotification) {
+            with_window(self.ivars().id.get(), |w| w.renderer.set_full_screen(false));
+        }
+
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _n: &NSNotification) {
             with_window(self.ivars().id.get(), |w| w.set_focused(true));
@@ -1218,6 +1228,8 @@ struct TermWindow {
     dragging_divider: Option<panes::Divider>,
     /// When the key being handled was pressed.
     key_time: Option<u64>,
+    /// Frames drawn in a row without the link going idle.
+    busy_frames: u32,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -1243,9 +1255,21 @@ impl TermWindow {
     }
 
     /// Wake from idle. Called on the main queue by the reader thread.
+    fn set_frame_rate(&self, fps: f32) {
+        let min = fps.min(60.0);
+        self.link.setPreferredFrameRateRange(objc2_quartz_core::CAFrameRateRange { minimum: min, maximum: fps, preferred: fps });
+    }
+
     fn resume(&mut self) {
         self.idle_ticks = 0;
+        let was_idle = self.link.isPaused();
         self.link.setPaused(false);
+        // Idle until now (typing at a prompt, say): draw at once rather than
+        // waiting up to a refresh for the link's next tick. A window busy
+        // with output keeps drawing on the link.
+        if was_idle {
+            self.tick();
+        }
     }
 
     fn tick(&mut self) {
@@ -1281,6 +1305,13 @@ impl TermWindow {
         if self.needs_redraw {
             self.needs_redraw = false;
             self.idle_ticks = 0;
+            // Output streaming for a quarter of a second (a build, a cat):
+            // 60 frames a second is plenty to watch it, and leaves the
+            // terminal lock to the reader for twice as long.
+            self.busy_frames += 1;
+            if self.busy_frames == 30 {
+                self.set_frame_rate(60.0);
+            }
             self.update_secure_input();
             self.draw();
         } else {
@@ -1289,6 +1320,12 @@ impl TermWindow {
             self.idle_ticks += 1;
             if self.idle_ticks >= 3 {
                 self.link.setPaused(true);
+                // Next time it wakes it's for a keystroke, most likely: as
+                // fast as the display goes.
+                if self.busy_frames >= 30 {
+                    self.set_frame_rate(120.0);
+                }
+                self.busy_frames = 0;
             }
         }
     }
@@ -2869,6 +2906,10 @@ impl App {
         let (term, pty) = (Arc::clone(&pane.term), Arc::clone(&pane.pty));
 
         let link = unsafe { view.displayLinkWithTarget_selector(&view, sel!(tick:)) };
+        // ProMotion displays run at 120 Hz only when asked; a frame sooner is
+        // a keystroke on screen sooner. The link pauses when nothing changes,
+        // so an idle window still costs nothing.
+        link.setPreferredFrameRateRange(objc2_quartz_core::CAFrameRateRange { minimum: 60.0, maximum: 120.0, preferred: 120.0 });
         unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
 
         self.windows.push(TermWindow {
@@ -2912,6 +2953,7 @@ impl App {
             rewind_badge: None,
             dragging_divider: None,
             key_time: None,
+            busy_frames: 0,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,

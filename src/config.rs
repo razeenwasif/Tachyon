@@ -144,6 +144,11 @@ pub struct RenderConfig {
     /// up and drawing anyway, in milliseconds. Guards against an application
     /// that begins a batch and never ends it.
     pub sync_timeout_ms: u64,
+    /// macOS: in a window, hand each frame to the compositor as soon as it's
+    /// drawn rather than at the next refresh. The compositor still syncs to
+    /// the display, so nothing tears; in full screen, where Metal can reach
+    /// the display directly, `vsync` applies.
+    pub low_latency: bool,
 }
 
 impl Default for RenderConfig {
@@ -152,6 +157,7 @@ impl Default for RenderConfig {
             vsync: true,
             max_fps: 0,
             sync_timeout_ms: 150,
+            low_latency: true,
         }
     }
 }
@@ -513,6 +519,7 @@ impl Config {
             }
 
             "render.vsync" => self.render.vsync = parse_bool(value)?,
+            "render.low_latency" => self.render.low_latency = parse_bool(value)?,
             "render.max_fps" => self.render.max_fps = parse_usize(value, 0, 1000)? as u32,
             "render.sync_timeout_ms" => {
                 self.render.sync_timeout_ms = parse_usize(value, 0, 5000)? as u64
