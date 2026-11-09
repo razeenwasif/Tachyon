@@ -398,3 +398,13 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    assertions. After Rewind, because it owns the logs.
 9. **Split panes** on cell boundaries. Shaping already arrived with Core Text
    in step 1.
+   *Done (9 November 2026), ahead of the session host:* `src/mac/panes.rs` is
+   a tab's layout tree (splits with a ratio, on whole cells, one cell for each
+   divider, panes kept at least two cells). Each pane is a session of its own
+   (shell, reader, Rewind log, selection, receipts); the window swaps per-pane
+   state on focus as it does per tab. One Metal frame draws every visible pane
+   at its cell offset, then hairline dividers and a 30% veil over panes
+   without focus. ⌘D / ⌘⇧D split (the new shell starts in the pane's folder
+   from OSC 7, not over ssh), ⌘⌥ arrows move focus to the nearest pane on that
+   side, a click focuses, dividers drag (with resize pointers), ⌘⇧↩ zooms, ⌘W
+   and `exit` close a pane. Idle stays at 0.0% CPU with no wake-ups.

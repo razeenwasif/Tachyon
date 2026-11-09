@@ -429,6 +429,15 @@ impl Term {
     }
 
     /// The running command's line, for telling a submission from other output.
+    /// The folder the shell last reported, when it's on this Mac: not while
+    /// an ssh session runs here.
+    pub fn local_cwd(&self) -> Option<&str> {
+        if self.ssh_session.is_some() {
+            return None;
+        }
+        self.cwd.as_deref()
+    }
+
     pub fn running_cmdline(&self) -> Option<&str> {
         self.current_cmd
             .and_then(|id| self.commands.get(&id))
