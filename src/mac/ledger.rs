@@ -176,6 +176,15 @@ static RECENT: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
 const KEEP: usize = 200;
 
 fn record(e: Entry) {
+    crate::log!(
+        "ledger: total {:.2} take {:.2} shell {:.2} parse {:.2} frame {:.2} display {:.2}",
+        e.total(),
+        e.take,
+        e.shell,
+        e.parse,
+        e.frame,
+        e.display
+    );
     let mut r = RECENT.lock();
     if r.len() == KEEP {
         r.pop_front();

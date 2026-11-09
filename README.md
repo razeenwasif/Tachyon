@@ -285,6 +285,20 @@ Tachyon 0.6 · shell 0.3 · frame wait 2.4 · display 8.5`. Over ssh, the
 shell share includes the network. The same stages are `os_signpost`
 intervals in Instruments' Points of Interest track, or
 `log stream --signpost --predicate 'subsystem == "dev.tachyon.terminal"'`.
+With `TACHYON_LOG=1` every keystroke's stages go to the log as well.
+
+What the ledger found, and what changed: a keystroke took about 33 ms to
+reach the screen. Up to a refresh of that was the echo waiting for the
+display link's next tick, and the rest was the frame waiting for vsync before
+the compositor took it. Now an idle window draws the echo as soon as it is
+parsed, and in a window, frames go to the compositor without waiting for vsync
+(`render.low_latency`). The compositor syncs to the display either way, so
+nothing tears, and full screen keeps `render.vsync`. The display link asks
+for 120 Hz on ProMotion screens, and drops to 60 Hz once output has streamed
+for a quarter of a second. Measured on the M2 Pro, alternating with the
+previous build under the same load, with 40 synthetic keystrokes each:
+median 33.0–35.0 ms before, 23.0–25.0 ms now. A 256 MB `cat` runs at 145–165
+MiB/s, against 125–140 MiB/s before, and an idle window still uses 0.0% CPU.
 
 **Ligatures and emoji.** Core Text shapes what needs it. Emoji sequences
 draw as one glyph: ZWJ families, skin tones, flags, and keycaps. Combining

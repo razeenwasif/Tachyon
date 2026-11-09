@@ -249,7 +249,7 @@ impl Renderer {
         // Two drawables: the lowest latency that still lets the GPU work while
         // the display scans out the previous frame.
         layer.setMaximumDrawableCount(2);
-        layer.setDisplaySyncEnabled(cfg.render.vsync);
+        layer.setDisplaySyncEnabled(cfg.render.vsync && !cfg.render.low_latency);
         layer.setOpaque(cfg.window.opacity >= 1.0);
         if let Some(space) = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })) {
             layer.setColorspace(Some(&space));
@@ -276,6 +276,13 @@ impl Renderer {
             glyphs: Vec::new(),
             overlay: Vec::new(),
         })
+    }
+
+    /// Wait for the display refresh to present, or not: off in a window for
+    /// low latency, where the compositor syncs anyway; `vsync` in full screen.
+    pub fn set_full_screen(&mut self, full: bool) {
+        let sync = self.cfg.render.vsync && (full || !self.cfg.render.low_latency);
+        self.layer.setDisplaySyncEnabled(sync);
     }
 
     pub fn metrics(&self) -> CellMetrics {

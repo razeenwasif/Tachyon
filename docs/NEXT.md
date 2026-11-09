@@ -198,6 +198,14 @@ synthetic keys: about 35 ms median, mostly display (commit to presented,
 about 27 ms) and frame wait (about 8 ms); shell echo 0.1 ms; Tachyon 4.6 ms,
 mostly event delivery of the synthetic key. So the next latency work is the
 present path (drawable count, display sync), not parsing.
+*Present path done (9 November 2026):* an idle window draws as soon as output
+is parsed instead of at the link's next tick; `render.low_latency` (default
+on) turns display sync off in a window, where the compositor syncs anyway, and
+back on in full screen. The link asks for 120 Hz, falling to 60 Hz after 30
+frames of continuous output. Measured alternating with the previous build:
+median keystroke to screen 33.0–35.0 → 23.0–25.0 ms. Frame wait went from
+8–12 to 1–2 ms, display from 19–24 to 17–18 ms, about two 120 Hz refreshes,
+which is the compositor. In-app `cat` of 256 MB: 125–140 → 145–165 MiB/s.
 
 Closest today: Typometer, or a high-speed camera.
 

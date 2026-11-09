@@ -89,6 +89,12 @@ window.padding_y = 6.0
 # it.
 render.vsync           = true
 
+# macOS: in a window, give each frame to the compositor as soon as it is drawn
+# instead of at the next refresh, about half a frame sooner on screen. The
+# compositor still syncs to the display, so nothing tears. In full screen,
+# render.vsync applies.
+# render.low_latency   = true
+
 # 0 means "follow the display refresh".
 render.max_fps         = 0
 
