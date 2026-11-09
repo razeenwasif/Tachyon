@@ -13,6 +13,10 @@
 font.family      = "Cascadia Mono"
 font.size        = 12.0
 
+# Programming ligatures (-> != |>) in fonts that have them, such as Cascadia
+# Code, Fira Code and JetBrains Mono. Cascadia Mono has none, by design.
+# font.ligatures = true
+
 # subpixel  - ClearType-style RGB coverage, sharpest on a normal desktop LCD
 # grayscale - single-channel coverage; use on rotated or non-RGB-stripe panels
 font.antialias   = subpixel

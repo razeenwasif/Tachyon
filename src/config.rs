@@ -67,6 +67,9 @@ pub struct FontConfig {
     pub cell_width: f32,
     pub use_bold_font: bool,
     pub use_italic_font: bool,
+    /// Programming ligatures (`->`, `!=`, `=>`) in fonts that have them,
+    /// such as Cascadia Code, Fira Code and JetBrains Mono.
+    pub ligatures: bool,
 }
 
 impl Default for FontConfig {
@@ -81,6 +84,7 @@ impl Default for FontConfig {
             cell_width: 1.0,
             use_bold_font: true,
             use_italic_font: true,
+            ligatures: true,
         }
     }
 }
@@ -447,6 +451,7 @@ impl Config {
         match key {
             "font.family" => self.font.family = value.to_string(),
             "font.size" => self.font.size = parse_f32(value, 4.0, 200.0)?,
+            "font.ligatures" => self.font.ligatures = parse_bool(value)?,
             "font.antialias" => {
                 self.font.antialias = match value {
                     "subpixel" | "cleartype" | "rgb" => Antialias::Subpixel,

@@ -158,3 +158,33 @@ fn scanner_speedup() {
         "vectorised scan should beat the per-byte loop"
     );
 }
+
+/// The bulk path for floods of plain lines, against the line-by-line one, in
+/// alternating rounds so machine load hits both alike.
+#[test]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+fn bulk_lines_speedup() {
+    use tachyon::term::parser::set_bulk_lines;
+    let inputs = [("plain ASCII", plain_ascii(16 * 1024 * 1024)), ("build log", build_log(120_000)), ("TUI full redraw", tui_redraw(2_000))];
+    println!("\nBulk lines on vs off (best of 6 alternating rounds):");
+    for (name, data) in &inputs {
+        let mut best = [f64::MAX; 2];
+        for round in 0..6 {
+            // Which goes first alternates too.
+            let order = if round % 2 == 0 { [(0, true), (1, false)] } else { [(1, false), (0, true)] };
+            for (k, on) in order {
+                set_bulk_lines(on);
+                let mut term = Term::new(200, 50, 10_000);
+                let mut p = Processor::new();
+                let start = Instant::now();
+                for chunk in data.chunks(64 * 1024) {
+                    p.advance(&mut term, chunk);
+                }
+                best[k] = best[k].min(start.elapsed().as_secs_f64());
+            }
+        }
+        set_bulk_lines(true);
+        let mib = data.len() as f64 / (1024.0 * 1024.0);
+        println!("  {name:<18} on {:>7.0} MiB/s   off {:>7.0} MiB/s   x{:.2}", mib / best[0], mib / best[1], best[1] / best[0]);
+    }
+}

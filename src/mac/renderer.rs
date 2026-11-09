@@ -432,7 +432,15 @@ impl Renderer {
     /// dividers between them (pixel rectangles), and the tab strip. With
     /// `cursor_on_layer`, a focused cursor is left out of the frame because a
     /// Core Animation layer draws it.
-    pub fn draw_frame(&mut self, panes: &[PaneFrame], strip: Option<&Strip>, dividers: &[[f32; 4]]) {
+    /// `presented`, if given, is called with the time (seconds since boot)
+    /// the frame reached the display.
+    pub fn draw_frame(
+        &mut self,
+        panes: &[PaneFrame],
+        strip: Option<&Strip>,
+        dividers: &[[f32; 4]],
+        presented: Option<Box<dyn Fn(f64)>>,
+    ) {
         if self.atlas.overflowed {
             self.atlas.reset();
             self.atlas.overflowed = false;
@@ -565,6 +573,12 @@ impl Renderer {
         enc.endEncoding();
 
         let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
+        if let Some(f) = presented {
+            let block = block2::RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                f(unsafe { d.as_ref() }.presentedTime());
+            });
+            unsafe { drawable.addPresentedHandler(block2::RcBlock::as_ptr(&block)) };
+        }
         cb.presentDrawable(drawable);
         cb.commit();
         slot.in_flight = Some(cb);
@@ -642,7 +656,9 @@ impl Renderer {
                 }
             }
 
-            // Glyphs and decorations.
+            // Glyphs and decorations. Cells before `shaped_until` had their
+            // glyphs drawn with an earlier cell's, shaped together.
+            let mut shaped_until = 0usize;
             let mut x = 0usize;
             while x < cols {
                 let cell = cells[x];
@@ -662,8 +678,25 @@ impl Renderer {
                 }
 
                 let cell_x = pad_x + x as f32 * m.width;
-                if !cell.is_empty() && !cell.flags.contains(CellFlags::HIDDEN) {
-                    self.push_glyphs(&cell, term, cell_x, row_y, fg);
+                if x >= shaped_until && !cell.is_empty() && !cell.flags.contains(CellFlags::HIDDEN) {
+                    match self.shaped_span(cells, term, x) {
+                        Some((end, text, cell_of)) => {
+                            let bold = cell.flags.contains(CellFlags::BOLD);
+                            let italic = cell.flags.contains(CellFlags::ITALIC);
+                            let glyphs = self.fonts.shape(&text, bold, italic);
+                            // Each glyph in its own cell's colour.
+                            for g in glyphs.iter() {
+                                let cx = cell_of.get(g.index as usize).copied().unwrap_or(x);
+                                let (mut gfg, _) = self.resolve_colors(&cells[cx], term, selected(line, cx));
+                                if focused && draw_cursor && cursor.y == y && cursor.x == cx && cursor.shape == CursorShape::Block {
+                                    gfg = theme.cursor_text;
+                                }
+                                self.push_shaped(g, cell_x, row_y, gfg);
+                            }
+                            shaped_until = end;
+                        }
+                        None => self.push_glyphs(&cell, term, cell_x, row_y, fg),
+                    }
                 }
 
                 let deco_w = m.width * span as f32;
@@ -852,6 +885,100 @@ impl Renderer {
             }
             pen += cells * m.width;
         }
+    }
+
+    /// Cells from `x` that draw as one piece of shaped text, and that text:
+    /// an emoji sequence spread over cells (a ZWJ family, a skin tone, a
+    /// flag's two letters), a cluster of several characters, or with a
+    /// ligature font, a run of punctuation like `->` or `!==`. `None` for a
+    /// cell that draws alone.
+    /// Also returns, for each character of the text, the cell it's in.
+    fn shaped_span(&self, cells: &[Cell], term: &Term, x: usize) -> Option<(usize, String, Vec<usize>)> {
+        // The common case, without allocating: a lone character that no
+        // emoji sequence or ligature touches.
+        let c = cells[x].ch;
+        if c & CLUSTER_TAG == 0 {
+            if c < 0x80 {
+                let lig = self.fonts.ligatures && LIGATURE_CHARS.contains(&(c as u8));
+                let next = cells.get(x + 1).map(|n| n.ch).unwrap_or(0);
+                if !lig || next >= 0x80 || !LIGATURE_CHARS.contains(&(next as u8)) {
+                    return None;
+                }
+            } else {
+                let after = (x + 1..cells.len()).find(|&j| !cells[j].flags.contains(CellFlags::WIDE_SPACER));
+                let head = after.map(|j| cells[j].ch).filter(|h| h & CLUSTER_TAG == 0).unwrap_or(0);
+                let modifier = (0x1F3FB..=0x1F3FF).contains(&head);
+                let flag = (0x1F1E6..=0x1F1FF).contains(&c) && (0x1F1E6..=0x1F1FF).contains(&head);
+                // A cluster next could start with a modifier too.
+                let cluster_next = after.is_some_and(|j| cells[j].ch & CLUSTER_TAG != 0);
+                if !modifier && !flag && !cluster_next {
+                    return None;
+                }
+            }
+        }
+        let chars = |c: &Cell| -> Vec<char> {
+            if c.ch & CLUSTER_TAG != 0 {
+                term.cluster(c.ch).map(<[char]>::to_vec).unwrap_or_default()
+            } else {
+                char::from_u32(c.ch).into_iter().collect()
+            }
+        };
+        let first = chars(&cells[x]);
+        let next_cell = |i: usize| (i..cells.len()).find(|&j| !cells[j].flags.contains(CellFlags::WIDE_SPACER));
+
+        // Ligatures: two or more punctuation cells in one weight and slant.
+        let lig = |c: &Cell| c.ch < 0x80 && LIGATURE_CHARS.contains(&(c.ch as u8));
+        if self.fonts.ligatures && lig(&cells[x]) {
+            let style = cells[x].flags & (CellFlags::BOLD | CellFlags::ITALIC);
+            let end = (x..cells.len())
+                .find(|&j| !lig(&cells[j]) || cells[j].flags & (CellFlags::BOLD | CellFlags::ITALIC) != style)
+                .unwrap_or(cells.len());
+            if end - x >= 2 {
+                return Some((end, cells[x..end].iter().map(|c| c.ch as u8 as char).collect(), (x..end).collect()));
+            }
+            return None;
+        }
+
+        // Emoji sequences the grid keeps in separate cells, as wide as the
+        // shell counts them: joined here only to draw.
+        let is_ri = |c: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+        let mut text: Vec<char> = first.clone();
+        let mut cell_of = vec![x; first.len()];
+        let mut end = x + 1;
+        let mut ris = usize::from(first.len() == 1 && is_ri(first[0]));
+        while let Some(j) = next_cell(end) {
+            let next = chars(&cells[j]);
+            let Some(&head) = next.first() else { break };
+            let joins = text.last() == Some(&'\u{200D}')
+                || ('\u{1F3FB}'..='\u{1F3FF}').contains(&head)
+                || (ris == 1 && next.len() == 1 && is_ri(head));
+            if !joins {
+                break;
+            }
+            if is_ri(head) {
+                ris += 1;
+            }
+            cell_of.extend(std::iter::repeat_n(j, next.len()));
+            text.extend(next);
+            end = j + 1;
+        }
+        // Any multi-character cluster goes through shaping too, so the font
+        // composes or places its marks.
+        (end > x + 1 || text.len() > 1).then(|| (end, text.into_iter().collect(), cell_of))
+    }
+
+    /// One shaped glyph, at `cell_x` plus its offset.
+    fn push_shaped(&mut self, g: &super::font::Shaped, cell_x: f32, row_y: f32, fg: [u8; 3]) {
+        let m = self.fonts.metrics;
+        let Some(e) = self.atlas.get(&self.fonts, g.face, g.glyph) else {
+            return;
+        };
+        self.glyphs.push(GlyphInstance {
+            dst: [cell_x + g.x + e.left, row_y + m.ascent + e.top - g.y, e.width, e.height],
+            uv: [e.u, e.v],
+            flags: [if e.color { 1.0 } else { 0.0 }, 0.0],
+            color: srgb(fg),
+        });
     }
 
     fn push_glyphs(&mut self, cell: &Cell, term: &Term, cell_x: f32, row_y: f32, fg: [u8; 3]) {
@@ -1068,6 +1195,10 @@ pub struct Strip {
     pub tabs: Vec<(String, Option<Outcome>)>,
     pub active: usize,
 }
+
+/// Characters that take part in programming ligatures (`->`, `!=`, `|>`,
+/// `/*`): only runs of these are shaped as ligatures.
+const LIGATURE_CHARS: &[u8] = b"!#$%&*+-./:;<=>?@\\^_|~";
 
 /// One pane of a frame: its terminal and where it starts in the window's
 /// grid, in cells.

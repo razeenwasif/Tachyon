@@ -545,6 +545,35 @@ impl Grid {
     /// When the region covers the whole screen this is the O(1) ring advance
     /// and evicted lines enter scrollback. Otherwise rows are rotated in place
     /// and the evicted content is discarded, matching every other terminal.
+    /// Add a line of plain ASCII in one style to the scrollback directly,
+    /// packed from its bytes: a line that scrolls past without ever being on
+    /// screen in a frame. The same as writing it to a row and scrolling the
+    /// row off, without the cells.
+    pub fn push_history_ascii(&mut self, text: &[u8], style: &Cell, mark: RowMark) {
+        if self.max_scrollback == 0 {
+            return;
+        }
+        let mut data = if self.history.len() == self.max_scrollback {
+            self.history.pop_front().map(|p| p.data).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        data.clear();
+        let len = text.len().min(u16::MAX as usize);
+        if len > 0 {
+            data.extend_from_slice(&text[..len]);
+            data.resize(len + RUN_BYTES, 0);
+            let fu = style.flags.bits() as u32 | (style.underline as u32) << 16;
+            put_run(&mut data[len..], 0, &[style.fg.0, style.bg.0, fu]);
+        }
+        self.history.push_back(PackedRow { data, len: len as u16, runs: (len > 0) as u16, wide: false, wrapped: false, mark });
+    }
+
+    /// Whether screen row `y` is entirely blank.
+    pub fn row_is_blank(&self, y: usize) -> bool {
+        content_len(&self.screen[self.live_index(y)].cells) == 0
+    }
+
     pub fn scroll_up(&mut self, top: usize, bottom: usize, n: usize, pen: &Pen) {
         if n == 0 || top > bottom || bottom >= self.rows {
             return;

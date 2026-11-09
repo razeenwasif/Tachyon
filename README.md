@@ -127,6 +127,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
 | ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
 | ⌥⌘A | Keep the Mac awake while this pane's command runs (or its next one) |
+| ⌥⌘L | Latency ledger: where each keystroke's delay goes |
 | ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
 | ⌘D / ⌘⇧D | Split the pane: a new shell to the right / below, in the same folder |
 | ⌘⌥← ⌘⌥→ ⌘⌥↑ ⌘⌥↓, or click | Focus the pane on that side, or the one clicked |
@@ -275,8 +276,25 @@ For zsh, source `shell/tachyon-integration.zsh` from `~/.zshrc`; for fish, copy
 `shell/xdg/fish/vendor_conf.d/tachyon-integration.fish` into
 `~/.config/fish/conf.d/`. Some servers' `sshd_config` doesn't accept `LC_*`.
 
-Not yet on the Mac: split panes, ligatures, and emoji sequences that need
-shaping (skin tones, ZWJ families).
+**Latency ledger.** ⌥⌘L shows, on the prompt line, where your last
+keystroke's delay went. The key event is timed when the hardware delivered
+it, then at the write to the shell, the first byte of its echo, that echo
+parsed, the frame committed, and the frame on the display (Metal's presented
+time). The line reads, for example, `⏱ 11.8 ms (median 10.9 of 40) ·
+Tachyon 0.6 · shell 0.3 · frame wait 2.4 · display 8.5`. Over ssh, the
+shell share includes the network. The same stages are `os_signpost`
+intervals in Instruments' Points of Interest track, or
+`log stream --signpost --predicate 'subsystem == "dev.tachyon.terminal"'`.
+
+**Ligatures and emoji.** Core Text shapes what needs it. Emoji sequences
+draw as one glyph: ZWJ families, skin tones, flags, and keycaps. Combining
+marks are composed or placed by the font. With a font that has programming
+ligatures (Cascadia Code, Fira Code, JetBrains Mono), runs of punctuation such
+as `->`, `!=` and `|>` take them, each glyph in its own cell's colour.
+`font.ligatures = false` turns them off. Cell widths stay what the shell
+counts, so the cursor never drifts. A family emoji is drawn once and leaves
+the extra cells blank. Shaping is cached and only runs for cells that need
+it, so plain text draws exactly as before.
 
 ## Installing and pinning to the taskbar
 

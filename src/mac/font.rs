@@ -63,9 +63,25 @@ enum Style {
     BoldItalic = 3,
 }
 
+/// One glyph of shaped text: which face and glyph, the character it starts
+/// at, and where it goes from the text's origin, in pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shaped {
+    pub face: u16,
+    pub glyph: u16,
+    /// Index of the character (not UTF-16 unit) the glyph starts at.
+    pub index: u16,
+    pub x: f32,
+    pub y: f32,
+}
+
 pub struct FontSet {
     /// Index 0-3 are the styles of the primary family; fallbacks follow.
     faces: Vec<Face>,
+    /// Shaped text by style: emoji sequences, combining marks, ligatures.
+    shaped: FxHashMap<(String, Style), std::rc::Rc<[Shaped]>>,
+    /// The primary family has programming ligatures, and they're wanted.
+    pub ligatures: bool,
     /// Fallback faces by PostScript name, so each is created once.
     by_name: FxHashMap<String, u16>,
     /// Resolved (face, glyph) per character and style.
@@ -103,13 +119,121 @@ impl FontSet {
             })
             .collect();
 
-        crate::log!("font: {family} at {px:.1}px, cell {:.0}x{:.0}", metrics.width, metrics.height);
-        FontSet {
+        let mut set = FontSet {
             faces,
+            shaped: FxHashMap::default(),
+            ligatures: false,
             by_name: FxHashMap::default(),
             lookup: FxHashMap::default(),
             metrics,
+        };
+        // Ligatures only cost anything in fonts that have them: shape a few
+        // common ones and see whether any glyph changes.
+        set.ligatures = cfg.ligatures && set.has_ligatures();
+        crate::log!(
+            "font: {family} at {px:.1}px, cell {:.0}x{:.0}, ligatures: {}",
+            metrics.width,
+            metrics.height,
+            set.ligatures
+        );
+        set
+    }
+
+    fn has_ligatures(&mut self) -> bool {
+        let probe = "-> => != == <= >= :: && || </ /> ...";
+        let shaped = self.shape(probe, false, false);
+        let plain: Vec<Option<u16>> = probe.chars().map(|c| glyph_in(&self.faces[0].font, c)).collect();
+        shaped.len() != plain.iter().flatten().count()
+            || shaped.iter().any(|g| g.face != 0 || plain.get(g.index as usize).copied().flatten() != Some(g.glyph))
+    }
+
+    /// `text` shaped by Core Text in the primary family's style: ligatures
+    /// and contextual forms applied, emoji sequences (ZWJ families, skin
+    /// tones, flags) as one glyph, combining marks placed, and characters the
+    /// family lacks from fallback fonts. Cached.
+    pub fn shape(&mut self, text: &str, bold: bool, italic: bool) -> std::rc::Rc<[Shaped]> {
+        let style = match (bold, italic) {
+            (false, false) => Style::Regular,
+            (true, false) => Style::Bold,
+            (false, true) => Style::Italic,
+            (true, true) => Style::BoldItalic,
+        };
+        if let Some(hit) = self.shaped.get(&(text.to_string(), style)) {
+            return hit.clone();
         }
+        let glyphs: std::rc::Rc<[Shaped]> = self.shape_uncached(text, style as usize).into();
+        if self.shaped.len() > 8192 {
+            self.shaped.clear();
+        }
+        self.shaped.insert((text.to_string(), style), glyphs.clone());
+        glyphs
+    }
+
+    fn shape_uncached(&mut self, text: &str, face: usize) -> Vec<Shaped> {
+        use objc2::runtime::AnyObject;
+        use objc2::AnyThread;
+        use objc2_core_foundation::{CFArray, CFAttributedString};
+        use objc2_core_text::{CTLine, CTRun};
+        use objc2_foundation::{NSAttributedString, NSDictionary, NSString};
+
+        // The character each UTF-16 unit belongs to.
+        let mut unit_char = Vec::with_capacity(text.len());
+        for (i, c) in text.chars().enumerate() {
+            unit_char.extend(std::iter::repeat_n(i as u16, c.len_utf16()));
+        }
+        let font = &self.faces[face].font;
+        let key = NSString::from_str("NSFont");
+        // SAFETY: CTFont and NSFont are toll-free bridged.
+        let value: &AnyObject = unsafe { &*(CFRetained::as_ptr(font).as_ptr() as *const AnyObject) };
+        let attrs = NSDictionary::<NSString, AnyObject>::from_slices(&[&*key], &[value]);
+        let string = NSString::from_str(text);
+        let attributed = unsafe { NSAttributedString::initWithString_attributes(NSAttributedString::alloc(), &string, Some(&attrs)) };
+        // SAFETY: NSAttributedString is toll-free bridged with CFAttributedString.
+        let cf: &CFAttributedString = unsafe { &*(objc2::rc::Retained::as_ptr(&attributed) as *const CFAttributedString) };
+        let line = unsafe { CTLine::with_attributed_string(cf) };
+        let runs: CFRetained<CFArray> = unsafe { line.glyph_runs() };
+        let mut out = Vec::new();
+        for i in 0..runs.count() {
+            let run = unsafe { &*(runs.value_at_index(i) as *const CTRun) };
+            let n = unsafe { run.glyph_count() } as usize;
+            if n == 0 {
+                continue;
+            }
+            let mut glyphs = vec![0u16; n];
+            let mut positions = vec![CGPoint::new(0.0, 0.0); n];
+            let mut indices = vec![0 as objc2_core_foundation::CFIndex; n];
+            let all = CFRange { location: 0, length: 0 };
+            unsafe {
+                run.glyphs(all, NonNull::new_unchecked(glyphs.as_mut_ptr()));
+                run.positions(all, NonNull::new_unchecked(positions.as_mut_ptr()));
+                run.string_indices(all, NonNull::new_unchecked(indices.as_mut_ptr()));
+            }
+            // The run's font: the primary face, or one Core Text fell back to.
+            let attrs = unsafe { run.attributes() };
+            let attrs: &NSDictionary<NSString, AnyObject> = unsafe { &*(CFRetained::as_ptr(&attrs).as_ptr() as *const NSDictionary<NSString, AnyObject>) };
+            let run_face = match attrs.objectForKey(&key) {
+                Some(f) => {
+                    // SAFETY: the value under NSFont is a CTFont.
+                    let f = unsafe { CFRetained::retain(NonNull::new_unchecked(objc2::rc::Retained::as_ptr(&f) as *mut CTFont)) };
+                    let same = unsafe { f.post_script_name() }.to_string() == unsafe { self.faces[face].font.post_script_name() }.to_string();
+                    if same { face as u16 } else { self.intern(f) }
+                }
+                None => face as u16,
+            };
+            for k in 0..n {
+                if glyphs[k] == 0 {
+                    continue;
+                }
+                out.push(Shaped {
+                    face: run_face,
+                    glyph: glyphs[k],
+                    index: unit_char.get(indices[k] as usize).copied().unwrap_or(0),
+                    x: positions[k].x as f32,
+                    y: positions[k].y as f32,
+                });
+            }
+        }
+        out
     }
 
     /// The face and glyph that draw `ch`, falling back to a system font when
@@ -121,6 +245,10 @@ impl FontSet {
             (false, true) => Style::Italic,
             (true, true) => Style::BoldItalic,
         };
+        self.glyph_in_style(ch, style)
+    }
+
+    fn glyph_in_style(&mut self, ch: char, style: Style) -> Option<(u16, u16)> {
         if let Some(hit) = self.lookup.get(&(ch, style)) {
             return *hit;
         }
@@ -351,5 +479,42 @@ fn measure(font: &CTFont, cfg: &FontConfig) -> CellMetrics {
         underline_thickness: thickness as f32,
         strikeout_y: (baseline - x_height / 2.0).round() as f32,
         strikeout_thickness: thickness as f32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fonts(family: &str) -> FontSet {
+        let cfg = FontConfig { family: family.into(), size: 13.0, ..FontConfig::default() };
+        FontSet::new(&cfg, 2.0)
+    }
+
+    #[test]
+    fn emoji_sequences_shape_to_one_glyph() {
+        let mut f = fonts("Cascadia Mono");
+        for seq in ["👨\u{200D}👩\u{200D}👧", "👍\u{1F3FD}", "🇯🇵", "❤\u{FE0F}"] {
+            let g = f.shape(seq, false, false);
+            assert_eq!(g.len(), 1, "{seq:?} gave {g:?}");
+            assert!(f.faces[g[0].face as usize].color, "{seq:?} from a colour font");
+        }
+        // A combining accent is composed or placed by the font itself.
+        let g = f.shape("e\u{301}", false, false);
+        assert!(!g.is_empty() && g.iter().all(|g| g.face == 0), "{g:?}");
+    }
+
+    #[test]
+    fn ligatures_only_where_the_font_has_them() {
+        assert!(!fonts("Cascadia Mono").ligatures, "Cascadia Mono has none, by design");
+        let mut f = fonts("JetBrainsMono Nerd Font");
+        if unsafe { f.faces[0].font.family_name() }.to_string() != "JetBrainsMono Nerd Font" {
+            return; // not installed here
+        }
+        assert!(f.ligatures);
+        // `->` keeps one glyph per character, but not the plain ones.
+        let g = f.shape("->", false, false);
+        let plain = [glyph_in(&f.faces[0].font, '-'), glyph_in(&f.faces[0].font, '>')];
+        assert!(g.iter().zip(plain).any(|(s, p)| Some(s.glyph) != p), "{g:?}");
     }
 }
