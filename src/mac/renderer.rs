@@ -420,22 +420,61 @@ impl Renderer {
         (fg, bg)
     }
 
-    /// Build and present one frame. With `cursor_on_layer`, a focused cursor
-    /// is left out of the frame because a Core Animation layer draws it.
-    pub fn draw(
-        &mut self,
-        term: &Term,
-        focused: bool,
-        selection: Option<Range>,
-        cursor_on_layer: bool,
-        decor: &Decor,
-    ) {
+    /// Where a pane whose top-left cell is (`col`, `row`) of the window's
+    /// grid starts, in drawable pixels.
+    pub fn pane_origin(&self, col: usize, row: usize) -> (f32, f32) {
+        let m = self.fonts.metrics;
+        let (pad_x, pad_y) = self.padding();
+        (pad_x + col as f32 * m.width, pad_y + row as f32 * m.height)
+    }
+
+    /// Build and present one frame: each pane at its place in the grid, the
+    /// dividers between them (pixel rectangles), and the tab strip. With
+    /// `cursor_on_layer`, a focused cursor is left out of the frame because a
+    /// Core Animation layer draws it.
+    pub fn draw_frame(&mut self, panes: &[PaneFrame], strip: Option<&Strip>, dividers: &[[f32; 4]]) {
         if self.atlas.overflowed {
             self.atlas.reset();
             self.atlas.overflowed = false;
         }
-        self.build(term, focused, selection, cursor_on_layer);
-        self.build_decor(term, decor);
+        self.bg.clear();
+        self.glyphs.clear();
+        self.overlay.clear();
+        for p in panes {
+            let origin = self.pane_origin(p.col, p.row);
+            self.build(p.term, origin, p.focused, p.selection, p.cursor_on_layer);
+            // Receipt gutter bars sit in the padding left of the text, or for
+            // a pane right of a divider, in the divider's cell beside it.
+            let (pad_x, _) = self.padding();
+            let gutter_x = if p.col == 0 {
+                (pad_x * 0.35).round()
+            } else {
+                (origin.0 - self.fonts.metrics.width * 0.3).round()
+            };
+            self.build_decor(p.term, origin, gutter_x, p.decor);
+            if p.dim {
+                // A pane without focus, in a window with focus: its text
+                // recedes a little, so the one keys go to stands out.
+                let m = self.fonts.metrics;
+                let mut veil = srgb(self.cfg.theme.background);
+                veil[3] = 0.3;
+                let rect = [origin.0, origin.1, p.term.cols() as f32 * m.width, p.term.rows() as f32 * m.height];
+                self.overlay.push(RectInstance { rect, color: veil });
+            }
+        }
+        if !dividers.is_empty() {
+            let theme = &self.cfg.theme;
+            let line: [u8; 3] = std::array::from_fn(|i| {
+                (theme.background[i] as f32 + (theme.foreground[i] as f32 - theme.background[i] as f32) * 0.22).round() as u8
+            });
+            for &rect in dividers {
+                self.overlay.push(RectInstance { rect, color: srgb(line) });
+            }
+        }
+        if let Some(strip) = strip.filter(|_| self.strip_band.is_none()) {
+            let cols = self.grid_size_for(self.size.0, self.size.1).0;
+            self.build_strip(strip, cols);
+        }
 
         let Some(drawable) = self.layer.nextDrawable() else {
             crate::log!("render: no drawable");
@@ -531,14 +570,10 @@ impl Renderer {
         slot.in_flight = Some(cb);
     }
 
-    fn build(&mut self, term: &Term, focused: bool, selection: Option<Range>, cursor_on_layer: bool) {
+    fn build(&mut self, term: &Term, origin: (f32, f32), focused: bool, selection: Option<Range>, cursor_on_layer: bool) {
         let m = self.fonts.metrics;
         let theme = self.cfg.theme.clone();
-        let (pad_x, pad_y) = self.padding();
-
-        self.bg.clear();
-        self.glyphs.clear();
-        self.overlay.clear();
+        let (pad_x, pad_y) = origin;
 
         let rows = term.rows();
         let cols = term.cols();
@@ -656,13 +691,14 @@ impl Renderer {
         }
     }
 
-    /// Gutter bars in the left padding, and receipts at the right of rows.
-    fn build_decor(&mut self, term: &Term, decor: &Decor) {
+    /// Gutter bars at `gutter_x`, left of the text, and receipts at the
+    /// right of rows.
+    fn build_decor(&mut self, term: &Term, origin: (f32, f32), gutter_x: f32, decor: &Decor) {
         let m = self.fonts.metrics;
-        let (pad_x, pad_y) = self.padding();
+        let (pad_x, pad_y) = origin;
         let theme = self.cfg.theme.clone();
         let width = (self.scale * 1.5).round().max(2.0);
-        let x = (pad_x * 0.35).round();
+        let x = gutter_x;
         for &(y, outcome) in &decor.gutter {
             let color = match outcome {
                 Outcome::Running => self.palette.0[4],
@@ -725,10 +761,6 @@ impl Renderer {
             }
             let row_y = pad_y + *y as f32 * m.height;
             self.push_text(text, pad_x + start as f32 * m.width, row_y, dim);
-        }
-
-        if let Some(strip) = decor.strip.as_ref().filter(|_| self.strip_band.is_none()) {
-            self.build_strip(strip, cols);
         }
     }
 
@@ -1037,6 +1069,20 @@ pub struct Strip {
     pub active: usize,
 }
 
+/// One pane of a frame: its terminal and where it starts in the window's
+/// grid, in cells.
+pub struct PaneFrame<'a> {
+    pub term: &'a Term,
+    pub col: usize,
+    pub row: usize,
+    pub focused: bool,
+    pub selection: Option<Range>,
+    pub cursor_on_layer: bool,
+    pub decor: &'a Decor,
+    /// Veil it: a pane without focus beside one with it.
+    pub dim: bool,
+}
+
 /// Shell-integration decorations for one frame, by viewport row.
 #[derive(Default)]
 pub struct Decor {
@@ -1046,8 +1092,6 @@ pub struct Decor {
     /// Text being composed in an input method (a dead key's accent, or
     /// Japanese before conversion), drawn underlined at the cursor.
     pub preedit: String,
-    /// The tab strip, when the window has more than one tab.
-    pub strip: Option<Strip>,
 }
 
 /// What the cursor layer should show: a rectangle in drawable pixels and, for
@@ -1063,13 +1107,14 @@ pub struct CursorOverlay {
 impl Renderer {
     /// The cursor as a layer would draw it, or `None` when it should not be
     /// shown (hidden, or scrolled back into history).
-    pub fn cursor_overlay(&mut self, term: &Term) -> Option<CursorOverlay> {
+    /// `col` and `row` place the terminal's pane in the window's grid.
+    pub fn cursor_overlay(&mut self, term: &Term, col: usize, row: usize) -> Option<CursorOverlay> {
         let cursor = term.cursor_state();
         if !cursor.visible || term.grid().display_offset() != 0 {
             return None;
         }
         let m = self.fonts.metrics;
-        let (pad_x, pad_y) = self.padding();
+        let (pad_x, pad_y) = self.pane_origin(col, row);
         let theme = self.cfg.theme.clone();
         let x = pad_x + cursor.x as f32 * m.width;
         let y = pad_y + cursor.y as f32 * m.height;

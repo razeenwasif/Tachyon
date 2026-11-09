@@ -21,6 +21,7 @@ mod font;
 mod input;
 mod links;
 mod notify;
+mod panes;
 mod pty;
 mod receipts;
 mod renderer;
@@ -69,7 +70,7 @@ use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Te
 use rustc_hash::FxHashMap;
 use pty::Pty;
 use input::{MouseButton, MouseEventKind};
-use renderer::{CursorOverlay, Decor, Gpu, Outcome, Renderer, Strip};
+use renderer::{CursorOverlay, Decor, Gpu, Outcome, PaneFrame, Renderer, Strip};
 use selection::{Pos, Selection, Unit};
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/icon/tachyon.svg");
@@ -106,11 +107,12 @@ fn with_window(id: u64, f: impl FnOnce(&mut TermWindow)) {
     });
 }
 
-/// Run `f` against the window holding a tab, with the tab's index in it.
-fn with_tab(tab: u64, f: impl FnOnce(&mut TermWindow, usize)) {
+/// Run `f` against the window holding a pane (a shell session), with the
+/// index of the pane's tab.
+fn with_tab(pane: u64, f: impl FnOnce(&mut TermWindow, usize)) {
     with_app(|app| {
         for w in &mut app.windows {
-            if let Some(i) = w.tabs.iter().position(|t| t.id == tab) {
+            if let Some(i) = w.tabs.iter().position(|t| t.index_of(pane).is_some()) {
                 f(w, i);
                 return;
             }
@@ -210,12 +212,15 @@ fn quick_look(path: std::path::PathBuf) {
     }
 }
 
-/// A notification was clicked: show its window and tab.
-fn show_tab(tab: u64) {
+/// A notification was clicked: show its window, tab and pane.
+fn show_tab(pane: u64) {
     let window = with_app(|app| {
         for w in &mut app.windows {
-            if let Some(i) = w.tabs.iter().position(|t| t.id == tab) {
+            if let Some(i) = w.tabs.iter().position(|t| t.index_of(pane).is_some()) {
                 w.switch_to(i);
+                if let Some(p) = w.tabs[i].index_of(pane) {
+                    w.focus_pane(p);
+                }
                 return Some(w.window.clone());
             }
         }
@@ -399,6 +404,55 @@ define_class!(
         #[unsafe(method(tachyonFollowJob:))]
         fn follow_job(&self, _sender: Option<&AnyObject>) {
             follow_job(self.id(), None);
+        }
+
+        #[unsafe(method(tachyonSplitRight:))]
+        fn split_right(&self, _sender: Option<&AnyObject>) {
+            split_pane(self.id(), panes::Dir::Right);
+        }
+
+        #[unsafe(method(tachyonSplitDown:))]
+        fn split_down(&self, _sender: Option<&AnyObject>) {
+            split_pane(self.id(), panes::Dir::Down);
+        }
+
+        #[unsafe(method(tachyonPaneLeft:))]
+        fn pane_left(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.move_focus(-1, 0));
+        }
+
+        #[unsafe(method(tachyonPaneRight:))]
+        fn pane_right(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.move_focus(1, 0));
+        }
+
+        #[unsafe(method(tachyonPaneUp:))]
+        fn pane_up(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.move_focus(0, -1));
+        }
+
+        #[unsafe(method(tachyonPaneDown:))]
+        fn pane_down(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.move_focus(0, 1));
+        }
+
+        #[unsafe(method(tachyonZoomPane:))]
+        fn zoom_pane(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.toggle_zoom());
+        }
+
+        /// Resize pointers over the dividers between panes.
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            let rects = query_window(self.id(), |w| w.divider_cursor_rects()).unwrap_or_default();
+            for (rect, side_by_side) in rects {
+                let cursor = if side_by_side {
+                    NSCursor::columnResizeCursorInDirections(objc2_app_kit::NSHorizontalDirections::All)
+                } else {
+                    NSCursor::rowResizeCursorInDirections(objc2_app_kit::NSVerticalDirections::All)
+                };
+                self.addCursorRect_cursor(rect, &cursor);
+            }
         }
 
         #[unsafe(method(tachyonCloseTab:))]
@@ -890,8 +944,9 @@ impl RewindBadge {
     }
 }
 
-/// One shell session in a window.
-struct Tab {
+/// One shell session: a pane of a tab. Its id is the session's, which the
+/// reader thread, notifications and the Dock know it by.
+struct Pane {
     id: u64,
     term: Arc<Mutex<Term>>,
     pty: Arc<Pty>,
@@ -899,22 +954,36 @@ struct Tab {
     /// cleared when the main thread handles it. Keeps the main queue from
     /// filling with redundant wake-ups during a flood of output.
     wake_pending: Arc<AtomicBool>,
-    /// What the tab is called: the running command, the folder, or a title
-    /// the program set. Refreshed when `Term::title_revision` moves.
+    /// The window's per-pane state, kept here while another pane has focus.
+    saved: PaneState,
+    /// The cluster job this pane follows, if Tachyon opened it for one.
+    job: Option<JobRef>,
+    /// Its recent output, for Rewind.
+    log: Arc<Mutex<RewindLog>>,
+    /// Where it is in the window's grid.
+    rect: panes::Rect,
+}
+
+/// A tab: one pane, or several split from it.
+struct Tab {
+    panes: Vec<Pane>,
+    /// The pane with focus, which keys go to.
+    focus: usize,
+    layout: panes::Node,
+    /// The focused pane fills the tab for now; the others keep running.
+    zoomed: bool,
+    dividers: Vec<panes::Divider>,
+    /// What the tab is called: the focused pane's running command, folder,
+    /// or a title its program set. Refreshed when `Term::title_revision`
+    /// moves.
     label: String,
     title_rev: u64,
     /// A command finished here while the tab was in the background.
     unseen: Option<Outcome>,
-    /// The window's per-tab state, kept here while another tab is in front.
-    saved: TabState,
-    /// The cluster job this tab follows, if Tachyon opened it for one.
-    job: Option<JobRef>,
-    /// Its recent output, for Rewind.
-    log: Arc<Mutex<RewindLog>>,
 }
 
-/// Per-tab state the window works on directly while the tab is in front.
-struct TabState {
+/// Per-pane state the window works on directly while the pane has focus.
+struct PaneState {
     selection: Option<Selection>,
     preedit: String,
     mouse_held: Option<MouseButton>,
@@ -923,9 +992,9 @@ struct TabState {
     sync_since: Option<Instant>,
 }
 
-impl Default for TabState {
+impl Default for PaneState {
     fn default() -> Self {
-        TabState {
+        PaneState {
             selection: None,
             preedit: String::new(),
             mouse_held: None,
@@ -936,27 +1005,88 @@ impl Default for TabState {
     }
 }
 
-impl Tab {
-    fn start(id: u64, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>) -> Result<Tab, String> {
+impl Pane {
+    /// Start a shell, in `cwd` when given (a split starts where the pane it
+    /// came from is), otherwise at home.
+    fn start(
+        id: u64,
+        cfg: &Config,
+        cols: usize,
+        rows: usize,
+        job: Option<JobRef>,
+        cwd: Option<&str>,
+    ) -> Result<Pane, String> {
         let wake_pending = Arc::new(AtomicBool::new(false));
         let run = job.as_ref().and_then(follow_command);
-        let (term, pty, log) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending), run.as_deref())?;
-        Ok(Tab {
+        let (term, pty, log) = start_session(id, cfg, cols, rows, Arc::clone(&wake_pending), run.as_deref(), cwd)?;
+        Ok(Pane {
             id,
             term,
             pty,
             wake_pending,
-            label: String::new(),
-            title_rev: u64::MAX,
-            unseen: None,
-            saved: TabState::default(),
+            saved: PaneState::default(),
             job,
             log,
+            rect: panes::Rect { col: 0, row: 0, cols, rows },
         })
     }
 }
 
-impl Drop for Tab {
+impl Tab {
+    fn new(pane: Pane) -> Tab {
+        Tab {
+            layout: panes::Node::Leaf(pane.id),
+            panes: vec![pane],
+            focus: 0,
+            zoomed: false,
+            dividers: Vec::new(),
+            label: String::new(),
+            title_rev: u64::MAX,
+            unseen: None,
+        }
+    }
+
+    /// The pane with focus.
+    fn pane(&self) -> &Pane {
+        &self.panes[self.focus]
+    }
+
+    fn index_of(&self, pane: u64) -> Option<usize> {
+        self.panes.iter().position(|p| p.id == pane)
+    }
+
+    /// The panes on screen and where: all of them, or the focused one alone
+    /// when zoomed.
+    fn visible(&self) -> Vec<usize> {
+        if self.zoomed { vec![self.focus] } else { (0..self.panes.len()).collect() }
+    }
+
+    /// Lay the panes out in a grid of `cols` by `rows`, resizing each whose
+    /// size changed.
+    fn lay_out(&mut self, cols: usize, rows: usize) {
+        let area = panes::Rect { col: 0, row: 0, cols, rows };
+        let (rects, dividers) = if self.zoomed {
+            (vec![(self.pane().id, area)], Vec::new())
+        } else {
+            self.layout.layout(area)
+        };
+        self.dividers = dividers;
+        for (id, rect) in rects {
+            let Some(p) = self.panes.iter_mut().find(|p| p.id == id) else {
+                continue;
+            };
+            let rect = panes::Rect { cols: rect.cols.max(1), rows: rect.rows.max(1), ..rect };
+            if (rect.cols, rect.rows) != (p.rect.cols, p.rect.rows) {
+                p.term.lock().resize(rect.cols, rect.rows);
+                p.log.lock().record_resize(rect.cols, rect.rows);
+                p.pty.resize(rect.cols as u16, rect.rows as u16);
+            }
+            p.rect = rect;
+        }
+    }
+}
+
+impl Drop for Pane {
     fn drop(&mut self) {
         dock::set_progress(self.id, None);
         // The reader thread holds the PTY too, so dropping ours does not end
@@ -1025,6 +1155,8 @@ struct TermWindow {
     rewound: Option<Rewound>,
     rewind_badge: Option<RewindBadge>,
     glass_tint: f32,
+    /// A divider being dragged to resize the panes beside it.
+    dragging_divider: Option<panes::Divider>,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -1056,11 +1188,16 @@ impl TermWindow {
     }
 
     fn tick(&mut self) {
-        self.tabs[self.active].wake_pending.store(false, Ordering::Release);
-
-        let (dirty, syncing, title_rev) = {
-            let mut t = self.term.lock();
-            (t.take_dirty(), t.mode.contains(TermMode::SYNC_UPDATE), t.title_revision)
+        let tab = &self.tabs[self.active];
+        let mut dirty = false;
+        for &p in &tab.visible() {
+            let pane = &tab.panes[p];
+            pane.wake_pending.store(false, Ordering::Release);
+            dirty |= pane.term.lock().take_dirty();
+        }
+        let (syncing, title_rev) = {
+            let t = self.term.lock();
+            (t.mode.contains(TermMode::SYNC_UPDATE), t.title_revision)
         };
         if dirty {
             self.needs_redraw = true;
@@ -1084,34 +1221,7 @@ impl TermWindow {
             self.needs_redraw = false;
             self.idle_ticks = 0;
             self.update_secure_input();
-            let term = self.term.lock();
-            let blink = self.focused && term.cursor_state().blinking;
-            let selection = self.selection.and_then(|s| s.range(&term));
-            let mut decor = command_decor(&term, &self.followed);
-            decor.preedit = self.preedit.clone();
-            if self.secure {
-                decor.notes.push((term.cursor_state().y, "Secure Keyboard Entry".into()));
-            }
-            if self.tabs.len() > 1 {
-                let tabs: Vec<_> = self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect();
-                match &self.capsule {
-                    Some(c) if self.native_strip => c.view.set_tabs(tabs, self.active),
-                    _ => decor.strip = Some(Strip { tabs, active: self.active }),
-                }
-            }
-            if let Some(rw) = &self.rewound {
-                // An earlier screen: no selection, marks or cursor layer,
-                // since they belong to the live one.
-                drop(term);
-                let decor = Decor { strip: decor.strip, ..Decor::default() };
-                self.renderer.draw(&rw.term, self.focused, None, false, &decor);
-                self.update_cursor_layer(None);
-            } else {
-                self.renderer.draw(&term, self.focused, selection, blink, &decor);
-                let overlay = if blink { self.renderer.cursor_overlay(&term) } else { None };
-                drop(term);
-                self.update_cursor_layer(overlay);
-            }
+            self.draw();
         } else {
             // Nothing changed for a few refreshes: stop the display link. The
             // next byte from the shell or key press resumes it.
@@ -1122,15 +1232,112 @@ impl TermWindow {
         }
     }
 
+    /// Draw the tab in front: each pane on screen, the dividers between
+    /// them, and the tab strip.
+    fn draw(&mut self) {
+        let mut strip = None;
+        if self.tabs.len() > 1 {
+            let tabs: Vec<_> = self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect();
+            match &self.capsule {
+                Some(c) if self.native_strip => c.view.set_tabs(tabs, self.active),
+                _ => strip = Some(Strip { tabs, active: self.active }),
+            }
+        }
+        let tab = &self.tabs[self.active];
+        let visible = tab.visible();
+        // Every pane's terminal, locked for the frame: the focused one through
+        // the window's handle, the rest through their own.
+        let guards: Vec<_> = visible.iter().map(|&p| tab.panes[p].term.lock()).collect();
+        let focus_at = visible.iter().position(|&p| p == tab.focus);
+        let mut decors = Vec::with_capacity(visible.len());
+        let mut selections = Vec::with_capacity(visible.len());
+        for (k, &p) in visible.iter().enumerate() {
+            let term = &guards[k];
+            let mut decor = command_decor(term, &self.followed);
+            let selection = if p == tab.focus {
+                decor.preedit = self.preedit.clone();
+                if self.secure {
+                    decor.notes.push((term.cursor_state().y, "Secure Keyboard Entry".into()));
+                }
+                self.selection
+            } else {
+                tab.panes[p].saved.selection
+            };
+            selections.push(selection.and_then(|s| s.range(term)));
+            decors.push(decor);
+        }
+        let blink = self.focused && focus_at.is_some_and(|k| guards[k].cursor_state().blinking) && self.rewound.is_none();
+        let empty = Decor::default();
+        let frames: Vec<PaneFrame> = visible
+            .iter()
+            .enumerate()
+            .map(|(k, &p)| {
+                let rect = tab.panes[p].rect;
+                let focused = p == tab.focus;
+                match (&self.rewound, focused) {
+                    // An earlier screen: no selection, marks or cursor layer,
+                    // since they belong to the live one.
+                    (Some(rw), true) => PaneFrame {
+                        term: &rw.term,
+                        col: rect.col,
+                        row: rect.row,
+                        focused: self.focused,
+                        selection: None,
+                        cursor_on_layer: false,
+                        decor: &empty,
+                        dim: false,
+                    },
+                    _ => PaneFrame {
+                        term: &guards[k],
+                        col: rect.col,
+                        row: rect.row,
+                        focused: self.focused && focused,
+                        selection: selections[k],
+                        cursor_on_layer: focused && blink,
+                        decor: &decors[k],
+                        dim: self.focused && !focused,
+                    },
+                }
+            })
+            .collect();
+        let dividers: Vec<[f32; 4]> = tab.dividers.iter().map(|d| self.divider_pixels(d)).collect();
+        self.renderer.draw_frame(&frames, strip.as_ref(), &dividers);
+        let overlay = match focus_at {
+            Some(k) if blink => {
+                let rect = tab.panes[tab.focus].rect;
+                self.renderer.cursor_overlay(&guards[k], rect.col, rect.row)
+            }
+            _ => None,
+        };
+        drop(frames);
+        drop(guards);
+        self.update_cursor_layer(overlay);
+    }
+
+    /// A divider as a hairline down (or across) the middle of its cells, in
+    /// drawable pixels.
+    fn divider_pixels(&self, d: &panes::Divider) -> [f32; 4] {
+        let m = self.renderer.metrics();
+        let (x, y) = self.renderer.pane_origin(d.rect.col, d.rect.row);
+        let hair = (self.scale() as f32).round().max(1.0);
+        match d.dir {
+            panes::Dir::Right => [(x + (m.width - hair) / 2.0).round(), y, hair, d.rect.rows as f32 * m.height],
+            panes::Dir::Down => [x, (y + (m.height - hair) / 2.0).round(), d.rect.cols as f32 * m.width, hair],
+        }
+    }
+
     /// A command finished in tab `i`. A background tab gets a mark in the
     /// tab strip; if it ran a while and the window is not in front, the Dock
     /// icon bounces once.
-    fn command_finished(&mut self, i: usize, cmd: u32) {
+    fn command_finished(&mut self, i: usize, pane: u64, cmd: u32) {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
+        let Some(p) = self.tabs[i].index_of(pane) else {
+            return;
+        };
         let finished = {
-            let term = self.tabs[i].term.lock();
+            let term = self.tabs[i].panes[p].term.lock();
             term.command(cmd).map(|info| {
                 let elapsed = info.elapsed().unwrap_or_default();
                 let failed = info.exit.is_some_and(|e| e != 0);
@@ -1143,7 +1350,7 @@ impl TermWindow {
         let Some((elapsed, failed, mut title, folder, receipt)) = finished else {
             return;
         };
-        if let Some(job) = &self.tabs[i].job {
+        if let Some(job) = &self.tabs[i].panes[p].job {
             title = format!("{} {}", job.title(), if failed { "failed" } else { "finished" });
         }
         if i != self.active {
@@ -1160,7 +1367,7 @@ impl TermWindow {
         if elapsed < threshold {
             return;
         }
-        let tab = self.tabs[i].id;
+        let tab = pane;
         let posted = self.notify_after.is_some()
             && NOTIFIER.with(|n| n.borrow().as_ref().map(|n| n.post(tab, cmd, &title, &folder, &receipt)).is_some());
         if !posted {
@@ -1295,8 +1502,10 @@ impl TermWindow {
     /// Output arrived in a tab that is not in front. Its screen is drawn when
     /// it comes forward; only its name in the strip may need redrawing now.
     fn background_output(&mut self, i: usize) {
-        self.tabs[i].wake_pending.store(false, Ordering::Release);
-        let rev = self.tabs[i].term.lock().title_revision;
+        for pane in &self.tabs[i].panes {
+            pane.wake_pending.store(false, Ordering::Release);
+        }
+        let rev = self.tabs[i].pane().term.lock().title_revision;
         if rev != self.tabs[i].title_rev {
             self.refresh_label(i);
         }
@@ -1305,8 +1514,9 @@ impl TermWindow {
     /// Rename tab `i` from its terminal, and the window if it is in front.
     fn refresh_label(&mut self, i: usize) {
         let (label, rev) = {
-            let term = self.tabs[i].term.lock();
-            let label = match &self.tabs[i].job {
+            let pane = self.tabs[i].pane();
+            let term = pane.term.lock();
+            let label = match &pane.job {
                 Some(job) => job_label(&term, job),
                 None => tab_label(&term),
             };
@@ -1336,6 +1546,7 @@ impl TermWindow {
         self.save_live();
         self.active = i;
         self.load_live();
+        self.window.invalidateCursorRectsForView(&self.view);
     }
 
     /// ⌘1 to ⌘8 pick that tab; ⌘9 picks the last.
@@ -1377,9 +1588,148 @@ impl TermWindow {
         self.layout();
     }
 
-    /// Park the per-tab state of the tab in front in it.
+    /// Give focus to pane `p` of the tab in front.
+    fn focus_pane(&mut self, p: usize) {
+        let tab = &self.tabs[self.active];
+        if p >= tab.panes.len() || p == tab.focus {
+            return;
+        }
+        self.save_live();
+        let tab = &mut self.tabs[self.active];
+        tab.focus = p;
+        // Another pane can't have focus behind a zoomed one.
+        if std::mem::take(&mut tab.zoomed) {
+            self.layout();
+        }
+        self.load_live();
+    }
+
+    /// ⌘⌥ and an arrow: focus the pane on that side.
+    fn move_focus(&mut self, dx: i32, dy: i32) {
+        let tab = &self.tabs[self.active];
+        let area = panes::Rect { col: 0, row: 0, cols: self.grid.0, rows: self.grid.1 };
+        let (rects, _) = tab.layout.layout(area);
+        let from = rects.iter().find(|r| r.0 == tab.pane().id).map(|r| r.1).unwrap_or(area);
+        match panes::neighbor(&rects, from, dx, dy).and_then(|id| tab.index_of(id)) {
+            Some(p) => self.focus_pane(p),
+            None => objc2_app_kit::NSBeep(),
+        }
+    }
+
+    /// ⌘⇧↩: the focused pane fills the tab, or goes back to its place.
+    fn toggle_zoom(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        if tab.panes.len() < 2 {
+            objc2_app_kit::NSBeep();
+            return;
+        }
+        tab.zoomed = !tab.zoomed;
+        self.rewind_exit();
+        self.layout();
+    }
+
+    /// Close pane `p` of tab `i`: the rest of its split takes its place and,
+    /// if it had focus, the focus. Its last pane closes the tab; the last
+    /// tab's last pane returns the window, for the caller to close outside
+    /// the app-state borrow.
+    fn close_pane(&mut self, i: usize, p: usize) -> Option<Retained<NSWindow>> {
+        if self.tabs[i].panes.len() == 1 {
+            if self.tabs.len() == 1 {
+                return Some(self.window.clone());
+            }
+            self.remove_tab(i);
+            return None;
+        }
+        let in_front = i == self.active && p == self.tabs[i].focus;
+        if in_front {
+            self.rewind_exit();
+        }
+        let tab = &mut self.tabs[i];
+        let next = tab.layout.remove(tab.panes[p].id);
+        tab.zoomed = false;
+        tab.panes.remove(p);
+        if p == tab.focus {
+            tab.focus = next.and_then(|id| tab.index_of(id)).unwrap_or(0);
+            if i == self.active {
+                // Its live state goes with it.
+                self.load_live();
+            }
+        } else if p < tab.focus {
+            tab.focus -= 1;
+        }
+        self.layout();
+        None
+    }
+
+    /// Where a mouse event is in the window's grid, in fractional cells.
+    fn grid_point(&self, event: &NSEvent) -> (f32, f32) {
+        let p = self.view.convertPoint_fromView(event.locationInWindow(), None);
+        let scale = self.scale() as f32;
+        let height = self.view.bounds().size.height as f32;
+        let (x, y) = (p.x as f32 * scale, (height - p.y as f32) * scale);
+        let m = self.renderer.metrics();
+        let (pad_x, pad_y) = self.renderer.padding();
+        ((x - pad_x) / m.width, (y - pad_y) / m.height)
+    }
+
+    /// The pane on screen under a mouse event, if any.
+    fn pane_at(&self, event: &NSEvent) -> Option<usize> {
+        let (fx, fy) = self.grid_point(event);
+        if fx < 0.0 || fy < 0.0 {
+            return None;
+        }
+        let tab = &self.tabs[self.active];
+        tab.visible().into_iter().find(|&p| tab.panes[p].rect.contains(fx as usize, fy as usize))
+    }
+
+    /// The divider under a mouse event, if any.
+    fn divider_at(&self, event: &NSEvent) -> Option<panes::Divider> {
+        let (fx, fy) = self.grid_point(event);
+        if fx < 0.0 || fy < 0.0 {
+            return None;
+        }
+        self.tabs[self.active].dividers.iter().find(|d| d.rect.contains(fx as usize, fy as usize)).cloned()
+    }
+
+    /// Drag a divider to the cell under the pointer.
+    fn drag_divider(&mut self, event: &NSEvent) {
+        let Some(d) = &self.dragging_divider else {
+            return;
+        };
+        let (fx, fy) = self.grid_point(event);
+        let ratio = panes::ratio_at(d, fx.max(0.0) as usize, fy.max(0.0) as usize);
+        let tab = &mut self.tabs[self.active];
+        let before = tab.dividers.clone();
+        tab.layout.set_ratio(&d.path, ratio);
+        let (cols, rows) = self.grid;
+        tab.lay_out(cols, rows);
+        if tab.dividers != before {
+            self.view.window().map(|w| w.invalidateCursorRectsForView(&self.view));
+            self.request_redraw();
+        }
+    }
+
+    /// Where the dividers are, in view points, and whether each one divides
+    /// side by side; the view gives them resize pointers.
+    fn divider_cursor_rects(&self) -> Vec<(NSRect, bool)> {
+        let m = self.renderer.metrics();
+        let s = self.scale();
+        let height = self.view.bounds().size.height;
+        self.tabs[self.active]
+            .dividers
+            .iter()
+            .map(|d| {
+                let (x, y) = self.renderer.pane_origin(d.rect.col, d.rect.row);
+                let (w, h) = (d.rect.cols as f32 * m.width, d.rect.rows as f32 * m.height);
+                let (x, y, w, h) = (x as f64 / s, y as f64 / s, w as f64 / s, h as f64 / s);
+                (NSRect::new(NSPoint::new(x, height - y - h), NSSize::new(w, h)), d.dir == panes::Dir::Right)
+            })
+            .collect()
+    }
+
+    /// Park the per-pane state of the focused pane in it.
     fn save_live(&mut self) {
-        let saved = TabState {
+        let saved = PaneState {
             selection: self.selection.take(),
             preedit: std::mem::take(&mut self.preedit),
             mouse_held: self.mouse_held.take(),
@@ -1387,17 +1737,19 @@ impl TermWindow {
             scroll_accum: self.scroll_accum,
             sync_since: self.sync_since.take(),
         };
-        self.tabs[self.active].saved = saved;
+        let tab = &mut self.tabs[self.active];
+        tab.panes[tab.focus].saved = saved;
     }
 
     /// Take up the per-tab state of the tab now in front.
     fn load_live(&mut self) {
         self.rewind_exit();
         let tab = &mut self.tabs[self.active];
-        let s = std::mem::take(&mut tab.saved);
         tab.unseen = None;
-        self.term = Arc::clone(&tab.term);
-        self.pty = Arc::clone(&tab.pty);
+        let pane = &mut tab.panes[tab.focus];
+        let s = std::mem::take(&mut pane.saved);
+        self.term = Arc::clone(&pane.term);
+        self.pty = Arc::clone(&pane.pty);
         self.selection = s.selection;
         self.preedit = s.preedit;
         self.mouse_held = s.mouse_held;
@@ -1440,13 +1792,12 @@ impl TermWindow {
         if grid != self.grid {
             crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
             self.grid = grid;
-            // Every tab, so one brought forward is already the right size.
-            for tab in &self.tabs {
-                tab.term.lock().resize(grid.0, grid.1);
-                tab.log.lock().record_resize(grid.0, grid.1);
-                tab.pty.resize(grid.0 as u16, grid.1 as u16);
-            }
         }
+        // Every tab, so one brought forward is already the right size.
+        for tab in &mut self.tabs {
+            tab.lay_out(grid.0, grid.1);
+        }
+        self.window.invalidateCursorRectsForView(&self.view);
         self.update_resize_increments();
         self.request_redraw();
     }
@@ -1584,7 +1935,8 @@ impl TermWindow {
     fn cursor_screen_rect(&mut self) -> NSRect {
         let c = self.term.lock().cursor_state();
         let m = self.renderer.metrics();
-        let (pad_x, pad_y) = self.renderer.padding();
+        let rect = self.tabs[self.active].pane().rect;
+        let (pad_x, pad_y) = self.renderer.pane_origin(rect.col, rect.row);
         let s = self.scale();
         let h = self.view.bounds().size.height;
         let x = (pad_x + c.x as f32 * m.width) as f64 / s;
@@ -1644,12 +1996,20 @@ impl TermWindow {
             return;
         }
 
-        let mode = self.term.lock().mode;
+        // The wheel scrolls the pane under the pointer, focused or not.
+        let p = self.pane_at(event).unwrap_or(self.tabs[self.active].focus);
+        let (term, pty) = {
+            let pane = &self.tabs[self.active].panes[p];
+            (Arc::clone(&pane.term), Arc::clone(&pane.pty))
+        };
+        let mode = term.lock().mode;
         if mode.intersects(TermMode::ANY_MOUSE) {
-            let (_, cell) = self.cell_at(event);
+            let (_, cell) = self.cell_in(event, p);
             let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
             for _ in 0..lines.unsigned_abs() {
-                self.report(button, MouseEventKind::Press, cell, event);
+                if let Some(bytes) = input::encode_mouse(button, MouseEventKind::Press, cell.0, cell.1, Self::mods_of(event), mode) {
+                    let _ = pty.write(&bytes);
+                }
             }
             return;
         }
@@ -1662,9 +2022,9 @@ impl TermWindow {
                 (false, true) => b"\x1bOB",
                 (false, false) => b"\x1b[B",
             };
-            let _ = self.pty.write(&arrow.repeat(lines.unsigned_abs()));
+            let _ = pty.write(&arrow.repeat(lines.unsigned_abs()));
         } else {
-            self.term.lock().scroll_display(lines);
+            term.lock().scroll_display(lines);
             self.request_redraw();
         }
     }
@@ -1685,16 +2045,18 @@ impl TermWindow {
     /// The grid position under a mouse event: the selection position (with
     /// an absolute line) and the screen cell an application would be told.
     fn cell_at(&self, event: &NSEvent) -> (Pos, (usize, usize)) {
-        let p = self.view.convertPoint_fromView(event.locationInWindow(), None);
-        let scale = self.scale() as f32;
-        let height = self.view.bounds().size.height as f32;
-        let (x, y) = (p.x as f32 * scale, (height - p.y as f32) * scale);
-        let m = self.renderer.metrics();
-        let (pad_x, pad_y) = self.renderer.padding();
-        let fx = (x - pad_x) / m.width;
-        let fy = (y - pad_y) / m.height;
+        self.cell_in(event, self.tabs[self.active].focus)
+    }
 
-        let term = self.term.lock();
+    /// Like `cell_at`, in pane `p` of the tab in front; a point outside the
+    /// pane gives its nearest cell.
+    fn cell_in(&self, event: &NSEvent, p: usize) -> (Pos, (usize, usize)) {
+        let (gx, gy) = self.grid_point(event);
+        let pane = &self.tabs[self.active].panes[p];
+        let fx = gx - pane.rect.col as f32;
+        let fy = gy - pane.rect.row as f32;
+
+        let term = pane.term.lock();
         let (cols, rows) = (term.cols(), term.rows());
         let row = (fy.floor().max(0.0) as usize).min(rows.saturating_sub(1));
         let cell = (fx.floor().max(0.0) as usize).min(cols.saturating_sub(1));
@@ -1758,9 +2120,20 @@ impl TermWindow {
                 self.window.performWindowDragWithEvent(event);
                 return;
             }
-            if f.contains(NSEventModifierFlags::Command) && self.open_under_pointer(event) {
+            if let Some(d) = self.divider_at(event) {
+                self.dragging_divider = Some(d);
                 return;
             }
+        }
+        // A click in another pane gives it focus, and then counts there.
+        if let Some(p) = self.pane_at(event) {
+            self.focus_pane(p);
+        }
+        if button == MouseButton::Left
+            && event.modifierFlags().contains(NSEventModifierFlags::Command)
+            && self.open_under_pointer(event)
+        {
+            return;
         }
 
         let (pos, cell) = self.cell_at(event);
@@ -1786,6 +2159,10 @@ impl TermWindow {
     }
 
     fn mouse_dragged(&mut self, event: &NSEvent, button: MouseButton) {
+        if self.dragging_divider.is_some() {
+            self.drag_divider(event);
+            return;
+        }
         let (pos, cell) = self.cell_at(event);
         if self.mouse_held == Some(button) {
             if cell != self.mouse_cell {
@@ -1800,6 +2177,9 @@ impl TermWindow {
     }
 
     fn mouse_up(&mut self, event: &NSEvent, button: MouseButton) {
+        if self.dragging_divider.take().is_some() {
+            return;
+        }
         if self.mouse_held == Some(button) {
             self.mouse_held = None;
             let (_, cell) = self.cell_at(event);
@@ -1820,7 +2200,7 @@ impl TermWindow {
     /// ⌘[ and ⌘]: show the screen one frame earlier or later. Stepping
     /// forward past the newest frame goes back to live.
     fn rewind_step(&mut self, back: bool) {
-        let log = Arc::clone(&self.tabs[self.active].log);
+        let log = Arc::clone(&self.tabs[self.active].pane().log);
         let log = log.lock();
         let frames = log.frames();
         if frames.len() < 2 {
@@ -1845,7 +2225,7 @@ impl TermWindow {
 
     /// Show frame `index`, from ⌘[ / ⌘], the slider or the wheel.
     fn rewind_to(&mut self, index: usize) {
-        let log = Arc::clone(&self.tabs[self.active].log);
+        let log = Arc::clone(&self.tabs[self.active].pane().log);
         let log = log.lock();
         let frames = log.frames();
         let Some(&(seq, at)) = frames.get(index) else {
@@ -1868,7 +2248,7 @@ impl TermWindow {
         let (_, (x, y)) = self.cell_at(event);
         let Some(rw) = &self.rewound else { return };
         let ch = rw.term.grid().row(y).cells().get(x).and_then(|c| c.scalar()).unwrap_or(' ');
-        let log = Arc::clone(&self.tabs[self.active].log);
+        let log = Arc::clone(&self.tabs[self.active].pane().log);
         let found = log.lock().provenance(rw.seq, x, y);
         let note = match found {
             Some(p) => {
@@ -1925,7 +2305,8 @@ impl TermWindow {
     /// Over a line rerun diff marked: a tooltip with the line it replaced.
     fn update_tooltip(&mut self, event: &NSEvent) {
         let (pos, _) = self.cell_at(event);
-        let note = self.term.lock().rerun_note(pos.line);
+        let here = self.pane_at(event) == Some(self.tabs[self.active].focus);
+        let note = if here { self.term.lock().rerun_note(pos.line) } else { None };
         if note != self.tooltip {
             self.view.setToolTip(note.as_deref().map(NSString::from_str).as_deref());
             self.tooltip = note;
@@ -1936,6 +2317,9 @@ impl TermWindow {
     fn mouse_moved(&mut self, event: &NSEvent) {
         self.update_tooltip(event);
         if self.mouse_held.is_some() || !self.term.lock().mode.contains(TermMode::MOUSE_MOTION) {
+            return;
+        }
+        if self.pane_at(event) != Some(self.tabs[self.active].focus) {
             return;
         }
         let (_, cell) = self.cell_at(event);
@@ -2350,8 +2734,8 @@ impl App {
 
         let tab_id = self.next_tab;
         self.next_tab += 1;
-        let tab = Tab::start(tab_id, cfg, cfg.window.cols, cfg.window.rows, None)?;
-        let (term, pty) = (Arc::clone(&tab.term), Arc::clone(&tab.pty));
+        let tab = Tab::new(Pane::start(tab_id, cfg, cfg.window.cols, cfg.window.rows, None, None)?);
+        let (term, pty) = (Arc::clone(&tab.pane().term), Arc::clone(&tab.pane().pty));
 
         let link = unsafe { view.displayLinkWithTarget_selector(&view, sel!(tick:)) };
         unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
@@ -2395,6 +2779,7 @@ impl App {
             tooltip: None,
             rewound: None,
             rewind_badge: None,
+            dragging_divider: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -2415,7 +2800,8 @@ impl App {
             return Ok(());
         };
         if let Some(j) = &job {
-            if let Some(i) = w.tabs.iter().position(|t| t.job.as_ref().is_some_and(|tj| tj.kind == j.kind && tj.id == j.id)) {
+            let following = |p: &Pane| p.job.as_ref().is_some_and(|tj| tj.kind == j.kind && tj.id == j.id);
+            if let Some(i) = w.tabs.iter().position(|t| t.panes.iter().any(following)) {
                 w.switch_to(i);
                 return Ok(());
             }
@@ -2425,8 +2811,43 @@ impl App {
         }
         self.next_tab += 1;
         let (cols, rows) = w.grid;
-        let tab = Tab::start(tab_id, &self.cfg, cols.max(1), rows.max(1), job)?;
+        let tab = Tab::new(Pane::start(tab_id, &self.cfg, cols.max(1), rows.max(1), job, None)?);
         w.add_tab(tab);
+        Ok(())
+    }
+}
+
+impl App {
+    /// Split the focused pane of window `window`'s tab in front: a new shell,
+    /// in the same folder, takes the right or bottom half and focus.
+    fn split_pane(&mut self, window: u64, dir: panes::Dir) -> Result<(), String> {
+        let id = self.next_tab;
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == window) else {
+            return Ok(());
+        };
+        w.rewind_exit();
+        let tab = &w.tabs[w.active];
+        let from = tab.pane();
+        let cwd = from.term.lock().local_cwd().map(str::to_string);
+        let mut layout = tab.layout.clone();
+        layout.split(from.id, id, dir);
+        let area = panes::Rect { col: 0, row: 0, cols: w.grid.0, rows: w.grid.1 };
+        let rect = layout.layout(area).0.into_iter().find(|r| r.0 == id).map(|r| r.1).unwrap_or_default();
+        if rect.cols < 2 || rect.rows < 1 {
+            // No room for another pane.
+            objc2_app_kit::NSBeep();
+            return Ok(());
+        }
+        self.next_tab += 1;
+        let mut pane = Pane::start(id, &self.cfg, rect.cols, rect.rows, None, cwd.as_deref())?;
+        pane.rect = rect;
+        let tab = &mut w.tabs[w.active];
+        tab.layout = layout;
+        tab.zoomed = false;
+        tab.panes.push(pane);
+        let new = tab.panes.len() - 1;
+        w.layout();
+        w.focus_pane(new);
         Ok(())
     }
 }
@@ -2454,6 +2875,13 @@ fn follow_command(job: &JobRef) -> Option<String> {
     })
 }
 
+/// ⌘D, ⌘⇧D: split the focused pane.
+fn split_pane(window: u64, dir: panes::Dir) {
+    if let Some(Err(e)) = with_app(|app| app.split_pane(window, dir)) {
+        crate::log::force(&format!("could not split: {e}"));
+    }
+}
+
 /// ⌘T: a new tab in this window.
 fn open_tab(window: u64) {
     if let Some(Err(e)) = with_app(|app| app.new_tab(window)) {
@@ -2461,16 +2889,13 @@ fn open_tab(window: u64) {
     }
 }
 
-/// ⌘W: close the tab in front, or the window with its last tab.
+/// ⌘W: close the focused pane, or the tab with its last pane, or the
+/// window with its last tab.
 fn close_active_tab(window: u64) {
     let last = with_app(|app| {
         let w = app.windows.iter_mut().find(|w| w.id == window)?;
-        if w.tabs.len() == 1 {
-            return Some(w.window.clone());
-        }
-        let i = w.active;
-        w.remove_tab(i);
-        None
+        let (i, p) = (w.active, w.tabs[w.active].focus);
+        w.close_pane(i, p)
     })
     .flatten();
     // Outside the borrow: closing calls back into the window delegate.
@@ -2532,17 +2957,14 @@ fn open_window() {
     }
 }
 
-/// A tab's shell exited: close the tab, or its window if it was the last
-/// one, the way Terminal.app does by default.
-fn shell_exited(tab: u64) {
+/// A shell exited: close its pane, or its tab with the last pane, or the
+/// window with the last tab, the way Terminal.app does by default.
+fn shell_exited(pane: u64) {
     let window = with_app(|app| {
-        let w = app.windows.iter_mut().find(|w| w.tabs.iter().any(|t| t.id == tab))?;
-        if w.tabs.len() == 1 {
-            return Some(w.window.clone());
-        }
-        let i = w.tabs.iter().position(|t| t.id == tab)?;
-        w.remove_tab(i);
-        None
+        let w = app.windows.iter_mut().find(|w| w.tabs.iter().any(|t| t.index_of(pane).is_some()))?;
+        let i = w.tabs.iter().position(|t| t.index_of(pane).is_some())?;
+        let p = w.tabs[i].index_of(pane)?;
+        w.close_pane(i, p)
     })
     .flatten();
     // `close` sends windowWillClose:, which removes the window's state.
@@ -2584,7 +3006,10 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&file, "New Window", sel!(newWindow:), "n");
     item(&file, "Follow Job", sel!(tachyonFollowJob:), "j");
     file.addItem(&NSMenuItem::separatorItem(mtm));
-    item(&file, "Close Tab", sel!(tachyonCloseTab:), "w");
+    item(&file, "Split Right", sel!(tachyonSplitRight:), "d");
+    item(&file, "Split Down", sel!(tachyonSplitDown:), "D");
+    file.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&file, "Close", sel!(tachyonCloseTab:), "w");
     // A capital letter means Shift as well: ⌘⇧W.
     item(&file, "Close Window", sel!(performClose:), "W");
     submenu(&main, &file);
@@ -2616,6 +3041,19 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // "{" and "}" are ⌘⇧[ and ⌘⇧], as in Safari and Terminal.
     item(&window, "Show Previous Tab", sel!(tachyonPreviousTab:), "{");
     item(&window, "Show Next Tab", sel!(tachyonNextTab:), "}");
+    window.addItem(&NSMenuItem::separatorItem(mtm));
+    // ⌘⌥ and an arrow: the function-key codepoints for the arrows.
+    let option_command = NSEventModifierFlags::Command | NSEventModifierFlags::Option;
+    for (title, action, key) in [
+        ("Select Pane Left", sel!(tachyonPaneLeft:), "\u{F702}"),
+        ("Select Pane Right", sel!(tachyonPaneRight:), "\u{F703}"),
+        ("Select Pane Above", sel!(tachyonPaneUp:), "\u{F700}"),
+        ("Select Pane Below", sel!(tachyonPaneDown:), "\u{F701}"),
+    ] {
+        item(&window, title, action, key).setKeyEquivalentModifierMask(option_command);
+    }
+    item(&window, "Zoom Pane", sel!(tachyonZoomPane:), "\r")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
     submenu(&main, &window);
     app.setWindowsMenu(Some(&window));
 
@@ -2630,6 +3068,7 @@ fn start_session(
     rows: usize,
     wake_pending: Arc<AtomicBool>,
     run: Option<&str>,
+    cwd: Option<&str>,
 ) -> Result<(Arc<Mutex<Term>>, Arc<Pty>, Arc<Mutex<RewindLog>>), String> {
     let (program, login) = if cfg.shell.program.is_empty() {
         (pty::default_shell(), true)
@@ -2651,7 +3090,7 @@ fn start_session(
     }
     crate::log!("tab {id}: spawning `{program}` {args:?} at {cols}x{rows}, integration: {}", !extra_env.is_empty());
     let pty = Arc::new(
-        Pty::spawn(cols as u16, rows as u16, &program, &args, login, &extra_env)
+        Pty::spawn(cols as u16, rows as u16, &program, &args, login, &extra_env, cwd)
             .map_err(|e| format!("could not start {program}: {e}"))?,
     );
     if let (Some(cmd), false) = (run, zsh_runs_it) {
@@ -2799,7 +3238,7 @@ fn start_session(
                                 .map(|(a, b)| b.saturating_sub(a));
                             let receipt = sampler.finish(cpu);
                             reader_term.lock().set_receipt(cmd, receipt);
-                            DispatchQueue::main().exec_async(move || with_tab(id, |w, i| w.command_finished(i, cmd)));
+                            DispatchQueue::main().exec_async(move || with_tab(id, |w, i| w.command_finished(i, id, cmd)));
                         }
                     }
                 }

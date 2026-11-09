@@ -30,6 +30,7 @@ impl Pty {
         args: &[String],
         login: bool,
         extra_env: &[(String, String)],
+        cwd: Option<&str>,
     ) -> io::Result<Pty> {
         let path = resolve(program)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("`{program}` not found")))?;
@@ -49,8 +50,12 @@ impl Pty {
         envp.push(ptr::null());
 
         // New windows start in the home directory, as in Terminal.app, whether
-        // Tachyon was launched from Finder (cwd "/") or from a shell.
-        let home = std::env::var_os("HOME").and_then(|h| CString::new(h.as_bytes()).ok());
+        // Tachyon was launched from Finder (cwd "/") or from a shell; a split
+        // starts in the folder of the pane it came from, when it still exists.
+        let start = cwd.filter(|d| std::path::Path::new(d).is_dir()).map(std::ffi::OsString::from);
+        let home = start
+            .or_else(|| std::env::var_os("HOME"))
+            .and_then(|h| CString::new(h.as_bytes()).ok());
 
         let mut ws = libc::winsize {
             ws_row: rows.max(1),

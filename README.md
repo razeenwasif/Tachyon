@@ -124,8 +124,12 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | | |
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
-| ⌘W / ⌘⇧W | Close the tab (the window with its last tab) / close the window |
+| ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
 | ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
+| ⌘D / ⌘⇧D | Split the pane: a new shell to the right / below, in the same folder |
+| ⌘⌥← ⌘⌥→ ⌘⌥↑ ⌘⌥↓, or click | Focus the pane on that side, or the one clicked |
+| Drag a divider | Resize the panes beside it |
+| ⌘⇧↩ | Zoom the pane to fill the tab, or put it back |
 | ⌘⇧[ / ⌘⇧], ⌃⇥ / ⌃⇧⇥ | Previous / next tab |
 | Click / middle-click a tab | Show it / close it |
 | Drag, double-click, triple-click | Select by character, word (paths count as one word), or line |
@@ -163,6 +167,15 @@ a crash, at the next launch), but while a tab is open its output, passwords
 you typed excepted (they aren't echoed), is on disk. On the M2 Pro a seek takes
 about 4 ms in memory and 16 ms on disk, and recording costs 1 to 4% of parsing
 throughput: compression runs on a thread of its own.
+
+**Split panes.** ⌘D splits the pane with focus side by side and ⌘⇧D one above
+the other; the new shell starts in the same folder (unless that pane is in an
+ssh session). Panes land on whole cells, with one column or row for the
+divider, so every pane's text lines up with the window's grid. Panes without
+focus are veiled slightly. The wheel scrolls the pane under the pointer,
+without taking focus. ⌘W closes the pane with focus (then the tab, then the
+window), and a shell that exits closes its pane. Each pane has its own Rewind
+log, receipts and notifications; the tab is named after the pane with focus.
 
 **Tabs.** With two or more tabs, a strip along the bottom edge shows them; with
 one, it goes away and the grid gets the row back. A tab is named after what's
