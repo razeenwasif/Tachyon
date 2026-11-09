@@ -748,6 +748,20 @@ impl Renderer {
         let theme = self.cfg.theme.clone();
         let width = (self.scale * 1.5).round().max(2.0);
         let x = gutter_x;
+        // Find matches, under the text: the current one stronger.
+        let yellow = self.palette.0[3];
+        let mixed = |t: f32| -> [u8; 3] {
+            std::array::from_fn(|i| (theme.background[i] as f32 + (yellow[i] as f32 - theme.background[i] as f32) * t).round() as u8)
+        };
+        for &(row, x0, x1, current) in &decor.highlights {
+            if row >= term.rows() || x1 <= x0 {
+                continue;
+            }
+            self.bg.push(RectInstance {
+                rect: [pad_x + x0 as f32 * m.width, pad_y + row as f32 * m.height, (x1 - x0) as f32 * m.width, m.height],
+                color: srgb(mixed(if current { 0.75 } else { 0.35 })),
+            });
+        }
         for &(y, outcome) in &decor.gutter {
             let color = match outcome {
                 Outcome::Running => self.palette.0[4],
@@ -1284,6 +1298,8 @@ pub struct Decor {
     pub preedit: String,
     /// An inline suggestion: its text, drawn dim from (column, row).
     pub ghost: Option<(usize, usize, String)>,
+    /// Find matches on screen: (row, first column, end column, current).
+    pub highlights: Vec<(usize, usize, usize, bool)>,
 }
 
 /// What the cursor layer should show: a rectangle in drawable pixels and, for

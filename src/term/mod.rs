@@ -4,6 +4,7 @@ pub mod jobs;
 pub mod lens;
 pub mod rerun;
 pub mod rewind;
+pub mod find;
 mod restore;
 pub mod cell;
 pub mod color;

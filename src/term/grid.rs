@@ -394,6 +394,17 @@ impl History {
         self.index[i].mark
     }
 
+    /// A line's text as bytes, one per cell, when it's all ASCII (as most
+    /// are), and whether it wraps onto the next; `None` otherwise.
+    fn ascii(&self, i: usize) -> Option<(&[u8], bool)> {
+        let e = self.index[i];
+        if e.flags & 1 != 0 {
+            return None;
+        }
+        let b = &self.blocks[e.block.wrapping_sub(self.first_block) as usize];
+        Some((&b[e.offset as usize..e.offset as usize + e.len as usize], e.flags & 2 != 0))
+    }
+
     fn set_mark(&mut self, i: usize, mark: RowMark) {
         self.index[i].mark = mark;
     }
@@ -589,6 +600,17 @@ impl Grid {
             Cow::Owned(self.history.row(absolute, self.cols))
         } else {
             Cow::Borrowed(&self.screen[self.live_index((absolute - h).min(self.rows - 1))])
+        }
+    }
+
+    /// A scrollback line's text without unpacking it, when it's all ASCII:
+    /// one byte per cell, and whether it wraps onto the next line. `None` for
+    /// screen lines and lines with other characters.
+    pub fn line_ascii(&self, absolute: usize) -> Option<(&[u8], bool)> {
+        if absolute < self.history.len() {
+            self.history.ascii(absolute)
+        } else {
+            None
         }
     }
 
