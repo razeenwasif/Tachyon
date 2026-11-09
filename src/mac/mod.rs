@@ -735,6 +735,19 @@ define_class!(
     struct TachyonWindow;
 
     impl TachyonWindow {
+        /// The green button, ⌃⌘F and View > Enter Full Screen: around the
+        /// notch with `window.fullscreen = notch`, else macOS's own.
+        #[unsafe(method(toggleFullScreen:))]
+        fn toggle_full_screen(&self, sender: Option<&AnyObject>) {
+            let notch = with_app(|app| app.notch_full_screen).unwrap_or(false);
+            if let (true, Some(view)) = (notch, self.terminal_view()) {
+                let id = view_id(&view);
+                DispatchQueue::main().exec_async(move || with_window(id, TermWindow::toggle_notch));
+                return;
+            }
+            unsafe { msg_send![super(self), toggleFullScreen: sender] }
+        }
+
         /// Borderless around the notch, it still takes keys.
         #[unsafe(method(canBecomeKeyWindow))]
         fn can_become_key(&self) -> bool {
@@ -961,6 +974,8 @@ impl AppDelegate {
 
 struct App {
     cfg: Config,
+    /// The green button and ⌃⌘F go around the notch.
+    notch_full_screen: bool,
     /// New windows get a title bar (View > Show Title Bar).
     title_bar: bool,
     gpu: Rc<Gpu>,
@@ -2126,6 +2141,11 @@ impl TermWindow {
                 let Some(screen) = self.window.screen().or_else(|| NSScreen::mainScreen(mtm)) else { return };
                 self.notch = Some((self.window.frame(), self.window.styleMask()));
                 self.window.setStyleMask(NSWindowStyleMask::Borderless);
+                // Still a full-screen window as far as AppKit is concerned,
+                // so ⌃⌘F and View > Exit Full Screen stay enabled to leave.
+                self.window.setCollectionBehavior(
+                    self.window.collectionBehavior() | objc2_app_kit::NSWindowCollectionBehavior::FullScreenPrimary,
+                );
                 self.window.setFrame_display(screen.frame(), true);
                 app.setPresentationOptions(
                     objc2_app_kit::NSApplicationPresentationOptions::HideDock
@@ -2153,6 +2173,11 @@ impl TermWindow {
                 if let Some(t) = self.notch_timer.take() {
                     t.invalidate();
                 }
+                // A new style rebuilds the window's frame, and focus falls
+                // back to the window itself: give it to the terminal again,
+                // or keys and menu commands have nowhere to go.
+                self.window.makeKeyAndOrderFront(None);
+                self.window.makeFirstResponder(Some(&self.view));
             }
         }
         self.layout();
@@ -4054,6 +4079,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // turn the action off for this app only; System Settings is untouched.
     // SAFETY: storing an NSString value under an NSString key.
     let cfg_title_bar = cfg.window.title_bar;
+    let cfg_notch = cfg.window.notch_full_screen;
     set_double_click_action(cfg_title_bar);
     build_menu(mtm, &app);
 
@@ -4088,6 +4114,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
             windows: Vec::new(),
             next_id: 1,
             title_bar: cfg_title_bar,
+            notch_full_screen: cfg_notch,
             cascade: NSPoint::new(0.0, 0.0),
             _delegate: delegate,
         });
@@ -4105,6 +4132,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     if !restore_sessions(mtm) {
         open_window();
+    }
+    // Open around the notch, when that's what full screen means here.
+    if cfg_notch {
+        let key = with_app(|app| {
+            let keyw = app.windows.iter().position(|w| w.window.isKeyWindow()).unwrap_or(0);
+            app.windows.get(keyw).map(|w| w.id)
+        })
+        .flatten();
+        if let Some(id) = key {
+            DispatchQueue::main().exec_async(move || with_window(id, TermWindow::toggle_notch));
+        }
     }
     if with_app(|a| a.windows.is_empty()).unwrap_or(true) {
         return Err("could not open the first window".into());

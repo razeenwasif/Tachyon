@@ -105,8 +105,10 @@ around the notch** (View menu, ⌥⌘F) covers the whole screen with the menu ba
 and Dock hidden while Tachyon is in front. The tabs sit left of the notch, and
 right of it is a status line: the command running in front and for how long,
 or its folder, and the time, since the menu bar's clock is hidden. Every row
-below the notch is terminal. ⌥⌘F again goes back. ⌃⌘F is still macOS's own
-full screen, which keeps the window below the notch. **Liquid Glass** sits behind the text
+below the notch is terminal. ⌥⌘F again goes back. ⌃⌘F, the green button and
+View > Enter Full Screen are macOS's own full screen, which keeps the window
+below the notch, unless you set `window.fullscreen = notch`. Then they go
+around the notch too, and Tachyon opens that way. **Liquid Glass** sits behind the text
 (NSGlassEffectView on macOS 26 and later): only the default background lets it
 through; text, the cursor, the selection and colours a program sets stay solid.
 The glass is tinted with the theme's background (`window.glass_tint`, 0.75) in
