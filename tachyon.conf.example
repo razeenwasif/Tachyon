@@ -61,15 +61,20 @@ window.padding_y = 6.0
 # chooses after we have drawn.
 # window.backdrop = glass
 
-# macOS: Liquid Glass's style. regular adapts its tint to what's behind it,
-# which keeps text readable; clear is less frosted and bends more of what's
-# behind at its edges.
-# window.glass = regular
+# macOS: Liquid Glass's style. clear (the default) is less frosted and bends
+# more of what's behind at its edges; regular frosts it more and adapts its
+# tint to what's behind.
+# window.glass = clear
 
-# How opaque the default background is over the backdrop. Defaults to 0.25 on
-# Liquid Glass, 0.82 with a Windows backdrop, 1.0 without. Lower shows more
-# glass. Text is always fully opaque regardless.
-# window.opacity = 0.25
+# macOS: how strongly the glass itself is tinted with the theme's background,
+# 0 to 1. The tint colours the glass and keeps its refraction, so it's the way
+# to make the window darker (or lighter, in Light Mode) without flattening it.
+# window.glass_tint = 0.75
+
+# How opaque the default background drawn over the backdrop is. Defaults to
+# 0.05 on Liquid Glass, where the tint above does the work, 0.82 with a Windows
+# backdrop, 1.0 without. Text is always fully opaque regardless.
+# window.opacity = 0.05
 
 # ---------------------------------------------------------------------------
 # Rendering

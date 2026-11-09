@@ -867,6 +867,9 @@ struct TermWindow {
     /// when the second tab opens.
     native_strip: bool,
     capsule: Option<strip::Capsule>,
+    /// The Liquid Glass behind the text, tinted with the theme's background.
+    host_glass: Option<Retained<NSGlassEffectView>>,
+    glass_tint: f32,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -1019,6 +1022,10 @@ impl TermWindow {
         }
         if !self.glass {
             self.window.setBackgroundColor(Some(&srgb_color(theme.background, 1.0)));
+        }
+        if let Some(glass) = &self.host_glass {
+            let tint = (self.glass_tint > 0.0).then(|| srgb_color(theme.background, self.glass_tint as f64));
+            glass.setTintColor(tint.as_deref());
         }
         self.renderer.set_theme(&theme);
         self.cursor_shown = None;
@@ -1959,8 +1966,11 @@ impl App {
         };
         view.addTrackingArea(&tracking);
 
+        let mut host_glass = None;
         if glass {
-            window.setContentView(Some(&glass_host(mtm, &view, content, cfg.window.glass_clear)));
+            let (host, glass_view) = glass_host(mtm, &view, content, cfg.window.glass_clear);
+            window.setContentView(Some(&host));
+            host_glass = glass_view;
         } else {
             window.setContentView(Some(&view));
         }
@@ -2017,6 +2027,8 @@ impl App {
             glass,
             native_strip: glass && objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some(),
             capsule: None,
+            host_glass,
+            glass_tint: cfg.window.glass_tint,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -2065,7 +2077,12 @@ fn close_active_tab(window: u64) {
 
 /// A view that puts `view` on glass: Liquid Glass on macOS 26 and later,
 /// otherwise the blurred window material macOS used before.
-fn glass_host(mtm: MainThreadMarker, view: &TachyonView, size: NSSize, clear: bool) -> Retained<NSView> {
+fn glass_host(
+    mtm: MainThreadMarker,
+    view: &TachyonView,
+    size: NSSize,
+    clear: bool,
+) -> (Retained<NSView>, Option<Retained<NSGlassEffectView>>) {
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), size);
     if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
         let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
@@ -2076,7 +2093,7 @@ fn glass_host(mtm: MainThreadMarker, view: &TachyonView, size: NSSize, clear: bo
         // it follow the window's edge.
         glass.setCornerRadius(16.0);
         glass.setContentView(Some(view));
-        return Retained::into_super(glass);
+        return (Retained::into_super(glass.clone()), Some(glass));
     }
     let blur = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
     blur.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
@@ -2085,7 +2102,7 @@ fn glass_host(mtm: MainThreadMarker, view: &TachyonView, size: NSSize, clear: bo
     view.setFrame(frame);
     view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
     blur.addSubview(view);
-    Retained::into_super(blur)
+    (Retained::into_super(blur), None)
 }
 
 /// Open a new terminal window and bring it to the front.
