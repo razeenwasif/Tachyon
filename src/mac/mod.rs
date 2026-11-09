@@ -251,6 +251,28 @@ fn show_tab(pane: u64) {
     }
 }
 
+/// What double-clicking a title bar does. Edge-to-edge, the invisible
+/// title bar sits over the top rows of text, where a double-click selects a
+/// word, so it does nothing (for this app only; System Settings is
+/// untouched). With a visible title bar, the system setting applies.
+fn set_double_click_action(title_bar: bool) {
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let key = NSString::from_str("AppleActionOnDoubleClick");
+    // SAFETY: storing an NSString value under an NSString key.
+    unsafe {
+        if title_bar {
+            defaults.removeObjectForKey(&key);
+        } else {
+            defaults.setObject_forKey(Some(&NSString::from_str("None")), &key);
+        }
+    }
+}
+
+/// The window id of a terminal view.
+fn view_id(view: &NSView) -> u64 {
+    view.downcast_ref::<TachyonView>().map_or(0, TachyonView::id)
+}
+
 /// Per-instance storage for the Objective-C classes: which window they serve.
 #[derive(Default)]
 struct WindowId {
@@ -449,6 +471,19 @@ define_class!(
         #[unsafe(method(tachyonPaneDown:))]
         fn pane_down(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.move_focus(0, 1));
+        }
+
+        #[unsafe(method(tachyonTitleBar:))]
+        fn toggle_title_bar(&self, _sender: Option<&AnyObject>) {
+            let on = with_app(|app| {
+                app.title_bar = !app.title_bar;
+                let on = app.title_bar;
+                app.windows.iter_mut().for_each(|w| w.set_title_bar(on));
+                on
+            });
+            if let Some(on) = on {
+                set_double_click_action(on);
+            }
         }
 
         #[unsafe(method(tachyonLedger:))]
@@ -757,7 +792,11 @@ impl TachyonWindow {
                 && p.y >= f.origin.y
                 && p.y <= f.origin.y + f.size.height
         });
-        inside && !over_buttons && !over_capsule
+        // In the standard layout the title bar is AppKit's: dragging,
+        // double-clicking, the title.
+        let bar = query_window(view_id(view), |w| w.title_bar_height()).unwrap_or(0.0);
+        let in_bar = bar > 0.0 && p.y > size.height - bar;
+        inside && !over_buttons && !over_capsule && !in_bar
     }
 }
 
@@ -906,6 +945,8 @@ impl AppDelegate {
 
 struct App {
     cfg: Config,
+    /// New windows get a title bar (View > Show Title Bar).
+    title_bar: bool,
     gpu: Rc<Gpu>,
     windows: Vec<TermWindow>,
     next_id: u64,
@@ -1191,6 +1232,8 @@ struct TermWindow {
     scroll_accum: f64,
     buttons_visible: bool,
     focused: bool,
+    /// The standard layout: a visible title bar, the grid below it.
+    title_bar: bool,
 
     selection: Option<Selection>,
     /// Text an input method is composing, shown at the cursor until committed.
@@ -1960,8 +2003,13 @@ impl TermWindow {
 
         let strip = self.tabs.len() > 1;
         self.renderer.set_strip(strip);
+        self.apply_chrome();
+        let inset = self.title_bar_height();
+        self.renderer.set_top_inset((inset * scale).round() as f32);
         if self.native_strip {
-            self.renderer.set_strip_band(Some((strip::BAND_HEIGHT * scale).round() as f32));
+            // In a title bar the capsule sits there, taking no rows.
+            let band = if self.title_bar { 0.0 } else { strip::BAND_HEIGHT };
+            self.renderer.set_strip_band(Some((band * scale).round() as f32));
             self.place_capsule(strip);
         }
         let grid = self.renderer.grid_size_for(w, h);
@@ -1989,11 +2037,58 @@ impl TermWindow {
         if let Some(c) = &self.capsule {
             c.glass.setHidden(!show);
             if show {
-                c.place(self.view.bounds().size.width, self.tabs.len());
+                let size = self.view.bounds().size;
+                let bar = self.title_bar_height();
+                if self.title_bar && bar > 0.0 {
+                    // In the title bar, clear of the window buttons.
+                    let y = size.height - bar + (bar - strip::CAPSULE_HEIGHT) / 2.0;
+                    c.place_at(size.width, self.tabs.len(), y, BUTTON_ZONE.0 + 8.0);
+                } else {
+                    c.place(size.width, self.tabs.len());
+                }
                 let tabs = self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect();
                 c.view.set_tabs(tabs, self.active);
             }
         }
+    }
+
+    /// How tall the title bar is, in points: zero edge-to-edge.
+    fn title_bar_height(&self) -> f64 {
+        if !self.title_bar {
+            return 0.0;
+        }
+        (self.view.bounds().size.height - self.window.contentLayoutRect().size.height).max(0.0)
+    }
+
+    /// Show the title bar and its buttons for the standard layout, with the
+    /// title unless the tabs are there instead; or hide them, edge-to-edge,
+    /// until the pointer reaches the corner.
+    fn apply_chrome(&mut self) {
+        if self.title_bar {
+            set_titlebar_hidden(&self.window, false);
+            self.buttons_visible = true;
+            let tabs_in_bar = self.native_strip && self.tabs.len() > 1;
+            self.window.setTitleVisibility(if tabs_in_bar { NSWindowTitleVisibility::Hidden } else { NSWindowTitleVisibility::Visible });
+        } else {
+            self.window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+            if self.buttons_visible {
+                self.buttons_visible = false;
+                set_titlebar_hidden(&self.window, true);
+            }
+        }
+    }
+
+    /// View > Show Title Bar: switch layouts.
+    fn set_title_bar(&mut self, on: bool) {
+        if on == self.title_bar {
+            return;
+        }
+        self.title_bar = on;
+        if !on {
+            // Hide everything now; hovering the corner brings it back.
+            self.buttons_visible = true;
+        }
+        self.layout();
     }
 
     fn rescale(&mut self) {
@@ -2247,6 +2342,9 @@ impl TermWindow {
     /// Edge-to-edge: the traffic lights stay hidden until the pointer reaches
     /// the top-left corner.
     fn hover(&mut self, location: Option<NSPoint>) {
+        if self.title_bar {
+            return;
+        }
         let height = self.view.bounds().size.height;
         let show = location.is_some_and(|p| p.x < BUTTON_ZONE.0 && p.y > height - BUTTON_ZONE.1);
         if show != self.buttons_visible {
@@ -2514,7 +2612,10 @@ impl TermWindow {
             }
         }
         if let Some(b) = &self.rewind_badge {
-            b.show(&text, index, frames, note.as_deref(), self.view.bounds().size);
+            // Below a title bar, when there is one.
+            let mut size = self.view.bounds().size;
+            size.height -= self.title_bar_height();
+            b.show(&text, index, frames, note.as_deref(), size);
         }
     }
 
@@ -3034,6 +3135,7 @@ impl App {
             grid: (0, 0),
             scroll_accum: 0.0,
             buttons_visible: false,
+            title_bar: self.title_bar,
             focused: true,
             selection: None,
             preedit: String::new(),
@@ -3320,6 +3422,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Previous Command", sel!(tachyonPreviousCommand:), "\u{F700}");
     item(&view, "Next Command", sel!(tachyonNextCommand:), "\u{F701}");
     view.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&view, "Show Title Bar", sel!(tachyonTitleBar:), "");
     item(&view, "Latency Ledger", sel!(tachyonLedger:), "l")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view.addItem(&NSMenuItem::separatorItem(mtm));
@@ -3822,12 +3925,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // sits over the top rows of text, where a double-click selects a word, so
     // turn the action off for this app only; System Settings is untouched.
     // SAFETY: storing an NSString value under an NSString key.
-    unsafe {
-        NSUserDefaults::standardUserDefaults().setObject_forKey(
-            Some(&NSString::from_str("None")),
-            &NSString::from_str("AppleActionOnDoubleClick"),
-        );
-    }
+    let cfg_title_bar = cfg.window.title_bar;
+    set_double_click_action(cfg_title_bar);
     build_menu(mtm, &app);
 
     let delegate = AppDelegate::new(mtm);
@@ -3860,6 +3959,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
             gpu,
             windows: Vec::new(),
             next_id: 1,
+            title_bar: cfg_title_bar,
             cascade: NSPoint::new(0.0, 0.0),
             _delegate: delegate,
         });

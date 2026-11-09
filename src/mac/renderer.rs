@@ -235,6 +235,8 @@ pub struct Renderer {
     /// When the strip is a glass capsule drawn by AppKit, the height of the
     /// band kept free for it, in pixels; the renderer then draws no strip.
     strip_band: Option<f32>,
+    /// Pixels a title bar takes at the top.
+    top_inset: f32,
 
     bg: Vec<RectInstance>,
     glyphs: Vec<GlyphInstance>,
@@ -271,6 +273,7 @@ impl Renderer {
             scale,
             size: (1.0, 1.0),
             strip: false,
+            top_inset: 0.0,
             strip_band: None,
             bg: Vec::new(),
             glyphs: Vec::new(),
@@ -307,6 +310,12 @@ impl Renderer {
         self.atlas.reset();
     }
 
+    /// Pixels at the top of the view taken by a title bar; the grid starts
+    /// below them.
+    pub fn set_top_inset(&mut self, px: f32) {
+        self.top_inset = px.max(0.0);
+    }
+
     pub fn padding(&self) -> (f32, f32) {
         (
             (self.cfg.window.padding_x * self.scale).round(),
@@ -320,7 +329,7 @@ impl Renderer {
         let m = self.fonts.metrics;
         let (pad_x, pad_y) = self.padding();
         let w = (width_px - pad_x * 2.0).max(m.width);
-        let h = (height_px - pad_y * 2.0 - self.strip_height()).max(m.height);
+        let h = (height_px - pad_y * 2.0 - self.top_inset - self.strip_height()).max(m.height);
         (
             (w / m.width).floor().max(1.0) as usize,
             (h / m.height).floor().max(1.0) as usize,
@@ -432,7 +441,7 @@ impl Renderer {
     pub fn pane_origin(&self, col: usize, row: usize) -> (f32, f32) {
         let m = self.fonts.metrics;
         let (pad_x, pad_y) = self.padding();
-        (pad_x + col as f32 * m.width, pad_y + row as f32 * m.height)
+        (pad_x + col as f32 * m.width, pad_y + self.top_inset + row as f32 * m.height)
     }
 
     /// Build and present one frame: each pane at its place in the grid, the

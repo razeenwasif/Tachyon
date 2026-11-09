@@ -116,6 +116,9 @@ pub struct WindowConfig {
     /// background, 0..=1. Unlike `opacity`, which draws the background over
     /// the glass, the tint colours the glass and keeps its refraction.
     pub glass_tint: f32,
+    /// macOS: a visible title bar (on the glass, with the window's title, and
+    /// the tabs in it when there are two or more) instead of edge-to-edge.
+    pub title_bar: bool,
     /// Whether the user set `window.opacity` explicitly. Enabling a backdrop
     /// picks a sensible translucency by default, but must not override a value
     /// the user asked for.
@@ -137,6 +140,7 @@ impl Default for WindowConfig {
             // refraction; clear glass shows the most of it.
             glass_clear: cfg!(target_os = "macos"),
             glass_tint: if cfg!(target_os = "macos") { 0.75 } else { 0.0 },
+            title_bar: false,
             opacity_explicit: false,
         }
     }
@@ -545,6 +549,13 @@ impl Config {
                 self.window.opacity = parse_f32(value, 0.0, 1.0)?;
                 self.window.opacity_explicit = true;
             }
+            "window.layout" => {
+                self.window.title_bar = match value {
+                    "edge" | "edge-to-edge" | "edge_to_edge" => false,
+                    "standard" | "title_bar" | "titlebar" => true,
+                    _ => return Err(format!("window.layout: expected edge or standard, got `{value}`")),
+                }
+            }
             "window.backdrop" => {
                 self.window.backdrop = match value {
                     "none" | "off" => Backdrop::None,
@@ -852,6 +863,17 @@ mod contrast_tests {
             let red = hc.ansi[1].unwrap();
             assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
         }
+    }
+
+    #[test]
+    fn the_layout_is_a_setting() {
+        let mut c = Config::default();
+        assert!(!c.window.title_bar, "edge-to-edge by default");
+        c.set("window.layout", "standard").unwrap();
+        assert!(c.window.title_bar);
+        c.set("window.layout", "edge").unwrap();
+        assert!(!c.window.title_bar);
+        assert!(c.set("window.layout", "floating").is_err());
     }
 
     #[test]
