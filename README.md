@@ -172,6 +172,12 @@ with OSC 133, which gives:
   exact (from the shell's child-process accounting); P-core share, energy and
   memory are sampled every half second, so very short commands show only their
   exit status and time;
+- a **metric lens**: while a command runs, numbers in its output that look like
+  metrics (`loss=0.41`, `acc: 87%`, `{'loss': 0.39}`, `48.2it/s`, `512 tok/s`)
+  show on its prompt line, with a sparkline of the loss (or the first metric):
+  `loss 0.398 ▇▆▅▄▃▂ · 48.2 it/s · 45%`. A tqdm bar's percentage also shows as
+  a progress bar on the Dock icon. Every line of a training log is read; a flood
+  like `cat` of a big file is only sampled, so it costs no throughput;
 - ⌘↑ / ⌘↓ to jump between commands;
 - a **notification** with the receipt when a command of 10 seconds or more
   finishes while you're in another app or window (`notify.after` sets the time,

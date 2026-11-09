@@ -353,6 +353,12 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    Secure Keyboard Entry at password prompts, landed with it.
 7. **Metric lens and job tabs**: Nexus first, then Slurm. New `src/lens/`,
    `src/jobs/`.
+   *Metric lens done (9 November 2026):* `src/term/lens.rs` reads the output
+   stream as lines (escapes dropped, `\r` ends a line, so tqdm redraws count),
+   keeps up to 8 named series per command, and the prompt line shows the latest
+   values with a sparkline of the loss; a tqdm percentage drives a Dock progress
+   bar. Lines are all read below 256 KB per 100 ms and sampled above, which
+   measured the same as no lens on a 160 MB `cat`. Job tabs still to do.
 8. **Session host**: `tachyon-host` as a login agent with keep-awake
    assertions. After Rewind, because it owns the logs.
 9. **Split panes** on cell boundaries. Shaping already arrived with Core Text

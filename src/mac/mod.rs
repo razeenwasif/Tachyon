@@ -16,6 +16,7 @@
 //! windows, and clicking the Dock icon opens a fresh one.
 
 mod boxdraw;
+mod dock;
 mod font;
 mod input;
 mod links;
@@ -62,7 +63,7 @@ use objc2_quartz_core::{
 use parking_lot::Mutex;
 
 use crate::config::{Appearance, Backdrop, Config, OptionAsMeta, ThemeConfig};
-use crate::term::{CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
+use crate::term::{lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
 use rustc_hash::FxHashMap;
 use pty::Pty;
 use input::{MouseButton, MouseEventKind};
@@ -809,6 +810,7 @@ impl Tab {
 
 impl Drop for Tab {
     fn drop(&mut self) {
+        dock::set_progress(self.id, None);
         // The reader thread holds the PTY too, so dropping ours does not end
         // the session; hanging up does.
         self.pty.hangup();
@@ -1757,19 +1759,39 @@ fn command_decor(term: &Term) -> Decor {
         decor.gutter.push((y, outcome));
         if mark.has(RowMark::INPUT) {
             let running = info.state == CommandState::Running;
-            if let Some(text) = info
+            let receipt = info
                 .elapsed()
-                .and_then(|e| receipts::describe(e, info.exit, running, info.receipt.as_ref()))
-            {
-                // The input line, or if the command fills it, the first of its
-                // wrapped continuation lines with room at the right.
-                let room = |r: usize| g.row(r).trimmed_len() + text.chars().count() + 3 <= term.cols();
+                .and_then(|e| receipts::describe(e, info.exit, running, info.receipt.as_ref()));
+            let lens = info.lens.describe();
+            // Both if they fit, else the metrics while it runs and the
+            // receipt once it's done.
+            let mut candidates = Vec::new();
+            if let (Some(l), Some(r)) = (&lens, &receipt) {
+                candidates.push(format!("{l}  ·  {r}"));
+            }
+            let compact = info.lens.compact();
+            if running {
+                // While it runs, the metrics matter more than the time.
+                candidates.extend(lens);
+                candidates.extend(compact);
+                candidates.extend(receipt);
+            } else {
+                candidates.extend(receipt);
+                candidates.extend(lens);
+                candidates.extend(compact);
+            }
+            // The input line, or if the command fills it, the first of its
+            // wrapped continuation lines with room at the right.
+            let width = |t: &str| t.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)).sum::<usize>();
+            let room = |r: usize, t: &str| g.row(r).trimmed_len() + width(t) + 3 <= term.cols();
+            'place: for text in candidates {
                 let mut r = y;
-                while !room(r) && r + 1 < term.rows() && g.row(r).wrapped {
+                while !room(r, &text) && r + 1 < term.rows() && g.row(r).wrapped {
                     r += 1;
                 }
-                if room(r) {
+                if room(r, &text) {
                     decor.notes.push((r, text));
+                    break 'place;
                 }
             }
         }
@@ -2222,6 +2244,13 @@ fn start_session(
             let shell = reader_pty.pid();
             let mut cpu_at_start: FxHashMap<u32, Option<Duration>> = FxHashMap::default();
             let mut dump = std::env::var_os("TACHYON_DUMP").and_then(|p| std::fs::File::create(p).ok());
+            // The metric lens reads a running command's output as lines.
+            let mut lines = lens::LineSplitter::default();
+            let mut dock_percent: Option<i32> = None;
+            // Output rate, to tell a training log (read every line) from a
+            // flood like cat of a big file (only sampled).
+            let mut window = (Instant::now(), 0usize);
+            let mut last_sample = Instant::now();
             // 128 KiB amortises the syscall over a burst without holding the
             // terminal lock for long.
             let mut buf = vec![0u8; 128 * 1024];
@@ -2238,11 +2267,59 @@ fn start_session(
                     use std::io::Write;
                     let _ = f.write_all(&buf[..n]);
                 }
-                let (replies, events) = {
+                let (replies, events, running) = {
                     let mut t = reader_term.lock();
                     processor.advance(&mut t, &buf[..n]);
-                    (t.take_replies(), t.take_command_events())
+                    (t.take_replies(), t.take_command_events(), t.command_running())
                 };
+                if running {
+                    // A training run prints a few lines a second, and every
+                    // one is read. A flood (cat of a big log) isn't where
+                    // metrics live: over 256 KB in 100 ms, only the end of a
+                    // read is looked at, at most every 50 ms, which keeps the
+                    // lens off the throughput.
+                    let now = Instant::now();
+                    if now.duration_since(window.0) > Duration::from_millis(100) {
+                        window = (now, 0);
+                    }
+                    window.1 += n;
+                    let flood = window.1 > 256 * 1024;
+                    const TAIL: usize = 2 * 1024;
+                    let chunk: &[u8] = if !flood {
+                        &buf[..n]
+                    } else if now.duration_since(last_sample) >= Duration::from_millis(50) {
+                        last_sample = now;
+                        lines.reset();
+                        &buf[n.saturating_sub(TAIL)..n]
+                    } else {
+                        lines.reset();
+                        &[]
+                    };
+                    let mut readings = Vec::new();
+                    lines.feed(chunk, |line| {
+                        let r = lens::read_line(line);
+                        if !r.is_empty() {
+                            readings.push(r);
+                        }
+                    });
+                    // A progress bar is redrawn after a \r rather than ended
+                    // with one, so the line being written is its latest state.
+                    if let Some(bar) = lines.pending().filter(|l| l.contains("%|")) {
+                        readings.push(lens::read_line(&bar));
+                    }
+                    if !readings.is_empty() {
+                        let percent = {
+                            let mut t = reader_term.lock();
+                            readings.iter().fold(None, |p, r| t.record_reading(r).or(p))
+                        };
+                        if let Some(p) = percent {
+                            if dock_percent != Some(p as i32) {
+                                dock_percent = Some(p as i32);
+                                DispatchQueue::main().exec_async(move || dock::set_progress(id, Some(p)));
+                            }
+                        }
+                    }
+                }
                 if !replies.is_empty() {
                     let _ = reader_pty.write(&replies);
                 }
@@ -2253,6 +2330,9 @@ fn start_session(
                             sampler.start(shell, reader_pty.master_fd());
                         }
                         CommandEvent::Finished(cmd, _) => {
+                            if dock_percent.take().is_some() {
+                                DispatchQueue::main().exec_async(move || dock::set_progress(id, None));
+                            }
                             let start = cpu_at_start.remove(&cmd).flatten();
                             let cpu = start
                                 .zip(receipts::children_cpu(shell))
