@@ -137,6 +137,8 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | Shift-drag in vim, tmux, htop | Select even while the app has the mouse |
 | ⌘-click a path / a URL | Show the file in Quick Look / open the link |
 | ⌘[ / ⌘] / esc | Rewind: the screen one frame earlier / later / live again |
+| Wheel, or drag the slider, while rewound | Scrub through the frames kept |
+| ⌥-click while rewound | Which output wrote that cell, and when |
 | ⌘J, or ⌘-click a job id | Follow the job this tab submitted last, or that one, in its own tab |
 
 **⌘-click** a file path to see it in Quick Look (an image, a CSV, a PDF) or a
@@ -148,10 +150,19 @@ those keystrokes, and turns off after; the prompt line says so while it's on.
 **Rewind.** ⌘[ shows the screen as it was a moment ago, including full-screen
 programs (htop, nvtop, vim, agent UIs) that scrollback never keeps; ⌘[ again
 steps further back, ⌘] forward, and Esc or any key returns to live. A glass badge
-says how long ago the frame is. Each tab keeps its last 32 MiB of output in
-memory, with a copy of the screen every 2 MiB, so a step replays at most 2 MiB
-(a few milliseconds); recording costs about 1% of parsing throughput. Still to
-come: keeping the log on disk, a scrub track, and cell provenance.
+says how long ago the frame is, with a slider to scrub through every frame kept;
+the wheel steps through them too. **⌥-click** a cell in a rewound frame to see
+which output wrote it: the bytes around it, their offset in the stream, and how
+long before the frame they arrived.
+
+Each tab keeps its last 32 MiB of output in memory, with a copy of the screen
+every 2 MiB, and up to 512 MiB more on disk, LZ4-compressed in 8 MiB segments
+under `~/Library/Caches/Tachyon/Rewind`. That folder is private to you (0700)
+and a tab's part of it is deleted when the tab closes or Tachyon quits (or, after
+a crash, at the next launch), but while a tab is open its output, passwords
+you typed excepted (they aren't echoed), is on disk. On the M2 Pro a seek takes
+about 4 ms in memory and 16 ms on disk, and recording costs 1 to 4% of parsing
+throughput: compression runs on a thread of its own.
 
 **Tabs.** With two or more tabs, a strip along the bottom edge shows them; with
 one, it goes away and the grid gets the row back. A tab is named after what's

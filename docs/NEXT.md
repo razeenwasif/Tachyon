@@ -109,6 +109,9 @@ htop, asitop, vim and agent UIs draw and which scrollback never keeps.
   sequence and byte offset that last wrote it.
 - Keys: ⌘[ steps back, ⌘] returns to live.
 
+*Built (9 November 2026)*, with snapshots every 2 MiB in memory and every
+8 MiB on disk rather than the 8 MiB planned above; see step 5 of the plan.
+
 Closest today: asciinema, outside the terminal. Ghostty's inspector shows live
 cell state.
 
@@ -346,8 +349,15 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    taken while the parser is in Ground. A frame is a burst of reads less than
    40 ms apart; ⌘[ / ⌘] replay from the nearest snapshot, Esc returns to live,
    and a glass badge says when. Recording measured 375 against 379 MiB/s
-   parsing alone. Still to do: the log on disk, compressed; a scrub track; cell
-   provenance.
+   parsing alone.
+   *Finished (9 November 2026):* past 32 MiB, output moves to disk in 8 MiB
+   LZ4 segments (one snapshot each, up to 512 MiB a tab) under
+   `~/Library/Caches/Tachyon/Rewind/<pid>-<tab>`, written by a background
+   thread and deleted on tab close, quit, or the next launch after a crash. The
+   badge has a slider over every frame kept, and the wheel steps frames.
+   ⌥-click shows which bytes last wrote a cell (or scrolled it there), their
+   stream offset and how long before the frame. Measured: seek 3.9 ms in
+   memory, 15.8 ms on disk; recording 1 to 4% of parsing throughput.
 6. **Shell integration and receipts**: OSC 133 for zsh first, then bash and
    fish. `proc_pid_rusage` receipts, rerun diff, notifications, ⌘↑/⌘↓.
    *Done for zsh (9 November 2026):* marks stored on rows so they survive
