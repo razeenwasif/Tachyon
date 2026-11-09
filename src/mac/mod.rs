@@ -18,6 +18,8 @@
 mod boxdraw;
 mod font;
 mod input;
+mod links;
+mod notify;
 mod pty;
 mod receipts;
 mod renderer;
@@ -38,11 +40,12 @@ use objc2_app_kit::{
     NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuItem, NSPasteboard,
     NSPasteboardTypeString, NSRequestUserAttentionType, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
     NSTextInputClient, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask,
-    NSWindowTitleVisibility,
+    NSWindowTitleVisibility, NSWorkspace,
 };
+use objc2_quick_look_ui::{QLPreviewPanel, QLPreviewPanelDataSource};
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSNotFound, NSRange, NSUserDefaults, NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop,
-    NSRunLoopCommonModes, NSSize, NSString,
+    NSInteger, NSRunLoopCommonModes, NSSize, NSString, NSURL,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
@@ -70,6 +73,10 @@ const ICON_SVG: &[u8] = include_bytes!("../../assets/icon/tachyon.svg");
 const BUTTON_ZONE: (f64, f64) = (84.0, 34.0);
 
 thread_local! {
+    /// The file Quick Look is showing, from the last ⌘-click on a path.
+    static QUICK_LOOK: RefCell<Option<Retained<NSURL>>> = const { RefCell::new(None) };
+    /// Posts notifications for long commands; `None` outside the app bundle.
+    static NOTIFIER: RefCell<Option<notify::Notifier>> = const { RefCell::new(None) };
     /// All main-thread state. AppKit calls into the views and delegates; each
     /// carries its window's id and forwards here.
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -119,6 +126,65 @@ fn input_string(obj: &AnyObject) -> String {
         s.to_string()
     } else {
         String::new()
+    }
+}
+
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    /// Secure Keyboard Entry: while on, other apps can't read keystrokes.
+    /// Reference-counted per process, so every enable needs one disable.
+    fn EnableSecureEventInput() -> i32;
+    fn DisableSecureEventInput() -> i32;
+}
+
+/// Whether the program on this PTY is asking for a password: echo off while
+/// the terminal is still in line mode, which is how sudo, ssh and getpass
+/// read one. Full-screen programs turn echo off too, but also leave line mode.
+fn asking_for_password(fd: i32) -> bool {
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::tcgetattr(fd, &mut t) } == 0;
+    ok && t.c_lflag & libc::ECHO == 0 && t.c_lflag & libc::ICANON != 0
+}
+
+/// Show `path` in Quick Look, as the Finder does with the space bar.
+fn quick_look(path: std::path::PathBuf) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    QUICK_LOOK.with(|q| *q.borrow_mut() = Some(url));
+    // SAFETY: main thread; the panel finds the view through the responder
+    // chain and the view keeps itself alive as the data source.
+    unsafe {
+        let Some(panel) = QLPreviewPanel::sharedPreviewPanel(mtm) else {
+            return;
+        };
+        if panel.isVisible() {
+            panel.reloadData();
+        } else {
+            panel.makeKeyAndOrderFront(None);
+        }
+    }
+}
+
+/// A notification was clicked: show its window and tab.
+fn show_tab(tab: u64) {
+    let window = with_app(|app| {
+        for w in &mut app.windows {
+            if let Some(i) = w.tabs.iter().position(|t| t.id == tab) {
+                w.switch_to(i);
+                return Some(w.window.clone());
+            }
+        }
+        None
+    })
+    .flatten();
+    if let (Some(window), Some(mtm)) = (window, MainThreadMarker::new()) {
+        if window.isMiniaturized() {
+            window.deminiaturize(None);
+        }
+        window.makeKeyAndOrderFront(None);
+        NSApplication::sharedApplication(mtm).activate();
     }
 }
 
@@ -276,6 +342,28 @@ define_class!(
             with_window(self.id(), |w| w.cycle_tab(1));
         }
 
+        #[unsafe(method(acceptsPreviewPanelControl:))]
+        fn accepts_preview_panel_control(&self, _panel: Option<&QLPreviewPanel>) -> bool {
+            QUICK_LOOK.with(|q| q.borrow().is_some())
+        }
+
+        #[unsafe(method(beginPreviewPanelControl:))]
+        fn begin_preview_panel_control(&self, panel: Option<&QLPreviewPanel>) {
+            if let Some(panel) = panel {
+                unsafe {
+                    panel.setDataSource(Some(ProtocolObject::from_ref(self)));
+                    panel.reloadData();
+                }
+            }
+        }
+
+        #[unsafe(method(endPreviewPanelControl:))]
+        fn end_preview_panel_control(&self, panel: Option<&QLPreviewPanel>) {
+            if let Some(panel) = panel {
+                unsafe { panel.setDataSource(None) };
+            }
+        }
+
         #[unsafe(method(tachyonPreviousCommand:))]
         fn previous_command(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.jump_command(true));
@@ -350,6 +438,24 @@ define_class!(
         #[unsafe(method(tick:))]
         fn tick(&self, _link: &CADisplayLink) {
             with_window(self.id(), TermWindow::tick);
+        }
+    }
+
+    /// Quick Look asks the view what to show: the path last ⌘-clicked.
+    unsafe impl QLPreviewPanelDataSource for TachyonView {
+        #[unsafe(method(numberOfPreviewItemsInPreviewPanel:))]
+        fn number_of_preview_items(&self, _panel: Option<&QLPreviewPanel>) -> NSInteger {
+            QUICK_LOOK.with(|q| q.borrow().is_some() as NSInteger)
+        }
+
+        /// Returned autoreleased, as Objective-C expects of a getter. NSURL
+        /// is a Quick Look preview item.
+        #[unsafe(method(previewPanel:previewItemAtIndex:))]
+        fn preview_item(&self, _panel: Option<&QLPreviewPanel>, _index: NSInteger) -> *mut NSURL {
+            match QUICK_LOOK.with(|q| q.borrow().clone()) {
+                Some(url) => Retained::autorelease_return(url),
+                None => std::ptr::null_mut(),
+            }
         }
     }
 
@@ -685,6 +791,12 @@ struct TermWindow {
     mouse_cell: (usize, usize),
     option_as_meta: OptionAsMeta,
     base_font_size: f32,
+    /// How long a command must run to notify when it finishes unseen;
+    /// `None` when notifications are off.
+    notify_after: Option<Duration>,
+    /// Secure Keyboard Entry is on for this window: it's in front and its
+    /// tab is asking for a password.
+    secure: bool,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -698,6 +810,9 @@ impl Drop for TermWindow {
         // A display link retains its target; invalidate it or the view leaks.
         // Dropping the tabs hangs up their shells.
         self.link.invalidate();
+        if self.secure {
+            unsafe { DisableSecureEventInput() };
+        }
     }
 }
 
@@ -740,11 +855,15 @@ impl TermWindow {
         if self.needs_redraw {
             self.needs_redraw = false;
             self.idle_ticks = 0;
+            self.update_secure_input();
             let term = self.term.lock();
             let blink = self.focused && term.cursor_state().blinking;
             let selection = self.selection.and_then(|s| s.range(&term));
             let mut decor = command_decor(&term);
             decor.preedit = self.preedit.clone();
+            if self.secure {
+                decor.notes.push((term.cursor_state().y, "Secure Keyboard Entry".into()));
+            }
             if self.tabs.len() > 1 {
                 decor.strip = Some(Strip {
                     tabs: self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect(),
@@ -769,22 +888,88 @@ impl TermWindow {
     /// tab strip; if it ran a while and the window is not in front, the Dock
     /// icon bounces once.
     fn command_finished(&mut self, i: usize, cmd: u32) {
-        let (long, outcome) = {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let finished = {
             let term = self.tabs[i].term.lock();
-            let info = term.command(cmd);
-            let long = info.and_then(|c| c.elapsed()).is_some_and(|d| d >= Duration::from_secs(10));
-            let failed = info.and_then(|c| c.exit).is_some_and(|e| e != 0);
-            (long, if failed { Outcome::Failed } else { Outcome::Succeeded })
+            term.command(cmd).map(|info| {
+                let elapsed = info.elapsed().unwrap_or_default();
+                let failed = info.exit.is_some_and(|e| e != 0);
+                let receipt = receipts::describe(elapsed, info.exit, false, info.receipt.as_ref()).unwrap_or_default();
+                let title = info.cmdline.clone().unwrap_or_else(|| "Command finished".into());
+                let folder = term.cwd.as_deref().map(short_path).unwrap_or_default();
+                (elapsed, failed, title, folder, receipt)
+            })
+        };
+        let Some((elapsed, failed, title, folder, receipt)) = finished else {
+            return;
         };
         if i != self.active {
-            self.tabs[i].unseen = Some(outcome);
+            self.tabs[i].unseen = Some(if failed { Outcome::Failed } else { Outcome::Succeeded });
         }
         self.request_redraw();
-        if long && !self.window.isKeyWindow() {
-            if let Some(mtm) = MainThreadMarker::new() {
-                NSApplication::sharedApplication(mtm)
-                    .requestUserAttention(NSRequestUserAttentionType::InformationalRequest);
+
+        // Only when you weren't looking at this window.
+        let app = NSApplication::sharedApplication(mtm);
+        if app.isActive() && self.window.isKeyWindow() {
+            return;
+        }
+        let threshold = self.notify_after.unwrap_or(Duration::from_secs(10));
+        if elapsed < threshold {
+            return;
+        }
+        let tab = self.tabs[i].id;
+        let posted = self.notify_after.is_some()
+            && NOTIFIER.with(|n| n.borrow().as_ref().map(|n| n.post(tab, cmd, &title, &folder, &receipt)).is_some());
+        if !posted {
+            app.requestUserAttention(NSRequestUserAttentionType::InformationalRequest);
+        }
+    }
+
+    /// Turn Secure Keyboard Entry on while this window is in front and its
+    /// tab is reading a password, and off again after.
+    fn update_secure_input(&mut self) {
+        let want = self.focused && asking_for_password(self.pty.master_fd());
+        if want == self.secure {
+            return;
+        }
+        self.secure = want;
+        unsafe {
+            if want {
+                EnableSecureEventInput();
+            } else {
+                DisableSecureEventInput();
             }
+        }
+        crate::log!("window {}: secure keyboard entry {}", self.id, if want { "on" } else { "off" });
+        self.needs_redraw = true;
+    }
+
+    /// ⌘-click: open a URL in the browser, or show a file in Quick Look.
+    /// Returns false when there's nothing there to open.
+    fn open_under_pointer(&mut self, event: &NSEvent) -> bool {
+        let (pos, _) = self.cell_at(event);
+        let (word, cwd) = {
+            let term = self.term.lock();
+            (selection::word_at(&term, pos.line, pos.cell), term.cwd.clone())
+        };
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let target = links::resolve(&word, cwd.as_deref().map(std::path::Path::new), home.as_deref(), |p| p.exists());
+        match target {
+            Some(links::Target::Url(u)) => {
+                if let Some(url) = NSURL::URLWithString(&NSString::from_str(&u)) {
+                    NSWorkspace::sharedWorkspace().openURL(&url);
+                }
+                true
+            }
+            Some(links::Target::Path(path)) => {
+                // After this event, outside the app-state borrow: the panel
+                // taking key status calls back into the window delegate.
+                DispatchQueue::main().exec_async(move || quick_look(path));
+                true
+            }
+            None => false,
         }
     }
 
@@ -989,6 +1174,7 @@ impl TermWindow {
 
     fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
+        self.update_secure_input();
         if !focused {
             self.hover(None);
         }
@@ -1235,6 +1421,9 @@ impl TermWindow {
                 < (self.renderer.padding().1 / self.scale() as f32) as f64;
             if top_edge || f.contains(NSEventModifierFlags::Control | NSEventModifierFlags::Command) {
                 self.window.performWindowDragWithEvent(event);
+                return;
+            }
+            if f.contains(NSEventModifierFlags::Command) && self.open_under_pointer(event) {
                 return;
             }
         }
@@ -1659,6 +1848,8 @@ impl App {
             mouse_cell: (usize::MAX, usize::MAX),
             option_as_meta: cfg.macos.option_as_meta,
             base_font_size: cfg.font.size,
+            notify_after: (cfg.macos.notify_after_secs > 0).then(|| Duration::from_secs(cfg.macos.notify_after_secs)),
+            secure: false,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -1953,6 +2144,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let delegate = AppDelegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
+    NOTIFIER.with(|n| *n.borrow_mut() = notify::Notifier::new(mtm));
     let gpu = Gpu::new()?;
     APP.with(|cell| {
         *cell.borrow_mut() = Some(App {
