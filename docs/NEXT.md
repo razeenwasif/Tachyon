@@ -424,6 +424,14 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    there. The receipt reads `☕ awake` while held.
 9. **Split panes** on cell boundaries. Shaping already arrived with Core Text
    in step 1.
+   *Ligatures and emoji sequences done (9 November 2026):* `FontSet::shape`
+   lays text out with a CTLine and maps glyphs back to characters, cached by
+   text and style. The renderer shapes only spans that need it: emoji
+   sequences the grid keeps in separate cells (ZWJ, skin-tone modifiers,
+   regional-indicator pairs), multi-character clusters, and with a ligature
+   font, runs of two or more punctuation cells in one weight. Each glyph is
+   coloured by its own cell. Ligatures switch on only when shaping a probe
+   string changes a glyph (JetBrains Mono yes, Cascadia Mono no).
    *Done (9 November 2026), ahead of the session host:* `src/mac/panes.rs` is
    a tab's layout tree (splits with a ratio, on whole cells, one cell for each
    divider, panes kept at least two cells). Each pane is a session of its own

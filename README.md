@@ -275,8 +275,15 @@ For zsh, source `shell/tachyon-integration.zsh` from `~/.zshrc`; for fish, copy
 `shell/xdg/fish/vendor_conf.d/tachyon-integration.fish` into
 `~/.config/fish/conf.d/`. Some servers' `sshd_config` doesn't accept `LC_*`.
 
-Not yet on the Mac: split panes, ligatures, and emoji sequences that need
-shaping (skin tones, ZWJ families).
+**Ligatures and emoji.** Core Text shapes what needs it. Emoji sequences
+draw as one glyph: ZWJ families, skin tones, flags, and keycaps. Combining
+marks are composed or placed by the font. With a font that has programming
+ligatures (Cascadia Code, Fira Code, JetBrains Mono), runs of punctuation such
+as `->`, `!=` and `|>` take them, each glyph in its own cell's colour.
+`font.ligatures = false` turns them off. Cell widths stay what the shell
+counts, so the cursor never drifts. A family emoji is drawn once and leaves
+the extra cells blank. Shaping is cached and only runs for cells that need
+it, so plain text draws exactly as before.
 
 ## Installing and pinning to the taskbar
 
