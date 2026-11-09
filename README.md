@@ -188,6 +188,11 @@ with OSC 133, which gives:
   its state (`nexus j-1a2b3c4d · running on forge`, then `· finished` or
   `· failed`), with a receipt and a notification when it ends. A Slurm job
   submitted over ssh is followed through the same ssh;
+- **rerun diff**: run a command again (numbers in the command line ignored, so
+  `train.py --lr 3e-4` then `--lr 1e-3` counts) and the lines that differ from
+  the last run get an amber mark in the gutter, with `2 lines changed` (or `same
+  as last run`) on the prompt line. Lines are paired by shape, numbers ignored,
+  so a changed loss reads as changed; hover a mark for the old line;
 - ⌘↑ / ⌘↓ to jump between commands;
 - a **notification** with the receipt when a command of 10 seconds or more
   finishes while you're in another app or window (`notify.after` sets the time,

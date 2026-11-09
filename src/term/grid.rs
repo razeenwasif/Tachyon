@@ -45,6 +45,10 @@ impl RowMark {
     pub const PROMPT: u8 = 1;
     pub const INPUT: u8 = 2;
     pub const OUTPUT: u8 = 4;
+    /// Rerun diff: this line differs from the last run's (CHANGED), or the
+    /// last run had nothing like it (NEW).
+    pub const CHANGED: u8 = 8;
+    pub const NEW: u8 = 16;
 
     #[inline]
     pub fn is_some(&self) -> bool {
@@ -461,6 +465,18 @@ impl Grid {
         } else {
             RowMark::default()
         }
+    }
+
+    /// Set the mark on a line by absolute position.
+    pub fn set_mark(&mut self, absolute: usize, mark: RowMark) {
+        let h = self.history.len();
+        if absolute < h {
+            self.history[absolute].mark = mark;
+        } else if absolute - h < self.rows {
+            let i = self.live_index(absolute - h);
+            self.screen[i].mark = mark;
+        }
+        self.full_damage = true;
     }
 
     #[inline]

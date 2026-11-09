@@ -369,6 +369,13 @@ left and a faint blue glow behind it. No `>_` chevron, no text, one accent.
    from `nexus jobs` or `squeue` through OSC 2, and exits with the job's code
    (from `sacct` for Slurm). zsh runs the command at its first prompt through a
    line-init hook added from precmd; other shells get it typed ahead.
+   *Rerun diff done (9 November 2026):* `src/term/rerun.rs`. When a command
+   finishes, its output lines (wrapped rows joined, up to 2000) are compared
+   with the last run of the same command line with numbers ignored, by a
+   Myers diff (the `similar` crate) on line shapes; equal shapes with different
+   text are changed, unmatched lines new. Marks go on the rows (CHANGED, NEW)
+   so they travel through scrollback and reflow; the prompt line counts them
+   and hovering shows the old line as a tooltip.
 8. **Session host**: `tachyon-host` as a login agent with keep-awake
    assertions. After Rewind, because it owns the logs.
 9. **Split panes** on cell boundaries. Shaping already arrived with Core Text

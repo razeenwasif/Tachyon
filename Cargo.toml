@@ -26,6 +26,7 @@ unicode-width = "0.2"
 rustc-hash = "2.1"
 bitflags = "2.13"
 parking_lot = "0.12"
+similar = { version = "2", default-features = false }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
