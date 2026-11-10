@@ -568,11 +568,13 @@ impl Term {
     /// What's typed at the prompt, when the cursor is at its end: the text
     /// from where the command line starts (OSC 133 B) to the cursor, and how
     /// many blank cells follow the cursor before anything else on its row (a
-    /// right prompt, say). `None` while a command runs, on the alternate
-    /// screen, scrolled back, with the cursor inside the text, or without
-    /// shell integration.
+    /// right prompt, say). `None` while a command runs, scrolled back, with
+    /// the cursor inside the text, or without shell integration. On the
+    /// alternate screen only for a prompt marked there: a shell in tmux,
+    /// whose integration sends its marks through (a full-screen program the
+    /// shell started is a running command).
     pub fn prompt_input(&self) -> Option<(String, usize)> {
-        if self.mode.contains(TermMode::ALT_SCREEN) || self.grid.display_offset() != 0 {
+        if self.grid.display_offset() != 0 {
             return None;
         }
         let id = self.current_cmd?;
@@ -637,10 +639,8 @@ impl Term {
     /// OSC 133: A prompt starts, B input starts, C output starts (the command
     /// runs), D;exit the command finished.
     fn semantic_mark(&mut self, params: &[&[u8]]) {
-        // Marks belong to the shell's own screen, not to full-screen apps.
-        if self.mode.contains(TermMode::ALT_SCREEN) {
-            return;
-        }
+        // Marks on the alternate screen come from a shell inside tmux, which
+        // passes them through: a full-screen program doesn't send them.
         let Some(&kind) = params.get(1).and_then(|p| p.first()) else {
             return;
         };
@@ -3239,6 +3239,7 @@ mod image_tests {
         for v in t.visible_images() {
             println!("image {}x{} px at row {} col {}, {}x{} cells", v.image.width, v.image.height, v.row, v.col, v.cols, v.rows);
         }
+        println!("prompt input: {:?}; cursor {:?}", t.prompt_input(), (t.cursor.x, t.cursor.y));
         for y in 0..t.rows() {
             let line: String = t.grid.row(y).cells().iter().map(|c| char::from_u32(c.ch).filter(|c| *c >= ' ').unwrap_or(' ')).collect();
             println!("{y:2}|{}", line.trim_end());

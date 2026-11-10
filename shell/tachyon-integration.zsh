@@ -5,25 +5,44 @@
 # Loaded automatically (see zsh/.zshenv). On a machine you ssh into, source it
 # from ~/.zshrc; ssh passes LC_TERMINAL, which tells it it's in Tachyon. Safe
 # to source more than once, and a no-op outside Tachyon.
+#
+# Inside tmux, whose shells Tachyon doesn't start, source it from ~/.zshrc:
+#   [[ -n $TMUX ]] && source /Applications/Tachyon.app/Contents/Resources/shell/tachyon-integration.zsh
+# tmux drops OSC 133, so there the marks go through its passthrough (`set -g
+# allow-passthrough on`); a terminal outside that doesn't read them ignores
+# them.
 
 [[ -n $_TACHYON_INTEGRATED ]] && return
-[[ $TERM_PROGRAM == Tachyon || $LC_TERMINAL == Tachyon ]] || return
+[[ $TERM_PROGRAM == Tachyon || $LC_TERMINAL == Tachyon || -n $TMUX ]] || return
 typeset -g _TACHYON_INTEGRATED=1
+
+# An OSC sequence for the terminal: wrapped for tmux's passthrough inside it.
+if [[ -n $TMUX ]]; then
+  typeset -g _tachyon_pre=$'\ePtmux;\e\e]' _tachyon_post=$'\a\e\\'
+  # tmux holds back text it's drawing but passes a mark on at once, so the
+  # mark where typing starts would come before the prompt. Erasing the blank
+  # cell at the cursor (ECH) makes tmux send the prompt first.
+  typeset -g _tachyon_input=$'\e[1X'${_tachyon_pre}133';B'${_tachyon_post}
+else
+  typeset -g _tachyon_pre=$'\e]' _tachyon_post=$'\a'
+  typeset -g _tachyon_input=${_tachyon_pre}133';B'${_tachyon_post}
+fi
+_tachyon_osc() { builtin print -rn -- "$_tachyon_pre$1$_tachyon_post" }
 
 _tachyon_precmd() {
   # Must run first among precmd hooks so $? is still the command's status.
   local ret=$?
   if [[ -n $_tachyon_running ]]; then
-    builtin print -n "\e]133;D;$ret\a"
+    _tachyon_osc "133;D;$ret"
     unset _tachyon_running
   fi
-  builtin print -n "\e]133;A\a"
+  _tachyon_osc "133;A"
   # The working directory, which names the tab while it sits at a prompt.
-  builtin print -rn -- $'\e]7;file://'"${HOST}${PWD//\%/%25}"$'\a'
+  _tachyon_osc "7;file://${HOST}${PWD//\%/%25}"
   # Mark where typing starts: the end of the prompt. Re-added whenever a theme
   # (starship, powerlevel10k) has rebuilt the prompt without it.
-  if [[ $PS1 != *$'\e]133;B\a'* ]]; then
-    PS1="$PS1%{"$'\e]133;B\a'"%}"
+  if [[ $PS1 != *"$_tachyon_input"* ]]; then
+    PS1="$PS1%{$_tachyon_input%}"
   fi
 }
 
@@ -32,7 +51,7 @@ _tachyon_preexec() {
   # The command line (control characters blanked, at most 256 characters)
   # names the tab while it runs.
   local cmd=${1//[[:cntrl:]]/ }
-  builtin print -rn -- $'\e]133;C;cmdline='"${cmd[1,256]}"$'\a'
+  _tachyon_osc "133;C;cmdline=${cmd[1,256]}"
 }
 
 autoload -Uz add-zsh-hook

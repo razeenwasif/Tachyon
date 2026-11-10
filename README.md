@@ -289,6 +289,21 @@ with OSC 133, which gives:
 
 Set `shell.integration = false` to turn it off.
 
+Inside tmux, Tachyon doesn't start the shells, so load the script yourself,
+near the top of `~/.zshrc` (before a prompt theme like starship, so its hook
+runs first):
+
+```sh
+[[ -n $TMUX ]] && source /Applications/Tachyon.app/Contents/Resources/shell/tachyon-integration.zsh
+```
+
+For bash, the same with `tachyon-integration.bash` in `~/.bashrc`; for fish,
+copy `shell/xdg/fish/vendor_conf.d/tachyon-integration.fish` to
+`~/.config/fish/conf.d/`. tmux drops OSC 133, so inside it the marks go
+through its passthrough, which needs `set -g allow-passthrough on` in
+`tmux.conf`. Suggestions, receipts and the margin bars then work in tmux's
+panes as they do outside it (with tmux splits, by row across the window).
+
 Over ssh, the shell on the other machine needs the script too. Copy it there
 and load it from your startup file; ssh passes `LC_TERMINAL=Tachyon`, which is
 how it knows it's in Tachyon:

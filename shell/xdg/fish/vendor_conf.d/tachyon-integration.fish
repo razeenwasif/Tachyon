@@ -20,20 +20,34 @@ else if set -q TACHYON_SHELL_INTEGRATION
 end
 
 status is-interactive; or exit
-test "$TERM_PROGRAM" = Tachyon; or test "$LC_TERMINAL" = Tachyon; or exit
+test "$TERM_PROGRAM" = Tachyon; or test "$LC_TERMINAL" = Tachyon; or set -q TMUX; or exit
 set -q _tachyon_integrated; and exit
 set -g _tachyon_integrated 1
+
+# An OSC sequence for the terminal: inside tmux, which drops OSC 133, wrapped
+# for its passthrough (`set -g allow-passthrough on`).
+function _tachyon_osc
+    if set -q TMUX
+        printf '\ePtmux;\e\e]%s\a\e\\' $argv[1]
+    else
+        printf '\e]%s\a' $argv[1]
+    end
+end
 
 # A prompt is about to be drawn. fish_prompt itself may be defined later (by
 # config.fish, or starship), so it's wrapped here, the first time, to mark
 # where typing starts.
 function _tachyon_prompt_start --on-event fish_prompt
-    printf '\e]133;A\a\e]7;file://%s%s\a' $hostname (string replace -a % %25 -- $PWD)
+    _tachyon_osc '133;A'
+    _tachyon_osc "7;file://$hostname"(string replace -a % %25 -- $PWD)
     if not functions -q _tachyon_user_prompt; and functions -q fish_prompt
         functions -c fish_prompt _tachyon_user_prompt
         function fish_prompt
             _tachyon_user_prompt
-            printf '\e]133;B\a'
+            # In tmux, erasing the blank cell at the cursor (ECH) makes it
+            # send the prompt it holds back before this mark.
+            set -q TMUX; and printf '\e[1X'
+            _tachyon_osc '133;B'
         end
     end
 end
@@ -41,10 +55,10 @@ end
 # A command line is about to run: its text names the tab.
 function _tachyon_preexec --on-event fish_preexec
     set -l cmd (string replace -ra '[[:cntrl:]]' ' ' -- $argv[1] | string join ' ')
-    printf '\e]133;C;cmdline=%s\a' (string sub -l 256 -- "$cmd")
+    _tachyon_osc "133;C;cmdline="(string sub -l 256 -- "$cmd")
 end
 
 # It finished, with this status.
 function _tachyon_postexec --on-event fish_postexec
-    printf '\e]133;D;%s\a' $status
+    _tachyon_osc "133;D;$status"
 end

@@ -26,8 +26,21 @@ if [ -n "${_TACHYON_BASH_INJECT-}" ]; then
   fi
 fi
 
-if [[ $- == *i* && ( ${TERM_PROGRAM-} == Tachyon || ${LC_TERMINAL-} == Tachyon ) && -z ${_TACHYON_INTEGRATED-} ]]; then
+if [[ $- == *i* && ( ${TERM_PROGRAM-} == Tachyon || ${LC_TERMINAL-} == Tachyon || -n ${TMUX-} ) && -z ${_TACHYON_INTEGRATED-} ]]; then
   _TACHYON_INTEGRATED=1
+  # OSC sequences for the terminal: inside tmux, which drops OSC 133, wrapped
+  # for its passthrough (`set -g allow-passthrough on`).
+  if [[ -n ${TMUX-} ]]; then
+    _tachyon_pre='\033Ptmux;\033\033]' _tachyon_post='\007\033\\'
+    # tmux holds back text it's drawing but passes a mark on at once:
+    # erasing the blank cell at the cursor (ECH) makes it send the prompt
+    # before the mark where typing starts.
+    _tachyon_input='\033[1X'$_tachyon_pre'133;B'$_tachyon_post
+  else
+    _tachyon_pre='\033]' _tachyon_post='\007'
+    _tachyon_input=$_tachyon_pre'133;B'$_tachyon_post
+  fi
+  _tachyon_osc() { builtin printf "$_tachyon_pre%s$_tachyon_post" "$1"; }
   _tachyon_running=
   _tachyon_armed=
   _tachyon_hist=
@@ -39,10 +52,11 @@ if [[ $- == *i* && ( ${TERM_PROGRAM-} == Tachyon || ${LC_TERMINAL-} == Tachyon )
   _tachyon_precmd() {
     local ret=$?
     if [[ -n $_tachyon_running ]]; then
-      builtin printf '\033]133;D;%s\007' "$ret"
+      _tachyon_osc "133;D;$ret"
       _tachyon_running=
     fi
-    builtin printf '\033]133;A\007\033]7;file://%s%s\007' "${HOSTNAME-}" "${PWD//\%/%25}"
+    _tachyon_osc "133;A"
+    _tachyon_osc "7;file://${HOSTNAME-}${PWD//\%/%25}"
     return $ret
   }
 
@@ -52,7 +66,7 @@ if [[ $- == *i* && ( ${TERM_PROGRAM-} == Tachyon || ${LC_TERMINAL-} == Tachyon )
   _tachyon_ready() {
     local ret=$?
     if [[ $PS1 != *'133;B'* ]]; then
-      PS1=$PS1'\[\033]133;B\007\]'
+      PS1=$PS1'\['$_tachyon_input'\]'
     fi
     _tachyon_install
     _tachyon_hist=$(HISTTIMEFORMAT= builtin history 1)
@@ -81,7 +95,7 @@ if [[ $- == *i* && ( ${TERM_PROGRAM-} == Tachyon || ${LC_TERMINAL-} == Tachyon )
         fi
         cmd=${cmd//[[:cntrl:]]/ }
         _tachyon_running=1
-        builtin printf '\033]133;C;cmdline=%s\007' "${cmd:0:256}"
+        _tachyon_osc "133;C;cmdline=${cmd:0:256}"
       fi
     fi
     # A DEBUG trap that was there first (starship times commands with one)
