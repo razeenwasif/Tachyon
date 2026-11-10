@@ -554,6 +554,11 @@ define_class!(
             close_active_tab(self.id());
         }
 
+        #[unsafe(method(tachyonReopenTab:))]
+        fn reopen_tab(&self, _sender: Option<&AnyObject>) {
+            reopen_closed(Some(self.id()));
+        }
+
         #[unsafe(method(tachyonPreviousTab:))]
         fn previous_tab(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.cycle_tab(-1));
@@ -966,8 +971,11 @@ define_class!(
         /// without running destructors).
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _n: &NSNotification) {
-            // The host keeps the shells; it keeps where they were too.
+            crate::log!("app: terminating");
+            // The host keeps the shells; it keeps where they were too. Tabs
+            // closed by hand end now, though.
             save_layout();
+            end_closed();
             QUITTING.store(true, Ordering::Release);
             if let Some(root) = rewind_root() {
                 let prefix = format!("{}-", std::process::id());
@@ -1019,6 +1027,12 @@ define_class!(
         #[unsafe(method(newTab:))]
         fn new_tab(&self, _sender: Option<&AnyObject>) {
             open_window();
+        }
+
+        /// ⌥⌘T with no window open: the tab comes back in a new one.
+        #[unsafe(method(tachyonReopenTab:))]
+        fn reopen_tab(&self, _sender: Option<&AnyObject>) {
+            reopen_closed(None);
         }
     }
 );
@@ -1530,6 +1544,8 @@ struct TermWindow {
     ghost_cache: Option<(String, Option<String>, Option<String>)>,
     /// The training chart, over one pane.
     chart: Option<ChartView>,
+    /// Closing because its last shell ended, not by hand: nothing to keep.
+    shell_ended: bool,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -2054,21 +2070,32 @@ impl TermWindow {
         self.layout();
     }
 
-    /// Close tab `i`, which must not be the last one. The tab to its right
-    /// comes forward, as in Safari, or the one to its left at the end.
-    fn remove_tab(&mut self, i: usize) {
-        if i == self.active {
+    /// Take tab `i` out, which must not be the last one. The tab to its
+    /// right comes forward, as in Safari, or the one to its left at the end.
+    fn take_tab(&mut self, i: usize) -> Tab {
+        let tab = if i == self.active {
             // Its live state goes with it.
-            self.tabs.remove(i);
+            self.save_live();
+            let tab = self.tabs.remove(i);
             self.active = i.min(self.tabs.len() - 1);
             self.load_live();
+            tab
         } else {
-            self.tabs.remove(i);
+            let tab = self.tabs.remove(i);
             if i < self.active {
                 self.active -= 1;
             }
-        }
+            tab
+        };
         self.layout();
+        tab
+    }
+
+    /// Close tab `i` (not the last one): it's kept a while, its shells
+    /// running, for ⌥⌘T to bring back.
+    fn remove_tab(&mut self, i: usize) {
+        let tab = self.take_tab(i);
+        keep_closed(tab);
     }
 
     /// Give focus to pane `p` of the tab in front.
@@ -2138,22 +2165,36 @@ impl TermWindow {
     /// if it had focus, the focus. Its last pane closes the tab; the last
     /// tab's last pane returns the window, for the caller to close outside
     /// the app-state borrow.
-    fn close_pane(&mut self, i: usize, p: usize) -> Option<Retained<NSWindow>> {
+    /// Close pane `p` of tab `i`; with `keep`, closed by hand, so kept a
+    /// while for ⌥⌘T. Returns the window when it was the last pane in it,
+    /// for the caller to close.
+    fn close_pane(&mut self, i: usize, p: usize, keep: bool) -> Option<Retained<NSWindow>> {
         if self.tabs[i].panes.len() == 1 {
             if self.tabs.len() == 1 {
+                if !keep {
+                    self.shell_ended = true;
+                }
                 return Some(self.window.clone());
             }
-            self.remove_tab(i);
+            let tab = self.take_tab(i);
+            if keep {
+                keep_closed(tab);
+            }
             return None;
         }
         let in_front = i == self.active && p == self.tabs[i].focus;
         if in_front {
             self.rewind_exit();
+            self.save_live();
         }
         let tab = &mut self.tabs[i];
         let next = tab.layout.remove(tab.panes[p].id);
         tab.zoomed = false;
-        tab.panes.remove(p);
+        let pane = tab.panes.remove(p);
+        if keep {
+            keep_closed(Tab::new(pane));
+        }
+        let tab = &mut self.tabs[i];
         if p == tab.focus {
             tab.focus = next.and_then(|id| tab.index_of(id)).unwrap_or(0);
             if i == self.active {
@@ -3754,6 +3795,7 @@ impl App {
             ghost: None,
             ghost_cache: None,
             chart: None,
+            shell_ended: false,
             find_bar: None,
             find: None,
             cursor_layer,
@@ -3873,7 +3915,7 @@ fn close_active_tab(window: u64) {
     let last = with_app(|app| {
         let w = app.windows.iter_mut().find(|w| w.id == window)?;
         let (i, p) = (w.active, w.tabs[w.active].focus);
-        w.close_pane(i, p)
+        w.close_pane(i, p, true)
     })
     .flatten();
     // Outside the borrow: closing calls back into the window delegate.
@@ -3942,9 +3984,11 @@ fn shell_exited(pane: u64) {
         let w = app.windows.iter_mut().find(|w| w.tabs.iter().any(|t| t.index_of(pane).is_some()))?;
         let i = w.tabs.iter().position(|t| t.index_of(pane).is_some())?;
         let p = w.tabs[i].index_of(pane)?;
-        w.close_pane(i, p)
+        w.close_pane(i, p, false)
     })
     .flatten();
+    // A closed tab's shell that ended while kept: it has nothing to bring back.
+    forget_closed_pane(pane);
     // `close` sends windowWillClose:, which removes the window's state.
     if let Some(window) = window {
         window.close();
@@ -3957,9 +4001,126 @@ fn remove_window(id: u64) {
     let removed = with_app(|app| {
         let i = app.windows.iter().position(|w| w.id == id)?;
         Some(app.windows.remove(i))
-    });
+    })
+    .flatten();
     schedule_layout_save();
-    drop(removed);
+    // Closed by hand: its tabs are kept a while for ⌥⌘T, like a tab's.
+    let tabs = match removed {
+        Some(mut w) if !w.shell_ended && !QUITTING.load(Ordering::Acquire) => {
+            w.save_live();
+            std::mem::take(&mut w.tabs)
+        }
+        _ => Vec::new(),
+    };
+    for tab in tabs {
+        keep_closed(tab);
+    }
+}
+
+/// How long a closed tab is kept, its shells running, for ⌥⌘T.
+const KEEP_CLOSED: Duration = Duration::from_secs(10 * 60);
+/// How many are kept; closing another ends the oldest.
+const MAX_CLOSED: usize = 10;
+
+thread_local! {
+    /// Tabs closed by hand, newest last, with when.
+    static CLOSED: RefCell<std::collections::VecDeque<(Tab, Instant)>> = const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Keep a tab closed by hand, its shells running and read, so ⌥⌘T can bring
+/// it back as it is. It goes after [`KEEP_CLOSED`], or when it's the oldest
+/// of more than [`MAX_CLOSED`].
+fn keep_closed(tab: Tab) {
+    if QUITTING.load(Ordering::Acquire) {
+        return;
+    }
+    crate::log!("closed tab kept: panes {:?}", tab.panes.iter().map(|p| p.id).collect::<Vec<_>>());
+    let dropped = CLOSED.with(|c| {
+        let mut c = c.borrow_mut();
+        c.push_back((tab, Instant::now()));
+        let n = c.len().saturating_sub(MAX_CLOSED);
+        c.drain(..n).collect::<Vec<_>>()
+    });
+    // Outside the borrow: dropping a pane hangs up its shell.
+    drop(dropped);
+    let _ = std::thread::Builder::new().name("tachyon-closed-expiry".into()).spawn(|| {
+        std::thread::sleep(KEEP_CLOSED + Duration::from_secs(1));
+        DispatchQueue::main().exec_async(expire_closed);
+    });
+}
+
+/// End the closed tabs kept longer than [`KEEP_CLOSED`].
+fn expire_closed() {
+    let expired = CLOSED.with(|c| {
+        let mut c = c.borrow_mut();
+        let n = c.iter().take_while(|(_, at)| at.elapsed() >= KEEP_CLOSED).count();
+        c.drain(..n).collect::<Vec<_>>()
+    });
+    if !expired.is_empty() {
+        crate::log!("closed tabs: {} ended after {} minutes", expired.len(), KEEP_CLOSED.as_secs() / 60);
+    }
+}
+
+/// End every kept tab's shells (quitting).
+fn end_closed() {
+    let all = CLOSED.with(|c| c.borrow_mut().drain(..).collect::<Vec<_>>());
+    drop(all);
+}
+
+/// A kept tab's shell ended by itself: forget its pane, and the tab if it
+/// was the last.
+fn forget_closed_pane(pane: u64) {
+    let gone = CLOSED.with(|c| {
+        let mut c = c.borrow_mut();
+        let i = c.iter().position(|(t, _)| t.index_of(pane).is_some())?;
+        let tab = &mut c[i].0;
+        let p = tab.index_of(pane)?;
+        let next = tab.layout.remove(pane);
+        let removed = tab.panes.remove(p);
+        tab.focus = next.and_then(|id| tab.index_of(id)).unwrap_or(0);
+        let whole = tab.panes.is_empty().then(|| c.remove(i)).flatten();
+        Some((removed, whole))
+    });
+    drop(gone);
+}
+
+/// ⌥⌘T: bring back the tab closed last, as a tab of window `window`, or of
+/// a new window when there's none.
+fn reopen_closed(window: Option<u64>) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(tab) = CLOSED.with(|c| c.borrow_mut().pop_back().map(|(t, _)| t)) else {
+        objc2_app_kit::NSBeep();
+        return;
+    };
+    crate::log!("closed tab reopened: panes {:?}", tab.panes.iter().map(|p| p.id).collect::<Vec<_>>());
+    // Its reader threads asked for redraws nobody answered: let them again.
+    for p in &tab.panes {
+        p.wake_pending.store(false, Ordering::Release);
+    }
+    let target = window.filter(|&id| with_app(|app| app.windows.iter().any(|w| w.id == id)).unwrap_or(false));
+    match target {
+        Some(id) => {
+            with_window(id, |w| {
+                w.save_live();
+                w.add_tab(tab);
+                w.request_redraw();
+            });
+        }
+        None => match with_app(|app| app.create_window(mtm, Some((vec![tab], 0)))) {
+            Some(Ok((window, view, id))) => {
+                with_window(id, |w| {
+                    w.apply_appearance();
+                    w.layout();
+                });
+                window.makeKeyAndOrderFront(None);
+                window.makeFirstResponder(Some(&view));
+                NSApplication::sharedApplication(mtm).activate();
+            }
+            Some(Err(e)) => crate::log::force(&format!("could not reopen a tab: {e}")),
+            None => {}
+        },
+    }
+    schedule_layout_save();
 }
 
 fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
@@ -3986,6 +4147,10 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let file = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Shell"));
     item(&file, "New Tab", sel!(newTab:), "t");
     item(&file, "New Window", sel!(newWindow:), "n");
+    // ⌥⌘T rather than browsers' ⌘⇧T, which other apps often take as a
+    // global shortcut (and then Tachyon never sees it).
+    item(&file, "Reopen Closed Tab", sel!(tachyonReopenTab:), "t")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&file, "Follow Job", sel!(tachyonFollowJob:), "j");
     file.addItem(&NSMenuItem::separatorItem(mtm));
     item(&file, "Split Right", sel!(tachyonSplitRight:), "d");
