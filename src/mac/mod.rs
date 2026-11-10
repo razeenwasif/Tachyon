@@ -2701,11 +2701,13 @@ impl TermWindow {
             self.request_redraw();
             return false;
         }
-        // A suggestion showing: →, End or ⌃F take it, ⌥→ a word of it.
+        // A suggestion showing: Tab, →, End or ⌃F take it, ⌥→ a word of it.
+        // Tab only while one shows: otherwise it's the shell's completion.
         if let Some(rest) = self.ghost.clone() {
             const RIGHT: u16 = 124;
             const END: u16 = 119;
             const F: u16 = 3;
+            const TAB: u16 = 48;
             let (opt, ctrl, shift) = (
                 flags.contains(NSEventModifierFlags::Option),
                 flags.contains(NSEventModifierFlags::Control),
@@ -2713,7 +2715,7 @@ impl TermWindow {
             );
             let take = match event.keyCode() {
                 RIGHT if !ctrl && !shift => Some(if opt { suggest::next_word(&rest).to_string() } else { rest }),
-                END if !ctrl && !shift && !opt => Some(rest),
+                END | TAB if !ctrl && !shift && !opt => Some(rest),
                 F if ctrl && !opt && !shift => Some(rest),
                 _ => None,
             };

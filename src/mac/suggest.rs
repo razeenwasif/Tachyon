@@ -1,5 +1,5 @@
 //! Inline suggestions: as you type at a prompt, the rest of a command you've
-//! run before, in grey after the cursor; → takes it.
+//! run before, in grey after the cursor; Tab or → takes it.
 //!
 //! Commands come from two places. Every command line shell integration
 //! reports (OSC 133 C, in any tab) is recorded with its folder, in a private
