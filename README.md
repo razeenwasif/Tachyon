@@ -145,6 +145,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
+| ⌘⇧T | Reopen the tab, pane or window's tab closed last (kept ten minutes, shells running) |
 | ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
 | ⌥⌘A | Keep the Mac awake while this pane's command runs (or its next one) |
 | ⌥⌘L | Latency ledger: where each keystroke's delay goes |
@@ -234,6 +235,14 @@ running in it, or its folder at a prompt (zsh reports both through the
 integration below), or a title a program set while it runs. When a command
 finishes in a tab you aren't looking at, the tab gets a dot: green if it
 succeeded, red if it failed.
+
+**Reopen a closed tab.** A tab, split pane or window you close is kept for ten
+minutes with its shells still running and their output still read, and ⌘⇧T
+(Shell > Reopen Closed Tab) brings the last one back as a tab in the window in
+front, splits and all, exactly as it is now: what ran meanwhile is on its
+screen. A closed window's tabs come back one at a time. Up to ten are kept;
+closing an eleventh ends the oldest, and quitting ends them all. A shell that
+exits by itself closes its tab for good.
 
 Applications that turn on mouse reporting (vim, tmux, htop) get clicks, drags
 and the wheel. The cursor blinks through Core Animation, so a blinking cursor
