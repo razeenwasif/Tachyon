@@ -269,6 +269,8 @@ pub struct Term {
     /// An iTerm2 image arriving in parts (`MultipartFile`): its arguments
     /// and the payload so far.
     iterm_partial: Option<(Vec<u8>, Vec<u8>)>,
+    /// A sixel image arriving (DCS q): its parameters and data so far.
+    sixel: Option<(Vec<u16>, Vec<u8>)>,
     next_image: u64,
     /// A cell's size in device pixels: what images are sized by, and what
     /// `CSI 16 t` reports.
@@ -335,6 +337,7 @@ impl Term {
             kitty_images: FxHashMap::default(),
             kitty_partial: None,
             iterm_partial: None,
+            sixel: None,
             next_image: 1,
             cell_px: (8, 16),
         }
@@ -475,6 +478,7 @@ impl Term {
             kitty_images: FxHashMap::default(),
             kitty_partial: None,
             iterm_partial: None,
+            sixel: None,
             next_image: 1,
             cell_px: self.cell_px,
         }
@@ -564,11 +568,13 @@ impl Term {
     /// What's typed at the prompt, when the cursor is at its end: the text
     /// from where the command line starts (OSC 133 B) to the cursor, and how
     /// many blank cells follow the cursor before anything else on its row (a
-    /// right prompt, say). `None` while a command runs, on the alternate
-    /// screen, scrolled back, with the cursor inside the text, or without
-    /// shell integration.
+    /// right prompt, say). `None` while a command runs, scrolled back, with
+    /// the cursor inside the text, or without shell integration. On the
+    /// alternate screen only for a prompt marked there: a shell in tmux,
+    /// whose integration sends its marks through (a full-screen program the
+    /// shell started is a running command).
     pub fn prompt_input(&self) -> Option<(String, usize)> {
-        if self.mode.contains(TermMode::ALT_SCREEN) || self.grid.display_offset() != 0 {
+        if self.grid.display_offset() != 0 {
             return None;
         }
         let id = self.current_cmd?;
@@ -633,10 +639,8 @@ impl Term {
     /// OSC 133: A prompt starts, B input starts, C output starts (the command
     /// runs), D;exit the command finished.
     fn semantic_mark(&mut self, params: &[&[u8]]) {
-        // Marks belong to the shell's own screen, not to full-screen apps.
-        if self.mode.contains(TermMode::ALT_SCREEN) {
-            return;
-        }
+        // Marks on the alternate screen come from a shell inside tmux, which
+        // passes them through: a full-screen program doesn't send them.
         let Some(&kind) = params.get(1).and_then(|p| p.first()) else {
             return;
         };
@@ -844,7 +848,7 @@ impl Term {
         // plainly; the primary screen, which holds the user's history, is
         // reflowed.
         let cursor = (self.cursor.x, self.cursor.y);
-        let line_before = self.grid.scrolled() + self.cursor.y as u64;
+        let line_before = self.grid.scrolled() as i64 + self.cursor.y as i64;
         if self.mode.contains(TermMode::ALT_SCREEN) {
             self.grid.resize(cols, rows, &pen);
             self.inactive.reflow(cols, rows, &pen, cursor);
@@ -857,10 +861,10 @@ impl Term {
             self.cursor.y = cy;
             // Reflowing moves lines: images keep their place relative to the
             // cursor's line, where the newest ones are.
-            let shift = (self.grid.scrolled() + cy as u64) as i64 - line_before as i64;
+            let shift = self.grid.scrolled() as i64 + cy as i64 - line_before;
             if shift != 0 {
                 for p in self.images.iter_mut().filter(|p| !p.alt) {
-                    p.line = (p.line as i64 + shift).max(0) as u64;
+                    p.line += shift;
                 }
             }
         }
@@ -1028,6 +1032,9 @@ impl Term {
             let take = avail.min(bytes.len());
 
             let y = self.cursor.y;
+            if !self.images.is_empty() {
+                self.punch_images(y, x, x + take, false);
+            }
             {
                 let row = self.grid.row_mut(y);
                 let cells = row.cells_mut();
@@ -1209,6 +1216,9 @@ impl Term {
         if self.mode.contains(TermMode::INSERT) {
             self.shift_right(x, y, width);
         }
+        if !self.images.is_empty() {
+            self.punch_images(y, x, x + width, false);
+        }
 
         let mut cell = Cell {
             ch: c as u32,
@@ -1304,7 +1314,7 @@ impl Term {
         if self.cursor.y == self.scroll_bot {
             let pen = self.cursor.pen;
             let (t, b) = (self.scroll_top, self.scroll_bot);
-            self.grid.scroll_up(t, b, 1, &pen);
+            self.scroll_lines_up(t, b, 1, &pen);
         } else if self.cursor.y + 1 < self.rows() {
             self.cursor.y += 1;
         }
@@ -1314,7 +1324,7 @@ impl Term {
         if self.cursor.y == self.scroll_top {
             let pen = self.cursor.pen;
             let (t, b) = (self.scroll_top, self.scroll_bot);
-            self.grid.scroll_down(t, b, 1, &pen);
+            self.scroll_lines_down(t, b, 1, &pen);
         } else {
             self.cursor.y = self.cursor.y.saturating_sub(1);
         }
@@ -1470,6 +1480,9 @@ impl Term {
             2 => 0..cols,
             _ => x..cols,
         };
+        if !self.images.is_empty() {
+            self.punch_images(y, range.start, range.end, true);
+        }
         let row = self.grid.row_mut(y);
         row.cells_mut()[range].fill(blank);
         row.wrapped = false;
@@ -1484,12 +1497,18 @@ impl Term {
             0 => {
                 self.erase_in_line(0);
                 for row in (y + 1)..rows {
+                    if !self.images.is_empty() {
+                        self.punch_images(row, 0, usize::MAX, true);
+                    }
                     self.grid.row_mut(row).cells_mut().fill(blank);
                 }
             }
             // Beginning of screen to cursor.
             1 => {
                 for row in 0..y {
+                    if !self.images.is_empty() {
+                        self.punch_images(row, 0, usize::MAX, true);
+                    }
                     self.grid.row_mut(row).cells_mut().fill(blank);
                 }
                 self.erase_in_line(1);
@@ -1517,6 +1536,9 @@ impl Term {
         let (x, y, cols) = (self.cursor.x, self.cursor.y, self.cols());
         let end = (x + n.max(1)).min(cols);
         let blank = Cell::blank(&self.cursor.pen);
+        if !self.images.is_empty() {
+            self.punch_images(y, x, end, true);
+        }
         self.grid.row_mut(y).cells_mut()[x..end].fill(blank);
         self.dirty = true;
     }
@@ -1542,7 +1564,7 @@ impl Term {
         }
         let pen = self.cursor.pen;
         let (top, bot) = (self.cursor.y, self.scroll_bot);
-        self.grid.scroll_down(top, bot, n.max(1), &pen);
+        self.scroll_lines_down(top, bot, n.max(1), &pen);
         self.cursor.x = 0;
         self.dirty = true;
     }
@@ -1553,7 +1575,7 @@ impl Term {
         }
         let pen = self.cursor.pen;
         let (top, bot) = (self.cursor.y, self.scroll_bot);
-        self.grid.scroll_up(top, bot, n.max(1), &pen);
+        self.scroll_lines_up(top, bot, n.max(1), &pen);
         self.cursor.x = 0;
         self.dirty = true;
     }
@@ -1912,15 +1934,15 @@ impl Perform for Term {
             ('L', _) => self.insert_lines(n(0)),
             ('M', _) => self.delete_lines(n(0)),
             ('P', _) => self.delete_chars(n(0)),
-            ('S', _) => {
+            ('S', None) => {
                 let pen = self.cursor.pen;
                 let (t, b) = (self.scroll_top, self.scroll_bot);
-                self.grid.scroll_up(t, b, n(0), &pen);
+                self.scroll_lines_up(t, b, n(0), &pen);
             }
-            ('T', _) => {
+            ('T', None) => {
                 let pen = self.cursor.pen;
                 let (t, b) = (self.scroll_top, self.scroll_bot);
-                self.grid.scroll_down(t, b, n(0), &pen);
+                self.scroll_lines_down(t, b, n(0), &pen);
             }
             ('X', _) => self.erase_chars(n(0)),
             ('Z', _) => self.back_tab(n(0)),
@@ -1956,7 +1978,9 @@ impl Perform for Term {
                     }
                 }
             }
-            ('m', _) => self.apply_sgr(params),
+            // `CSI > 4;1 m` and the like (xterm's key modifiers, which tmux
+            // sends) aren't SGR.
+            ('m', None) => self.apply_sgr(params),
             ('n', _) => match arg(params, 0, 0) {
                 // Device status report: ready.
                 5 => self.replies.extend_from_slice(b"\x1b[0n"),
@@ -1996,11 +2020,32 @@ impl Perform for Term {
                     self.goto(0, 0);
                 }
             }
-            ('s', _) => self.saved_cursor = self.cursor,
-            ('u', _) => self.cursor = self.saved_cursor,
-            ('c', _) => {
-                // Primary device attributes: claim to be a VT220 with colour.
-                self.replies.extend_from_slice(b"\x1b[?62;22c");
+            ('s', None) => self.saved_cursor = self.cursor,
+            ('u', None) => self.cursor = self.saved_cursor,
+            ('c', None) => {
+                // Primary device attributes: a VT220 with colour (22) and
+                // sixel graphics (4), which tmux looks for before passing
+                // images on.
+                if arg(params, 0, 0) == 0 {
+                    self.replies.extend_from_slice(b"\x1b[?62;4;22c");
+                }
+            }
+            ('c', Some(b'>')) => {
+                // Secondary device attributes: a VT100-class terminal.
+                if arg(params, 0, 0) == 0 {
+                    self.replies.extend_from_slice(b"\x1b[>0;10;1c");
+                }
+            }
+            ('S', Some(b'?')) => {
+                // XTSMGRAPHICS: sixel colour registers (1) and the largest
+                // image (2), asked by sixel tools before drawing.
+                let (cw, ch) = self.cell_px;
+                let s = match (arg(params, 0, 0), arg(params, 1, 0)) {
+                    (1, 1 | 4) => "\x1b[?1;0;1024S".to_string(),
+                    (2, 1 | 4) => format!("\x1b[?2;0;{};{}S", self.cols() as u32 * cw, self.rows() as u32 * ch),
+                    (item, _) => format!("\x1b[?{item};1;0S"),
+                };
+                self.replies.extend_from_slice(s.as_bytes());
             }
             ('t', _) => {
                 // Window reports: the text area in cells (18), in pixels
@@ -2111,13 +2156,26 @@ impl Perform for Term {
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+    fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         // Entering DCS -- explicitly *not* a return to Ground.
+        if action == 'q' && intermediates.is_empty() && !ignore {
+            let p: Vec<u16> = params.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
+            self.sixel = Some((p, Vec::new()));
+        }
     }
 
-    fn put(&mut self, _byte: u8) {}
+    fn put(&mut self, byte: u8) {
+        if let Some((_, data)) = &mut self.sixel {
+            if data.len() < MAX_IMAGE_PAYLOAD {
+                data.push(byte);
+            }
+        }
+    }
 
     fn unhook(&mut self) {
+        if let Some((params, data)) = self.sixel.take() {
+            self.sixel_image(&params, &data);
+        }
         // A DCS ends on the ESC of ST too; see osc_dispatch. (CAN and SUB end
         // it in Ground without a signal, which only means the next bytes take
         // the slow path until something does signal.)
@@ -2147,10 +2205,80 @@ impl Term {
             .iter()
             .filter(|p| p.alt == alt)
             .filter_map(|p| {
-                let row = p.line as i64 - first;
+                let row = p.line - first;
                 (row + p.rows as i64 > 0 && row < rows).then(|| VisibleImage { image: p.image.clone(), row, col: p.col, cols: p.cols, rows: p.rows })
             })
             .collect()
+    }
+
+    /// Scroll lines `top..=bottom` up by `n`, images on them too. The whole
+    /// screen scrolling takes its images along by itself (they're anchored to
+    /// lines); a region (tmux keeps its status line out of one) needs this.
+    fn scroll_lines_up(&mut self, top: usize, bottom: usize, n: usize, pen: &Pen) {
+        self.grid.scroll_up(top, bottom, n, pen);
+        if !self.images.is_empty() && !(top == 0 && bottom + 1 == self.rows()) {
+            self.shift_images(top, bottom, -(n.min(bottom + 1 - top) as i64));
+        }
+    }
+
+    fn scroll_lines_down(&mut self, top: usize, bottom: usize, n: usize, pen: &Pen) {
+        self.grid.scroll_down(top, bottom, n, pen);
+        if !self.images.is_empty() && top <= bottom {
+            self.shift_images(top, bottom, n.min(bottom + 1 - top) as i64);
+        }
+    }
+
+    /// Move the images whose top is in rows `top..=bottom` by `delta` rows.
+    /// One pushed out of the region goes; at the top of the screen it stays
+    /// while any of it shows (the screen's edge clips it).
+    fn shift_images(&mut self, top: usize, bottom: usize, delta: i64) {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        let base = self.grid.scrolled() as i64;
+        let (top, bottom) = (top as i64, bottom as i64);
+        self.images.retain_mut(|p| {
+            let row = p.line - base;
+            // One hanging off the top of the screen moves with what shows of it.
+            let hangs = top == 0 && row < 0 && row + p.rows as i64 > 0;
+            if p.alt != alt || (row < top && !hangs) || row > bottom {
+                return true;
+            }
+            let new = row + delta;
+            if new > bottom || (new < top && (top > 0 || new + p.rows as i64 <= 0)) {
+                return false;
+            }
+            p.line = base + new;
+            true
+        });
+    }
+
+    /// A sixel image (DCS q) at the cursor, which then moves to the line
+    /// below it.
+    fn sixel_image(&mut self, params: &[u16], data: &[u8]) {
+        let Some((w, h, rgba)) = image::decode_sixel(params, data) else { return };
+        let (cols, rows) = self.image_cells(w, h, (None, None));
+        let img = self.new_image(image::Format::Rgba, w, h, rgba);
+        let col = self.cursor.x;
+        self.place_image(img, cols, rows, true, None, true);
+        self.linefeed_raw();
+        self.cursor.x = col;
+    }
+
+    /// Cells `x0..x1` of screen row `y` were written, or with `erase`
+    /// erased: the images that took their place go. So do kitty images (a
+    /// layer of their own) on a row erased whole, which is how tmux
+    /// repaints: otherwise one would hang over the next window shown.
+    fn punch_images(&mut self, y: usize, x0: usize, x1: usize, erase: bool) {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        let line = self.grid.scrolled() as i64 + y as i64;
+        let whole_row = erase && x0 == 0 && x1 >= self.cols();
+        let before = self.images.len();
+        self.images.retain(|p| {
+            let hit = p.alt == alt && line >= p.line && line < p.line + p.rows as i64 && x0 < p.col + p.cols && x1 > p.col;
+            !(hit && (p.in_cells || whole_row))
+        });
+        if self.images.len() != before {
+            self.grid.damage_all();
+        }
     }
 
     /// Whether there are any images to draw on this screen.
@@ -2168,16 +2296,24 @@ impl Term {
     /// Put an image at the cursor, `cols` by `rows` cells, and (unless
     /// asked not to) move the cursor to just after its bottom-right corner,
     /// scrolling as text would.
-    fn place_image(&mut self, image: Arc<image::Image>, cols: usize, rows: usize, move_cursor: bool, kitty_id: Option<u32>) {
+    fn place_image(&mut self, image: Arc<image::Image>, cols: usize, rows: usize, move_cursor: bool, kitty_id: Option<u32>, in_cells: bool) {
         let alt = self.mode.contains(TermMode::ALT_SCREEN);
-        let (col, line) = (self.cursor.x, self.grid.scrolled() + self.cursor.y as u64);
-        self.images.push(image::Placement { image, line, col, cols, rows, alt, kitty_id });
+        let (col, line) = (self.cursor.x, self.grid.scrolled() as i64 + self.cursor.y as i64);
+        // A new image over older ones hides them: they go, as their pixels
+        // would in a terminal that draws images into its cells.
+        self.images.retain(|p| {
+            p.alt != alt || !(p.line >= line && p.line + p.rows as i64 <= line + rows as i64 && p.col >= col && p.col + p.cols <= col + cols)
+        });
+        self.images.push(image::Placement { image, line, col, cols, rows, alt, kitty_id, in_cells });
         if move_cursor {
             for _ in 1..rows {
                 self.linefeed_raw();
             }
-            self.cursor.x = (col + cols).min(self.cols() - 1);
-            self.cursor.wrap_pending = false;
+            // Just after it; at the right margin, the next character wraps
+            // rather than landing on it.
+            let end = col + cols;
+            self.cursor.x = end.min(self.cols() - 1);
+            self.cursor.wrap_pending = end >= self.cols() && self.mode.contains(TermMode::AUTOWRAP);
         }
         self.prune_images();
         self.grid.damage_all();
@@ -2188,9 +2324,9 @@ impl Term {
     /// while there are too many bytes of them.
     fn prune_images(&mut self) {
         let alt_now = self.mode.contains(TermMode::ALT_SCREEN);
-        let gone_before = |g: &Grid| g.scrolled().saturating_sub(g.history_len() as u64);
+        let gone_before = |g: &Grid| g.scrolled() as i64 - g.history_len() as i64;
         let (here, other) = (gone_before(&self.grid), gone_before(&self.inactive));
-        self.images.retain(|p| p.line + p.rows as u64 > if p.alt == alt_now { here } else { other });
+        self.images.retain(|p| p.line + p.rows as i64 > if p.alt == alt_now { here } else { other });
         let mut bytes: usize = self.kitty_images.values().map(|i| i.data.len()).sum();
         bytes += self.images.iter().filter(|p| p.kitty_id.is_none()).map(|p| p.image.data.len()).sum::<usize>();
         while bytes > MAX_IMAGE_BYTES {
@@ -2209,14 +2345,14 @@ impl Term {
     /// with the scrollback, those above it too.
     fn drop_images(&mut self, screen: bool, history: bool) {
         let alt = self.mode.contains(TermMode::ALT_SCREEN);
-        let top = self.grid.scrolled();
-        let bottom = top + self.rows() as u64;
+        let top = self.grid.scrolled() as i64;
+        let bottom = top + self.rows() as i64;
         self.images.retain(|p| {
             if p.alt != alt {
                 return true;
             }
-            let on_screen = p.line + (p.rows as u64) > top && p.line < bottom;
-            let above = p.line + (p.rows as u64) <= top;
+            let on_screen = p.line + (p.rows as i64) > top && p.line < bottom;
+            let above = p.line + (p.rows as i64) <= top;
             !((screen && on_screen) || (history && above))
         });
     }
@@ -2254,7 +2390,7 @@ impl Term {
             b'p' => match k.id.and_then(|id| self.kitty_images.get(&id).cloned()) {
                 Some(img) => {
                     let (cols, rows) = self.image_cells(img.width, img.height, (k.cols, k.rows));
-                    self.place_image(img, cols, rows, !k.stay, k.id);
+                    self.place_image(img, cols, rows, !k.stay, k.id, false);
                     self.kitty_reply(&k, Ok(()));
                 }
                 None => self.kitty_reply(&k, Err("ENOENT:no such image")),
@@ -2268,7 +2404,7 @@ impl Term {
                         }
                         if k.action == b'T' {
                             let (cols, rows) = self.image_cells(w, h, (k.cols, k.rows));
-                            self.place_image(img, cols, rows, !k.stay, k.id);
+                            self.place_image(img, cols, rows, !k.stay, k.id, false);
                         } else {
                             self.prune_images();
                         }
@@ -2341,7 +2477,7 @@ impl Term {
         let Some(i) = image::parse_iterm(rest, self.cell_px, (self.cols(), self.rows())) else { return };
         let (cols, rows) = self.image_cells(i.width, i.height, i.want);
         let img = self.new_image(image::Format::Encoded, i.width, i.height, i.data);
-        self.place_image(img, cols, rows, true, None);
+        self.place_image(img, cols, rows, true, None, true);
     }
 }
 
@@ -3030,5 +3166,100 @@ mod image_tests {
         assert_eq!(t.visible_images().len(), 1);
         p.advance(&mut t, b"\x1b[?1049l");
         assert!(t.visible_images().is_empty() && t.images.is_empty());
+    }
+
+    #[test]
+    fn device_attributes_answer_what_was_asked() {
+        let (mut t, mut p) = term();
+        p.advance(&mut t, b"\x1b[c\x1b[>c\x1b[=c");
+        assert_eq!(t.take_replies(), b"\x1b[?62;4;22c\x1b[>0;10;1c", "DA1 with sixel, DA2, no DA3");
+        // tmux's key-modifier request isn't an underline.
+        p.advance(&mut t, b"\x1b[>4;1mx");
+        assert!(!t.grid.row(0).cells()[0].flags.contains(CellFlags::UNDERLINE));
+        // A sixel tool's size query isn't a scroll.
+        p.advance(&mut t, b"\x1b[?2;1;0S\x1b[?1;1;0S");
+        assert_eq!(t.take_replies(), b"\x1b[?2;0;400;200S\x1b[?1;0;1024S");
+        assert_eq!(t.grid.row(0).cells()[0].ch, 'x' as u32);
+    }
+
+    #[test]
+    fn sixel_images_are_placed_at_the_cursor() {
+        let (mut t, mut p) = term();
+        p.advance(&mut t, b"ab\x1bPq\"1;1;20;40#1;2;100;0;0#1!20~-!20~-!20~-!20~-!20~-!20~-!20~\x1b\\");
+        let v = t.visible_images();
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].col, v[0].row, v[0].cols, v[0].rows, v[0].image.width), (2, 0, 2, 2, 20));
+        assert_eq!((t.cursor.x, t.cursor.y), (2, 2), "below it, at its left edge");
+        // The same place drawn again (tmux redrawing): the old one goes.
+        p.advance(&mut t, b"\x1b[1;3H\x1bPq\"1;1;20;40#1!20~\x1b\\");
+        assert_eq!(t.images.len(), 1);
+    }
+
+    #[test]
+    fn images_follow_region_scrolls() {
+        // tmux's layout: rows 0-8 scroll, row 9 is its status line.
+        let (mut t, mut p) = term();
+        p.advance(&mut t, b"\x1b[?1049h\x1b[1;9r\x1b[5;1H");
+        p.advance(&mut t, format!("\x1b_Ga=T,f=32,s=10,v=40,q=2;{}\x1b\\", b64(&[9u8; 10 * 40 * 4])).as_bytes());
+        assert_eq!(t.visible_images()[0].row, 4);
+        p.advance(&mut t, b"\x1b[9;1H\n\n");
+        assert_eq!(t.visible_images()[0].row, 2, "up with the region's lines");
+        p.advance(&mut t, b"\n\n\n");
+        assert_eq!(t.visible_images()[0].row, -1, "partly off the top: clipped there");
+        p.advance(&mut t, b"\x1b[1;1H\x1bM");
+        assert_eq!(t.visible_images()[0].row, 0, "reverse index brings it down");
+        p.advance(&mut t, b"\n\n\n\n\n\n\n\n\n\n\n");
+        assert!(t.visible_images().is_empty(), "wholly above: gone");
+    }
+
+    /// Replays a recording of a real program's output (`TACHYON_REPLAY`),
+    /// such as tmux showing images, and prints where the images ended up.
+    #[test]
+    #[ignore]
+    fn replay_images() {
+        let Some(path) = std::env::var_os("TACHYON_REPLAY") else { return };
+        let bytes = std::fs::read(path).unwrap();
+        let mut t = Term::new(100, 40, 1000);
+        t.set_cell_pixels(14, 28);
+        let mut p = Processor::new();
+        if std::env::var_os("TACHYON_TRACE").is_some() {
+            // Where the number of images changes, and what came then.
+            let mut n = 0;
+            for (i, b) in bytes.iter().enumerate() {
+                p.advance(&mut t, std::slice::from_ref(b));
+                if t.images.len() != n {
+                    n = t.images.len();
+                    let around = &bytes[i.saturating_sub(120)..(i + 40).min(bytes.len())];
+                    println!("@{i}: {n} images after {:?}", String::from_utf8_lossy(around).chars().filter(|c| !c.is_ascii_alphanumeric() || true).take(200).collect::<String>().escape_debug().to_string());
+                }
+            }
+        } else {
+            p.advance(&mut t, &bytes);
+        }
+        for v in t.visible_images() {
+            println!("image {}x{} px at row {} col {}, {}x{} cells", v.image.width, v.image.height, v.row, v.col, v.cols, v.rows);
+        }
+        println!("prompt input: {:?}; cursor {:?}", t.prompt_input(), (t.cursor.x, t.cursor.y));
+        for y in 0..t.rows() {
+            let line: String = t.grid.row(y).cells().iter().map(|c| char::from_u32(c.ch).filter(|c| *c >= ' ').unwrap_or(' ')).collect();
+            println!("{y:2}|{}", line.trim_end());
+        }
+    }
+
+    #[test]
+    fn text_over_an_iterm_or_sixel_image_replaces_it() {
+        let (mut t, mut p) = term();
+        p.advance(&mut t, format!("\x1b]1337;File=inline=1:{}\x07", b64(&png(100, 60))).as_bytes());
+        p.advance(&mut t, format!("\x1b[5;1H\x1b_Ga=T,f=32,s=10,v=20,q=2;{}\x1b\\", b64(&[9u8; 10 * 20 * 4])).as_bytes());
+        assert_eq!(t.images.len(), 2);
+        // tmux repainting: spaces over the first image's rows.
+        p.advance(&mut t, b"\x1b[2;5H    ");
+        assert_eq!(t.images.len(), 1, "the iTerm2 image gave way");
+        // A kitty image is a layer under the text, as in kitty.
+        p.advance(&mut t, b"\x1b[5;1Hkitty\x1b[K");
+        assert_eq!(t.images.len(), 1);
+        // Its row erased whole, as tmux repaints for another window: gone.
+        p.advance(&mut t, b"\x1b[5;1H\x1b[2K");
+        assert!(t.images.is_empty());
     }
 }

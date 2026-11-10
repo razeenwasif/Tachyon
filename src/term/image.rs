@@ -39,8 +39,9 @@ pub struct Image {
 #[derive(Clone, Debug)]
 pub struct Placement {
     pub image: Arc<Image>,
-    /// The line it starts on, counted from the first the screen ever had.
-    pub line: u64,
+    /// The line it starts on, counted from the first the screen ever had
+    /// (negative once a region scroll has pushed it partly off the top).
+    pub line: i64,
     pub col: usize,
     pub cols: usize,
     pub rows: usize,
@@ -48,6 +49,10 @@ pub struct Placement {
     pub alt: bool,
     /// kitty's image id, for `a=d` deletes.
     pub kitty_id: Option<u32>,
+    /// It takes the place of the cells it covers, as iTerm2's and sixel
+    /// images do: text written or erased over any of them removes it. A
+    /// kitty image is a layer of its own, under the text.
+    pub in_cells: bool,
 }
 
 /// The width and height of a PNG, GIF or JPEG, from its header.
@@ -239,6 +244,153 @@ pub fn kitty_image(k: &Kitty, base64: &[u8]) -> Result<(Format, u32, u32, Vec<u8
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sixel: DCS P1 ; P2 ; P3 q <data> ST
+// ---------------------------------------------------------------------------
+
+/// The VT340's sixteen colours, in percent, the registers' defaults.
+const VT340: [[u8; 3]; 16] = [
+    [0, 0, 0], [20, 20, 80], [80, 13, 13], [20, 80, 20], [80, 20, 80], [20, 80, 80], [80, 80, 20], [53, 53, 53],
+    [26, 26, 26], [33, 33, 60], [60, 26, 26], [33, 60, 33], [60, 33, 60], [33, 60, 60], [60, 60, 33], [80, 80, 80],
+];
+
+/// The largest side of a sixel image kept.
+const SIXEL_MAX: usize = 8192;
+
+/// A sixel image's width, height and pixels (straight RGBA; pixels no sixel
+/// set are transparent).
+pub fn decode_sixel(_params: &[u16], data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let pct = |v: u16| ((v.min(100) as u32 * 255 + 50) / 100) as u8;
+    let mut palette: Vec<[u8; 4]> = (0..1024)
+        .map(|i| VT340.get(i).map_or([0, 0, 0, 255], |c| [pct(c[0] as u16), pct(c[1] as u16), pct(c[2] as u16), 255]))
+        .collect();
+    let mut color = 0usize;
+    // Rows of pixels, each as long as drawn so far.
+    let mut rows: Vec<Vec<[u8; 4]>> = Vec::new();
+    let (mut x, mut y) = (0usize, 0usize);
+    let mut raster: Option<(usize, usize)> = None;
+    let mut width = 0usize;
+
+    let mut i = 0;
+    // Numbers separated by `;` from `i`.
+    let numbers = |i: &mut usize| -> Vec<u16> {
+        let mut out = vec![0u16];
+        while *i < data.len() {
+            match data[*i] {
+                d @ b'0'..=b'9' => {
+                    let last = out.last_mut().expect("one");
+                    *last = last.saturating_mul(10).saturating_add((d - b'0') as u16);
+                }
+                b';' => out.push(0),
+                _ => break,
+            }
+            *i += 1;
+        }
+        out
+    };
+    while i < data.len() {
+        let b = data[i];
+        i += 1;
+        let mut count = 1;
+        let sixel = match b {
+            b'"' => {
+                let n = numbers(&mut i);
+                if let (Some(&w), Some(&h)) = (n.get(2), n.get(3)) {
+                    if w > 0 && h > 0 {
+                        raster = Some((w as usize, h as usize));
+                    }
+                }
+                continue;
+            }
+            b'#' => {
+                let n = numbers(&mut i);
+                color = n[0] as usize % palette.len();
+                if n.len() >= 5 {
+                    palette[color] = match n[1] {
+                        1 => hls(n[2], n[3], n[4]),
+                        _ => [pct(n[2]), pct(n[3]), pct(n[4]), 255],
+                    };
+                }
+                continue;
+            }
+            b'!' => {
+                count = numbers(&mut i)[0].max(1) as usize;
+                let Some(&c) = data.get(i) else { break };
+                i += 1;
+                c
+            }
+            b'$' => {
+                x = 0;
+                continue;
+            }
+            b'-' => {
+                x = 0;
+                y += 6;
+                continue;
+            }
+            c => c,
+        };
+        if !(0x3F..=0x7E).contains(&sixel) {
+            continue;
+        }
+        let bits = sixel - 0x3F;
+        let end = (x + count).min(SIXEL_MAX);
+        if bits != 0 && y + 6 <= SIXEL_MAX {
+            if rows.len() < y + 6 {
+                rows.resize_with(y + 6, Vec::new);
+            }
+            let px = palette[color];
+            for bit in 0..6 {
+                if bits & (1 << bit) != 0 {
+                    let row = &mut rows[y + bit];
+                    if row.len() < end {
+                        row.resize(end, [0; 4]);
+                    }
+                    row[x..end].fill(px);
+                }
+            }
+        }
+        x = end;
+        width = width.max(x);
+    }
+    let (w, h) = match raster {
+        Some((rw, rh)) => (rw.min(SIXEL_MAX), rh.min(SIXEL_MAX)),
+        None => (width, rows.len()),
+    };
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; w * h * 4];
+    for (r, row) in rows.iter().take(h).enumerate() {
+        for (c, px) in row.iter().take(w).enumerate() {
+            out[(r * w + c) * 4..][..4].copy_from_slice(px);
+        }
+    }
+    Some((w as u32, h as u32, out))
+}
+
+/// A sixel HLS colour (hue 0 is blue, as on the VT340) as RGBA.
+fn hls(h: u16, l: u16, s: u16) -> [u8; 4] {
+    let h = ((h as f32 + 240.0) % 360.0) / 360.0;
+    let (l, s) = (l.min(100) as f32 / 100.0, s.min(100) as f32 / 100.0);
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let channel = |t: f32| {
+        let t = t.rem_euclid(1.0);
+        let v = if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        };
+        (v * 255.0).round() as u8
+    };
+    [channel(h + 1.0 / 3.0), channel(h), channel(h - 1.0 / 3.0), 255]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +447,24 @@ mod tests {
         assert_eq!(kitty_image(&k, &p).map(|(f, w, h, _)| (f, w, h)), Ok((Format::Rgba, 2, 2)));
         let (k, p) = parse_kitty(b"Gf=32,s=4,v=4;AAAA").map(|(k, p)| (k, p.to_vec())).unwrap();
         assert!(kitty_image(&k, &p).is_err(), "too few pixels");
+    }
+
+    #[test]
+    fn sixel_images() {
+        // Raster 4x7; colour 1 red, a 4-wide band of full sixels, then one
+        // more row (bit 0) of colour 2 green on the next band, 1 pixel wide.
+        let data = b"\"1;1;4;7#1;2;100;0;0#1!4~-#2;2;0;100;0#2@";
+        let (w, h, px) = decode_sixel(&[0, 1, 0], data).unwrap();
+        assert_eq!((w, h), (4, 7));
+        let at = |x: usize, y: usize| &px[(y * 4 + x) * 4..][..4];
+        assert_eq!(at(3, 5), &[255, 0, 0, 255]);
+        assert_eq!(at(0, 6), &[0, 255, 0, 255]);
+        assert_eq!(at(1, 6), &[0, 0, 0, 0], "never set: transparent");
+        // No raster attributes: the size is what was drawn.
+        let (w, h, _) = decode_sixel(&[], b"#0~~$-~").unwrap();
+        assert_eq!((w, h), (2, 12));
+        // HLS: hue 120 is red on the VT340's wheel.
+        assert_eq!(hls(120, 50, 100), [255, 0, 0, 255]);
+        assert!(decode_sixel(&[], b"").is_none());
     }
 }
