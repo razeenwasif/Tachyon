@@ -1029,7 +1029,7 @@ define_class!(
             open_window();
         }
 
-        /// ⌘⇧T with no window open: the tab comes back in a new one.
+        /// ⌥⌘T with no window open: the tab comes back in a new one.
         #[unsafe(method(tachyonReopenTab:))]
         fn reopen_tab(&self, _sender: Option<&AnyObject>) {
             reopen_closed(None);
@@ -2092,7 +2092,7 @@ impl TermWindow {
     }
 
     /// Close tab `i` (not the last one): it's kept a while, its shells
-    /// running, for ⌘⇧T to bring back.
+    /// running, for ⌥⌘T to bring back.
     fn remove_tab(&mut self, i: usize) {
         let tab = self.take_tab(i);
         keep_closed(tab);
@@ -2166,7 +2166,7 @@ impl TermWindow {
     /// tab's last pane returns the window, for the caller to close outside
     /// the app-state borrow.
     /// Close pane `p` of tab `i`; with `keep`, closed by hand, so kept a
-    /// while for ⌘⇧T. Returns the window when it was the last pane in it,
+    /// while for ⌥⌘T. Returns the window when it was the last pane in it,
     /// for the caller to close.
     fn close_pane(&mut self, i: usize, p: usize, keep: bool) -> Option<Retained<NSWindow>> {
         if self.tabs[i].panes.len() == 1 {
@@ -4004,7 +4004,7 @@ fn remove_window(id: u64) {
     })
     .flatten();
     schedule_layout_save();
-    // Closed by hand: its tabs are kept a while for ⌘⇧T, like a tab's.
+    // Closed by hand: its tabs are kept a while for ⌥⌘T, like a tab's.
     let tabs = match removed {
         Some(mut w) if !w.shell_ended && !QUITTING.load(Ordering::Acquire) => {
             w.save_live();
@@ -4017,7 +4017,7 @@ fn remove_window(id: u64) {
     }
 }
 
-/// How long a closed tab is kept, its shells running, for ⌘⇧T.
+/// How long a closed tab is kept, its shells running, for ⌥⌘T.
 const KEEP_CLOSED: Duration = Duration::from_secs(10 * 60);
 /// How many are kept; closing another ends the oldest.
 const MAX_CLOSED: usize = 10;
@@ -4027,7 +4027,7 @@ thread_local! {
     static CLOSED: RefCell<std::collections::VecDeque<(Tab, Instant)>> = const { RefCell::new(std::collections::VecDeque::new()) };
 }
 
-/// Keep a tab closed by hand, its shells running and read, so ⌘⇧T can bring
+/// Keep a tab closed by hand, its shells running and read, so ⌥⌘T can bring
 /// it back as it is. It goes after [`KEEP_CLOSED`], or when it's the oldest
 /// of more than [`MAX_CLOSED`].
 fn keep_closed(tab: Tab) {
@@ -4084,7 +4084,7 @@ fn forget_closed_pane(pane: u64) {
     drop(gone);
 }
 
-/// ⌘⇧T: bring back the tab closed last, as a tab of window `window`, or of
+/// ⌥⌘T: bring back the tab closed last, as a tab of window `window`, or of
 /// a new window when there's none.
 fn reopen_closed(window: Option<u64>) {
     let Some(mtm) = MainThreadMarker::new() else { return };
@@ -4147,8 +4147,10 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let file = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Shell"));
     item(&file, "New Tab", sel!(newTab:), "t");
     item(&file, "New Window", sel!(newWindow:), "n");
-    // A capital letter means Shift as well: ⌘⇧T.
-    item(&file, "Reopen Closed Tab", sel!(tachyonReopenTab:), "T");
+    // ⌥⌘T rather than browsers' ⌘⇧T, which other apps often take as a
+    // global shortcut (and then Tachyon never sees it).
+    item(&file, "Reopen Closed Tab", sel!(tachyonReopenTab:), "t")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&file, "Follow Job", sel!(tachyonFollowJob:), "j");
     file.addItem(&NSMenuItem::separatorItem(mtm));
     item(&file, "Split Right", sel!(tachyonSplitRight:), "d");
