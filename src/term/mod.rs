@@ -160,6 +160,17 @@ pub struct CommandInfo {
     /// How its output differs from the last run of the same command, by
     /// logical output line; `None` when there was no last run to compare.
     pub rerun: Option<Vec<(usize, rerun::Change)>>,
+    /// The metrics of the last run of the same command (numbers in the
+    /// command line ignored), for the chart to draw beside this run's.
+    pub previous: Option<PreviousRun>,
+}
+
+/// A finished run's metric curves.
+#[derive(Clone, Debug)]
+pub struct PreviousRun {
+    pub curves: Arc<Vec<lens::Curve>>,
+    pub cmdline: String,
+    pub ended: Option<Instant>,
 }
 
 impl CommandInfo {
@@ -225,6 +236,8 @@ pub struct Term {
     /// The last output of recent commands, by command-line shape, for
     /// rerun diff.
     last_outputs: std::collections::VecDeque<(String, Vec<String>)>,
+    /// The metric curves of recent runs that had any, by command-line shape.
+    last_curves: std::collections::VecDeque<(String, PreviousRun)>,
     /// Incremented whenever anything a tab's name is made from changes (the
     /// title, the working directory, a command starting or ending), so the
     /// app can cheaply notice.
@@ -320,6 +333,7 @@ impl Term {
             ssh_session: None,
             jobs: Vec::new(),
             last_outputs: std::collections::VecDeque::new(),
+            last_curves: std::collections::VecDeque::new(),
             title_revision: 0,
             bell_revision: 0,
             ground_signal: false,
@@ -356,6 +370,18 @@ impl Term {
         self.current_cmd
     }
 
+    /// The newest command whose output had metrics: the one running, or the
+    /// last to finish.
+    pub fn latest_with_metrics(&self) -> Option<u32> {
+        let has = |id: &u32| self.commands.get(id).is_some_and(|c| !c.lens.curves.is_empty());
+        if let Some(id) = self.current_cmd.filter(has) {
+            return Some(id);
+        }
+        // Ids count up from where the oldest kept one is.
+        let floor = self.next_cmd.wrapping_sub(MAX_COMMANDS);
+        self.commands.keys().copied().filter(has).max_by_key(|&k| k.wrapping_sub(floor))
+    }
+
     pub fn take_command_events(&mut self) -> Vec<CommandEvent> {
         core::mem::take(&mut self.command_events)
     }
@@ -369,6 +395,20 @@ impl Term {
                 let m = self.grid.mark(l);
                 m.cmd == id && m.has(RowMark::OUTPUT)
             })
+    }
+
+    /// Command `id` just finished: keep its metric curves, if it had any, for
+    /// the next run of the same command to be charted against.
+    fn keep_curves(&mut self, id: u32) {
+        let Some(c) = self.commands.get(&id) else { return };
+        let (Some(cmdline), false) = (c.cmdline.clone(), c.lens.curves.is_empty()) else { return };
+        let key = rerun::shape(cmdline.trim());
+        let run = PreviousRun { curves: Arc::new(c.lens.curves.clone()), cmdline, ended: c.finished };
+        self.last_curves.retain(|(k, _)| *k != key);
+        self.last_curves.push_back((key, run));
+        if self.last_curves.len() > 16 {
+            self.last_curves.pop_front();
+        }
     }
 
     /// Command `id` just finished: compare its output with the last run of
@@ -461,6 +501,7 @@ impl Term {
             ssh_session: None,
             jobs: Vec::new(),
             last_outputs: std::collections::VecDeque::new(),
+            last_curves: std::collections::VecDeque::new(),
             title_revision: 0,
             bell_revision: 0,
             ground_signal: false,
@@ -670,6 +711,7 @@ impl Term {
                         lens: lens::Lens::default(),
                         job: None,
                         rerun: None,
+                        previous: None,
                     },
                 );
                 self.mark_row(id, RowMark::PROMPT);
@@ -708,8 +750,13 @@ impl Term {
                     if cmdline.as_deref().is_some_and(is_ssh) && self.ssh_session.is_none() {
                         self.ssh_session = cmdline.clone().map(|c| (c, self.cwd_host.clone()));
                     }
+                    let previous = cmdline.as_deref().and_then(|line| {
+                        let key = rerun::shape(line.trim());
+                        self.last_curves.iter().rev().find(|(k, _)| *k == key).map(|(_, p)| p.clone())
+                    });
                     let c = self.commands.get_mut(&id).expect("looked up above");
                     c.cmdline = cmdline;
+                    c.previous = previous;
                     self.title_revision = self.title_revision.wrapping_add(1);
                     self.mark_row(id, RowMark::OUTPUT);
                     if std::mem::take(&mut self.awake_next) {
@@ -738,6 +785,7 @@ impl Term {
                                 self.command_events.push(CommandEvent::Finished(id, exit));
                             }
                             self.compare_run(id);
+                            self.keep_curves(id);
                             self.title_revision = self.title_revision.wrapping_add(1);
                         }
                     }
@@ -3261,5 +3309,30 @@ mod image_tests {
         // Its row erased whole, as tmux repaints for another window: gone.
         p.advance(&mut t, b"\x1b[5;1H\x1b[2K");
         assert!(t.images.is_empty());
+    }
+
+    /// A command run again gets the last run's metric curves to chart
+    /// beside its own.
+    #[test]
+    fn reruns_carry_the_last_runs_curves() {
+        let mut t = Term::new(60, 10, 100);
+        let mut p = Processor::new();
+        let run = |t: &mut Term, p: &mut Processor, cmd: &str, losses: &[f64]| {
+            p.advance(t, format!("\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;cmdline={cmd}\x07\r\n").as_bytes());
+            let id = t.current_command().unwrap();
+            for (i, l) in losses.iter().enumerate() {
+                t.record_reading(&lens::read_line(&format!("step={i} loss={l}")));
+            }
+            p.advance(t, b"\x1b]133;D;0\x07");
+            id
+        };
+        let first = run(&mut t, &mut p, "python train.py --lr 3e-4", &[2.0, 1.5, 1.0]);
+        assert!(t.command(first).unwrap().previous.is_none());
+        let second = run(&mut t, &mut p, "python train.py --lr 1e-3", &[2.2, 1.2]);
+        let prev = t.command(second).unwrap().previous.clone().expect("same command, numbers aside");
+        assert_eq!(prev.cmdline, "python train.py --lr 3e-4");
+        assert_eq!(prev.curves[0].at(1.0), Some(1.5));
+        let other = run(&mut t, &mut p, "python eval.py", &[0.3]);
+        assert!(t.command(other).unwrap().previous.is_none());
     }
 }

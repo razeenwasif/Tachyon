@@ -16,6 +16,7 @@
 //! windows, and clicking the Dock icon opens a fresh one.
 
 mod boxdraw;
+mod chart;
 mod dock;
 mod font;
 mod images;
@@ -491,6 +492,11 @@ define_class!(
             if let Some(on) = on {
                 set_double_click_action(on);
             }
+        }
+
+        #[unsafe(method(tachyonChart:))]
+        fn toggle_chart(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.toggle_chart(None));
         }
 
         #[unsafe(method(tachyonLedger:))]
@@ -1420,6 +1426,25 @@ impl Drop for Pane {
 }
 
 /// One window: its AppKit objects, renderer, and tabs.
+/// The training chart showing over a pane.
+struct ChartView {
+    pane: u64,
+    /// The command it shows; `None` follows the newest with metrics.
+    cmd: Option<u32>,
+    /// What its picture was last made from.
+    made: Option<ChartKey>,
+}
+
+/// What a chart's picture depends on: it's made again only when one changes.
+#[derive(Clone, Copy, PartialEq)]
+struct ChartKey {
+    /// The command and its curves' revision.
+    shows: Option<(u32, u64)>,
+    size: (usize, usize),
+    cell: (u32, u32),
+    colors: chart::Colors,
+}
+
 struct TermWindow {
     id: u64,
     window: Retained<NSWindow>,
@@ -1503,6 +1528,8 @@ struct TermWindow {
     ghost: Option<String>,
     /// The last suggestion looked up: (typed, folder) and its answer.
     ghost_cache: Option<(String, Option<String>, Option<String>)>,
+    /// The training chart, over one pane.
+    chart: Option<ChartView>,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -1686,6 +1713,42 @@ impl TermWindow {
             })
             .collect();
         let dividers: Vec<[f32; 4]> = tab.dividers.iter().map(|d| self.divider_pixels(d)).collect();
+        // The training chart, over its pane when that's on screen.
+        let mut panel_pixels = None;
+        let mut panel_labels = Vec::new();
+        let mut panel_place = None;
+        if let Some(view) = &mut self.chart {
+            if let Some(k) = visible.iter().position(|&p| tab.panes[p].id == view.pane) {
+                let term = &guards[k];
+                let rect = tab.panes[visible[k]].rect;
+                let chart = view.cmd.or_else(|| term.latest_with_metrics()).and_then(|c| chart::chart_for(term, c));
+                let (col, row, cols, rows) = chart::panel_rect(rect.cols, rect.rows);
+                let (bg, fg) = self.renderer.theme_colors();
+                let colors = chart::Colors { bg, fg };
+                let m = self.renderer.metrics();
+                let key = ChartKey {
+                    shows: chart.as_ref().map(|c| (c.cmd, c.revision)),
+                    size: (cols, rows),
+                    cell: (m.width.to_bits(), m.height.to_bits()),
+                    colors,
+                };
+                if view.made != Some(key) {
+                    let scale = self.window.backingScaleFactor() as f32;
+                    panel_pixels = chart::pixels(chart.as_ref(), cols, rows, (m.width, m.height), scale, colors);
+                    view.made = Some(key);
+                }
+                panel_labels = chart::labels(chart.as_ref(), cols, rows, colors);
+                panel_place = Some((rect.col + col, rect.row + row, cols, rows));
+            }
+        }
+        let panel = panel_place.map(|(col, row, cols, rows)| renderer::Panel {
+            col,
+            row,
+            pixels: panel_pixels.as_ref(),
+            labels: &panel_labels,
+            cols,
+            rows,
+        });
         // The echo of a keystroke is in this frame: the ledger finishes when
         // it reaches the display.
         let presented: Option<Box<dyn Fn(f64)>> = tab.pane().ledger.take_for_frame().map(|p| {
@@ -1696,7 +1759,7 @@ impl TermWindow {
                 }
             }) as Box<dyn Fn(f64)>
         });
-        self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, presented);
+        self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, panel.as_ref(), presented);
         let overlay = match focus_at {
             Some(k) if blink => {
                 let rect = tab.panes[tab.focus].rect;
@@ -2123,6 +2186,41 @@ impl TermWindow {
         }
         let tab = &self.tabs[self.active];
         tab.visible().into_iter().find(|&p| tab.panes[p].rect.contains(fx as usize, fy as usize))
+    }
+
+    /// Open the training chart over the focused pane, for `cmd` or (with
+    /// `None`) the newest command with metrics; or close it.
+    fn toggle_chart(&mut self, cmd: Option<u32>) {
+        self.chart = match self.chart {
+            Some(_) => None,
+            None => Some(ChartView { pane: self.tabs[self.active].pane().id, cmd, made: None }),
+        };
+        self.request_redraw();
+    }
+
+    /// Whether a mouse event is on the training chart.
+    fn chart_at(&self, event: &NSEvent) -> bool {
+        let Some(view) = &self.chart else { return false };
+        let tab = &self.tabs[self.active];
+        let Some(pane) = tab.visible().into_iter().map(|p| &tab.panes[p]).find(|p| p.id == view.pane) else {
+            return false;
+        };
+        let (fx, fy) = self.grid_point(event);
+        let (col, row, cols, rows) = chart::panel_rect(pane.rect.cols, pane.rect.rows);
+        let (x, y) = (fx - (pane.rect.col + col) as f32, fy - (pane.rect.row + row) as f32);
+        x >= 0.0 && y >= 0.0 && x < cols as f32 && y < rows as f32
+    }
+
+    /// The pane and command whose metrics readout is under a mouse event.
+    fn metrics_at(&self, event: &NSEvent) -> Option<(u64, u32)> {
+        let p = self.pane_at(event)?;
+        let pane = &self.tabs[self.active].panes[p];
+        let (fx, fy) = self.grid_point(event);
+        let (col, row) = ((fx - pane.rect.col as f32) as usize, (fy - pane.rect.row as f32) as usize);
+        let term = pane.term.lock();
+        let decor = command_decor(&term, &self.followed);
+        let &(_, cmd, _, _) = decor.metrics.iter().find(|&&(r, _, s, e)| r == row && col >= s && col < e)?;
+        Some((pane.id, cmd))
     }
 
     /// The divider under a mouse event, if any.
@@ -2596,6 +2694,13 @@ impl TermWindow {
         if !self.preedit.is_empty() {
             return true;
         }
+        // Escape closes the training chart, when it's open.
+        const ESCAPE_KEY: u16 = 53;
+        if event.keyCode() == ESCAPE_KEY && self.chart.is_some() {
+            self.chart = None;
+            self.request_redraw();
+            return false;
+        }
         // A suggestion showing: →, End or ⌃F take it, ⌥→ a word of it.
         if let Some(rest) = self.ghost.clone() {
             const RIGHT: u16 = 124;
@@ -2894,6 +2999,20 @@ impl TermWindow {
             }
             if let Some(d) = self.divider_at(event) {
                 self.dragging_divider = Some(d);
+                return;
+            }
+        }
+        // The training chart: a click on it closes it, and a click on a
+        // command's metrics opens it for that command.
+        if button == MouseButton::Left {
+            if self.chart_at(event) {
+                self.chart = None;
+                self.request_redraw();
+                return;
+            }
+            if let Some((pane, cmd)) = self.metrics_at(event) {
+                self.chart = Some(ChartView { pane, cmd: Some(cmd), made: None });
+                self.request_redraw();
                 return;
             }
         }
@@ -3325,6 +3444,7 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
                 (false, r) => r,
             };
             let lens = info.lens.describe();
+            let metric_texts: Vec<String> = lens.iter().cloned().chain(info.lens.compact()).collect();
             // Both if they fit, else the metrics while it runs and the
             // receipt once it's done.
             let mut candidates = Vec::new();
@@ -3363,6 +3483,12 @@ fn command_decor(term: &Term, followed: &[String]) -> Decor {
                     r += 1;
                 }
                 if room(r, &text) {
+                    // Metrics in it: a click there opens the chart.
+                    if let (true, Some(id), Some(start)) =
+                        (metric_texts.iter().any(|m| text.contains(m.as_str())), owner, renderer::note_start(g.row(r).cells(), width(&text)))
+                    {
+                        decor.metrics.push((r, id, start, start + width(&text)));
+                    }
                     decor.notes.push((r, text));
                     break 'place;
                 }
@@ -3625,6 +3751,7 @@ impl App {
             busy_frames: 0,
             ghost: None,
             ghost_cache: None,
+            chart: None,
             find_bar: None,
             find: None,
             cursor_layer,
@@ -3894,6 +4021,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Full Screen Around the Notch", sel!(tachyonNotch:), "f")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&view, "Latency Ledger", sel!(tachyonLedger:), "l")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    item(&view, "Training Chart", sel!(tachyonChart:), "c")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Rewind", sel!(tachyonRewindBack:), "[");
