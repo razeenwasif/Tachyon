@@ -36,6 +36,7 @@ mod renderer;
 mod selection;
 mod strip;
 mod suggest;
+mod sysmon;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -495,6 +496,11 @@ define_class!(
             if let Some(on) = on {
                 set_double_click_action(on);
             }
+        }
+
+        #[unsafe(method(tachyonMonitor:))]
+        fn monitor_toggle(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_monitor);
         }
 
         #[unsafe(method(tachyonFairy:))]
@@ -1278,6 +1284,88 @@ struct FairyCard {
     fresh: bool,
 }
 
+/// The system monitor card: CPU, GPU, memory, network, disk, battery and the
+/// busiest processes, read once a second while it shows.
+struct MonitorCard {
+    host: Retained<NSView>,
+    content: Retained<NSView>,
+    title: Retained<objc2_app_kit::NSTextField>,
+    close: Retained<objc2_app_kit::NSButton>,
+    scroll: Retained<objc2_app_kit::NSScrollView>,
+    text: Retained<objc2_app_kit::NSTextView>,
+    /// Cleared to stop the sampling thread.
+    running: Option<Arc<AtomicBool>>,
+}
+
+impl MonitorCard {
+    const WIDTH: f64 = 440.0;
+    const HEIGHT: f64 = 400.0;
+
+    fn new(mtm: MainThreadMarker, parent: &TachyonView) -> MonitorCard {
+        use objc2_app_kit::{NSButton, NSFont, NSTextField};
+        let content = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        let host: Retained<NSView> = if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+            glass.setCornerRadius(18.0);
+            glass.setTintColor(Some(&NSColor::windowBackgroundColor().colorWithAlphaComponent(0.82)));
+            glass.setContentView(Some(&content));
+            Retained::into_super(glass)
+        } else {
+            let blur = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), NSRect::ZERO);
+            blur.setMaterial(NSVisualEffectMaterial::HUDWindow);
+            blur.setState(NSVisualEffectState::Active);
+            blur.addSubview(&content);
+            Retained::into_super(blur)
+        };
+        let target: &AnyObject = parent.as_ref();
+        let title = NSTextField::labelWithString(&NSString::from_str("System"), mtm);
+        title.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
+        let close = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str("✕"), Some(target), Some(sel!(tachyonMonitor:)), mtm) };
+        close.setBordered(false);
+        close.setToolTip(Some(&NSString::from_str("Close (⌥⌘U)")));
+        let scroll = objc2_app_kit::NSTextView::scrollableTextView(mtm);
+        scroll.setDrawsBackground(false);
+        scroll.setHasVerticalScroller(true);
+        let text: Retained<objc2_app_kit::NSTextView> = scroll
+            .documentView()
+            .and_then(|v| v.downcast::<objc2_app_kit::NSTextView>().ok())
+            .expect("a scrollable text view holds a text view");
+        text.setEditable(false);
+        text.setSelectable(true);
+        text.setDrawsBackground(false);
+        text.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(12.0, unsafe { objc2_app_kit::NSFontWeightRegular })));
+        text.setTextColor(Some(&NSColor::labelColor()));
+        text.setTextContainerInset(NSSize::new(4.0, 6.0));
+        text.setString(&NSString::from_str("Reading…"));
+        for v in [&*title as &NSView, &close, &scroll] {
+            content.addSubview(v);
+        }
+        host.setHidden(true);
+        parent.addSubview(&host);
+        MonitorCard { host, content, title, close, scroll, text, running: None }
+    }
+
+    /// Place it above `bottom` points, at the right of a view of `size`.
+    fn place(&self, size: NSSize, bottom: f64, top: f64) {
+        let w = Self::WIDTH.min(size.width - 24.0).max(240.0);
+        let h = Self::HEIGHT.min(size.height - bottom - top - 16.0).max(160.0);
+        let frame = NSRect::new(NSPoint::new(size.width - w - 12.0, bottom + 6.0), NSSize::new(w, h));
+        self.host.setFrame(frame);
+        self.content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        let pad = 14.0;
+        self.title.setFrame(NSRect::new(NSPoint::new(pad, h - 34.0), NSSize::new(w - 2.0 * pad - 30.0, 20.0)));
+        self.close.setFrame(NSRect::new(NSPoint::new(w - pad - 24.0, h - 36.0), NSSize::new(24.0, 22.0)));
+        self.scroll.setFrame(NSRect::new(NSPoint::new(pad - 4.0, 10.0), NSSize::new(w - 2.0 * pad + 8.0, (h - 52.0).max(40.0))));
+    }
+
+    /// Stop reading.
+    fn stop(&mut self) {
+        if let Some(r) = self.running.take() {
+            r.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// The card's quick questions: their button titles, and what's asked.
 const FAIRY_QUICK: [(&str, &str); 4] = [
     ("Explain this", "Explain what's on my screen."),
@@ -1870,6 +1958,10 @@ struct TermWindow {
     fairy_socket: Option<std::path::PathBuf>,
     fairy_button: Option<Retained<objc2_app_kit::NSButton>>,
     fairy_card: Option<FairyCard>,
+    /// The system monitor: on in the config, its button and card.
+    monitor: bool,
+    monitor_button: Option<Retained<objc2_app_kit::NSButton>>,
+    monitor_card: Option<MonitorCard>,
     /// The quick terminal: borderless, dropping from the screen's top, and
     /// whether it's showing; the app that was in front, to go back to.
     quick: bool,
@@ -1889,6 +1981,9 @@ impl Drop for TermWindow {
         // A display link retains its target; invalidate it or the view leaks.
         // Dropping the tabs hangs up their shells.
         self.link.invalidate();
+        if let Some(card) = &mut self.monitor_card {
+            card.stop();
+        }
         if self.secure {
             unsafe { DisableSecureEventInput() };
         }
@@ -2111,7 +2206,8 @@ impl TermWindow {
         } else {
             Vec::new()
         };
-        let hints_right = self.fairy_button.as_ref().map_or(self.renderer.padding_right_edge(), |b| (b.frame().origin.x * self.scale()) as f32 - 12.0);
+        let leftmost = [&self.monitor_button, &self.fairy_button].iter().filter_map(|b| b.as_ref()).map(|b| b.frame().origin.x).fold(f64::INFINITY, f64::min);
+        let hints_right = if leftmost.is_finite() { (leftmost * self.scale()) as f32 - 12.0 } else { self.renderer.padding_right_edge() };
         self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, panel.as_ref(), &hints, hints_right, presented);
         let overlay = match focus_at {
             Some(k) if blink => {
@@ -2755,6 +2851,87 @@ impl TermWindow {
         }
     }
 
+    /// Put the monitor's button in the bottom band, left of Fairy's (or at
+    /// the right end without her), and its card above.
+    fn place_monitor(&mut self) {
+        if !self.monitor {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        if self.monitor_button.is_none() {
+            let Some(icon) = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str("gauge.with.dots.needle.67percent"),
+                Some(&NSString::from_str("System monitor")),
+            ) else {
+                return;
+            };
+            let target: &AnyObject = self.view.as_ref();
+            let button = unsafe { objc2_app_kit::NSButton::buttonWithImage_target_action(&icon, Some(target), Some(sel!(tachyonMonitor:)), mtm) };
+            button.setBordered(false);
+            button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+            button.setToolTip(Some(&NSString::from_str("System monitor (⌥⌘U)")));
+            self.view.addSubview(&button);
+            self.monitor_button = Some(button);
+        }
+        let scale = self.scale();
+        let size = self.view.bounds().size;
+        let (y0, h) = self.renderer.hints_rect();
+        let band_bottom = (size.height * scale - (y0 + h) as f64).max(0.0) / scale;
+        let band_h = h as f64 / scale;
+        let side = 20.0;
+        let pad_x = self.renderer.padding().0 as f64 / scale;
+        // Left of Fairy's button, when she has one.
+        let right = self.fairy_button.as_ref().map_or(size.width - pad_x, |b| b.frame().origin.x - 10.0);
+        if let Some(b) = &self.monitor_button {
+            b.setFrame(NSRect::new(NSPoint::new(right - side, band_bottom + (band_h - side) / 2.0), NSSize::new(side, side)));
+        }
+        if let Some(card) = &self.monitor_card {
+            card.place(size, band_bottom + band_h, self.title_bar_height());
+        }
+    }
+
+    /// Open or close the system monitor card; it reads the system once a
+    /// second, on a thread of its own, only while it shows.
+    fn toggle_monitor(&mut self) {
+        if !self.monitor {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        if let Some(card) = self.monitor_card.as_mut().filter(|c| !c.host.isHidden()) {
+            card.host.setHidden(true);
+            card.stop();
+            return;
+        }
+        if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_fairy();
+        }
+        if self.monitor_card.is_none() {
+            self.monitor_card = Some(MonitorCard::new(mtm, &self.view));
+        }
+        self.place_monitor();
+        let id = self.id;
+        let Some(card) = &mut self.monitor_card else { return };
+        card.host.setHidden(false);
+        let running = Arc::new(AtomicBool::new(true));
+        card.running = Some(Arc::clone(&running));
+        let _ = std::thread::Builder::new().name("tachyon-monitor".into()).spawn(move || {
+            let mut sampler = sysmon::Sampler::default();
+            let mut snapshot = sampler.sample();
+            while running.load(Ordering::Acquire) {
+                let text = sysmon::render(&snapshot);
+                DispatchQueue::main().exec_async(move || {
+                    with_window(id, |w| {
+                        if let Some(c) = &w.monitor_card {
+                            c.text.setString(&NSString::from_str(&text));
+                        }
+                    })
+                });
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                snapshot = sampler.sample();
+            }
+        });
+    }
+
     /// Open or close Fairy's card.
     fn toggle_fairy(&mut self) {
         if self.fairy_socket.is_none() {
@@ -2768,6 +2945,9 @@ impl TermWindow {
             }
             self.window.makeFirstResponder(Some(&self.view));
             return;
+        }
+        if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_monitor();
         }
         if self.fairy_card.is_none() {
             self.fairy_card = Some(FairyCard::new(mtm, &self.view));
@@ -3152,8 +3332,9 @@ impl TermWindow {
             self.place_capsule(strip);
         }
         // The band along the bottom: hints, and Fairy's button at its right.
-        self.renderer.set_hints_band(self.hints || self.fairy_socket.is_some());
+        self.renderer.set_hints_band(self.hints || self.fairy_socket.is_some() || self.monitor);
         self.place_fairy();
+        self.place_monitor();
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
             crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
@@ -4602,6 +4783,9 @@ impl App {
             fairy_socket: fairy_socket(cfg),
             fairy_button: None,
             fairy_card: None,
+            monitor: cfg.macos.monitor,
+            monitor_button: None,
+            monitor_card: None,
             quick: false,
             quick_shown: false,
             quick_inset: 0.0,
@@ -5062,6 +5246,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Fold Output", sel!(tachyonFoldOutput:), "k")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&view, "Ask Fairy", sel!(tachyonFairy:), "i")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    item(&view, "System Monitor", sel!(tachyonMonitor:), "u")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Rewind", sel!(tachyonRewindBack:), "[");

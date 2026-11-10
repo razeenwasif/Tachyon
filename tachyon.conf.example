@@ -223,6 +223,10 @@ theme.bold_is_bright = false
 # command of your own with {file}, {line} and {col}, run in a new tab.
 # editor = auto
 
+# macOS: the system monitor's gauge at the bottom right (and Option-Cmd-U):
+# CPU, GPU, memory, network, disk, battery and your busiest processes.
+# monitor.enabled = true
+
 # macOS: Fairy, the assistant on this Mac: a button at the bottom right (and
 # Option-Cmd-I) opens a card where she answers about what's on the screen. She
 # listens on a private socket in her data folder; fairy.socket points elsewhere.
