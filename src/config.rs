@@ -122,6 +122,8 @@ pub struct WindowConfig {
     /// macOS: full screen means around the notch: the green button, ⌃⌘F and
     /// View > Enter Full Screen use it, and Tachyon opens that way.
     pub notch_full_screen: bool,
+    /// macOS: a band along the bottom with shortcut hints.
+    pub hints: bool,
     /// Whether the user set `window.opacity` explicitly. Enabling a backdrop
     /// picks a sensible translucency by default, but must not override a value
     /// the user asked for.
@@ -145,6 +147,7 @@ impl Default for WindowConfig {
             glass_tint: if cfg!(target_os = "macos") { 0.75 } else { 0.0 },
             title_bar: false,
             notch_full_screen: false,
+            hints: true,
             opacity_explicit: false,
         }
     }
@@ -384,11 +387,15 @@ pub struct MacConfig {
     /// looking elsewhere, posts a notification with its receipt. 0 turns
     /// notifications off.
     pub notify_after_secs: u64,
+    /// Fairy, the assistant: her button at the bottom right, and where her
+    /// socket is (empty for where she keeps it).
+    pub fairy: bool,
+    pub fairy_socket: String,
 }
 
 impl Default for MacConfig {
     fn default() -> Self {
-        MacConfig { option_as_meta: OptionAsMeta::default(), notify_after_secs: 10 }
+        MacConfig { option_as_meta: OptionAsMeta::default(), notify_after_secs: 10, fairy: true, fairy_socket: String::new() }
     }
 }
 
@@ -623,6 +630,9 @@ impl Config {
             "shell.integration" => self.shell.integration = parse_bool(value)?,
             "shell.persist" => self.shell.persist = parse_bool(value)?,
             "shell.suggestions" => self.shell.suggestions = parse_bool(value)?,
+            "window.hints" => self.window.hints = parse_bool(value)?,
+            "fairy.enabled" => self.macos.fairy = parse_bool(value)?,
+            "fairy.socket" => self.macos.fairy_socket = value.to_string(),
             "shell.args" => {
                 self.shell.args = value
                     .split_whitespace()

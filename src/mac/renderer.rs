@@ -262,6 +262,9 @@ pub struct Renderer {
     strip_band: Option<f32>,
     /// Pixels a title bar takes at the top.
     top_inset: f32,
+    /// A band along the bottom, above any tab strip, for shortcut hints and
+    /// Fairy's button.
+    hints_band: bool,
 
     bg: Vec<RectInstance>,
     glyphs: Vec<GlyphInstance>,
@@ -318,6 +321,7 @@ impl Renderer {
             size: (1.0, 1.0),
             strip: false,
             top_inset: 0.0,
+            hints_band: false,
             strip_band: None,
             bg: Vec::new(),
             glyphs: Vec::new(),
@@ -378,7 +382,7 @@ impl Renderer {
         let m = self.fonts.metrics;
         let (pad_x, pad_y) = self.padding();
         let w = (width_px - pad_x * 2.0).max(m.width);
-        let h = (height_px - pad_y * 2.0 - self.top_inset - self.strip_height()).max(m.height);
+        let h = (height_px - pad_y * 2.0 - self.top_inset - self.strip_height() - self.hints_height()).max(m.height);
         (
             (w / m.width).floor().max(1.0) as usize,
             (h / m.height).floor().max(1.0) as usize,
@@ -398,6 +402,61 @@ impl Renderer {
 
     /// Height of the tab strip in pixels: a row of text with room around it,
     /// enough to aim a click at.
+    /// Keep a band along the bottom for hints and Fairy's button, or not.
+    pub fn set_hints_band(&mut self, on: bool) {
+        self.hints_band = on;
+    }
+
+    /// The hints band's height in pixels: a row and a bit.
+    pub fn hints_height(&self) -> f32 {
+        if self.hints_band {
+            (self.fonts.metrics.height * 1.3).round()
+        } else {
+            0.0
+        }
+    }
+
+    /// Where the hints may run to on the right, in pixels.
+    pub fn padding_right_edge(&self) -> f32 {
+        self.size.0 - self.padding().0
+    }
+
+    /// The hints band's top and height, in pixels from the top.
+    pub fn hints_rect(&self) -> (f32, f32) {
+        let h = self.hints_height();
+        (self.size.1 - self.strip_height() - h, h)
+    }
+
+    /// Shortcut hints along the bottom band: each key a little brighter than
+    /// what it does, as many as fit left of `right` pixels.
+    fn build_hints(&mut self, hints: &[(String, String)], right: f32) {
+        if !self.hints_band || hints.is_empty() {
+            return;
+        }
+        let m = self.fonts.metrics;
+        let (pad_x, _) = self.padding();
+        let theme = self.cfg.theme.clone();
+        let mix = |t: f32| -> [u8; 3] {
+            std::array::from_fn(|i| (theme.background[i] as f32 + (theme.foreground[i] as f32 - theme.background[i] as f32) * t).round() as u8)
+        };
+        let (key, label, line) = (mix(0.72), mix(0.46), mix(0.12));
+        let (y0, h) = self.hints_rect();
+        let hair = self.scale.round().max(1.0);
+        self.bg.push(RectInstance { rect: [pad_x, y0, (self.size.0 - 2.0 * pad_x).max(0.0), hair], color: srgb(line) });
+        let text_y = y0 + ((h - m.height) / 2.0).round();
+        let width = |s: &str| s.chars().map(|c| c.width().unwrap_or(1)).sum::<usize>() as f32 * m.width;
+        let mut x = pad_x;
+        for (k, what) in hints {
+            let w = width(k) + m.width + width(what);
+            if x + w > right {
+                break;
+            }
+            self.push_text(k, x, text_y, key);
+            self.push_text(what, x + width(k) + m.width, text_y, label);
+            x += w + 3.0 * m.width;
+        }
+    }
+
     fn strip_height(&self) -> f32 {
         if !self.strip {
             0.0
@@ -531,6 +590,8 @@ impl Renderer {
         strip: Option<&Strip>,
         dividers: &[[f32; 4]],
         panel: Option<&Panel>,
+        hints: &[(String, String)],
+        hints_right: f32,
         presented: Option<Box<dyn Fn(f64)>>,
     ) {
         if self.atlas.overflowed {
@@ -579,6 +640,7 @@ impl Renderer {
             let cols = self.grid_size_for(self.size.0, self.size.1).0;
             self.build_strip(strip, cols);
         }
+        self.build_hints(hints, hints_right);
         self.build_panel(panel);
 
         let Some(drawable) = self.layer.nextDrawable() else {
