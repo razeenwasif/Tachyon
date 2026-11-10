@@ -145,6 +145,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
+| ⌥⌘O / ⌥⌘K | Copy a command's output (the selected one's, or the last) / fold or unfold it |
 | ⌥⌘T | Reopen the tab, pane or window's tab closed last (kept ten minutes, shells running) |
 | ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
 | ⌥⌘A | Keep the Mac awake while this pane's command runs (or its next one) |
@@ -301,6 +302,14 @@ with OSC 133, which gives:
   as last run`) on the prompt line. Lines are paired by shape, numbers ignored,
   so a changed loss reads as changed; hover a mark for the old line;
 - ⌘↑ / ⌘↓ to jump between commands;
+- **command blocks**: click a command's bar in the left margin to select its
+  output (⌘C then copies it), or ⌥⌘O (Edit > Copy Output) to copy the selected
+  command's output, or the last command's, without selecting. ⌥⌘K (View > Fold
+  Output), or ⌥-click on the bar, folds a long output to one line,
+  `▸ 2,914 lines folded · click to unfold`, keeping its last three lines in
+  view; a click on that line or ⌥⌘K again unfolds it. Folding takes the lines
+  out of the scrollback and keeps them packed aside, so scrolling, find and
+  selection skip them, and copying the output still includes them;
 - a **notification** with the receipt when a command of 10 seconds or more
   finishes while you're in another app or window (`notify.after` sets the time,
   0 turns it off). Clicking it brings the command's tab to the front. macOS asks

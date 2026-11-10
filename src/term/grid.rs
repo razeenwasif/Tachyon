@@ -49,6 +49,9 @@ impl RowMark {
     /// last run had nothing like it (NEW).
     pub const CHANGED: u8 = 8;
     pub const NEW: u8 = 16;
+    /// A command block's folded output: this line stands for the lines
+    /// taken out.
+    pub const FOLDED: u8 = 32;
 
     #[inline]
     pub fn is_some(&self) -> bool {
@@ -127,6 +130,16 @@ impl Row {
     fn resize(&mut self, cols: usize, pen: &Pen) {
         self.cells.resize(cols, Cell::blank(pen));
         self.dirty = true;
+    }
+
+    /// A line of `cols` cells reading `text` in `style`, carrying `mark`.
+    pub fn from_text(cols: usize, text: &str, style: Cell, mark: RowMark) -> Row {
+        let mut row = Row::new(cols);
+        for (cell, ch) in row.cells.iter_mut().zip(text.chars()) {
+            *cell = Cell { ch: ch as u32, ..style };
+        }
+        row.mark = mark;
+        row
     }
 
     /// Index of the last non-blank cell, plus one. Used to trim trailing
@@ -1092,6 +1105,26 @@ impl Grid {
 
     /// Install a fresh set of lines: everything above the last `rows` becomes
     /// packed history, the rest the screen.
+    /// Replace lines `start..end` (absolute) with `with`, keeping the
+    /// screen's bottom where it is (lines above it move into or out of the
+    /// scrollback). Returns the absolute line the old `cursor_line` is now
+    /// at; the cursor's screen row is unchanged unless the grid got shorter
+    /// than the screen.
+    pub fn splice(&mut self, start: usize, end: usize, with: Vec<Row>, cursor_line: usize) -> usize {
+        let total = self.total_lines();
+        let (start, end) = (start.min(total), end.min(total).max(start.min(total)));
+        let removed = end - start;
+        let added = with.len();
+        let mut lines: Vec<Row> = (0..total).map(|i| self.line(i).into_owned()).collect();
+        lines.splice(start..end, with);
+        let (cols, rows) = (self.cols, self.rows);
+        let cap = rows + self.max_scrollback;
+        let dropped = lines.len().saturating_sub(cap);
+        self.rebuild(lines, cols, rows);
+        let moved = if cursor_line >= end { cursor_line + added - removed } else { cursor_line };
+        moved.saturating_sub(dropped)
+    }
+
     fn rebuild(&mut self, mut lines: Vec<Row>, cols: usize, rows: usize) {
         let cap = rows + self.max_scrollback;
         if lines.len() > cap {

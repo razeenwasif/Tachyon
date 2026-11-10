@@ -494,6 +494,20 @@ define_class!(
             }
         }
 
+        #[unsafe(method(tachyonCopyOutput:))]
+        fn copy_output(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::copy_output);
+        }
+
+        #[unsafe(method(tachyonFoldOutput:))]
+        fn fold_output(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| {
+                if let Some(cmd) = w.block_target() {
+                    w.toggle_fold(cmd);
+                }
+            });
+        }
+
         #[unsafe(method(tachyonChart:))]
         fn toggle_chart(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), |w| w.toggle_chart(None));
@@ -2239,6 +2253,104 @@ impl TermWindow {
         self.request_redraw();
     }
 
+    /// The command a block action is for: the one the selection starts in,
+    /// or the last to run.
+    fn block_target(&self) -> Option<u32> {
+        let term = self.term.lock();
+        match self.selection.and_then(|s| s.range(&term)) {
+            Some(r) => term.command_at_line(r.start.0),
+            None => term.last_started_command(),
+        }
+    }
+
+    /// Copy a command's output (the selected one's, or the last's), folded
+    /// lines and all.
+    fn copy_output(&mut self) {
+        let Some(cmd) = self.block_target() else { return };
+        let Some(text) = self.term.lock().output_text(cmd) else { return };
+        if text.is_empty() {
+            return;
+        }
+        let board = NSPasteboard::generalPasteboard();
+        board.clearContents();
+        board.setString_forType(&NSString::from_str(&text), unsafe { NSPasteboardTypeString });
+    }
+
+    /// Fold or unfold command `cmd`'s output in the focused pane.
+    fn toggle_fold(&mut self, cmd: u32) {
+        let changed = self.term.lock().toggle_fold(cmd);
+        if changed {
+            // Lines moved: what was selected, and found, is elsewhere now.
+            self.selection = None;
+            if self.find.is_some() {
+                self.find_changed();
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// Select command `cmd`'s output in the focused pane.
+    fn select_output(&mut self, cmd: u32) {
+        let range = self.term.lock().output_range(cmd);
+        let Some((start, end)) = range.filter(|(s, e)| e > s) else { return };
+        let cols = self.term.lock().cols();
+        let mut sel = Selection::new(selection::Pos { line: start, cell: 0, edge: 0 }, Unit::Char);
+        sel.extend(selection::Pos { line: end - 1, cell: cols - 1, edge: cols });
+        self.selection = Some(sel);
+        self.request_redraw();
+    }
+
+    /// A click on a command block: on its bar in the left margin (of a pane
+    /// against the window's edge), select its output, or with ⌥ fold it; on
+    /// a folded output's line, unfold it. Returns whether it was one.
+    fn block_click(&mut self, event: &NSEvent) -> bool {
+        let (fx, fy) = self.grid_point(event);
+        let tab = &self.tabs[self.active];
+        let in_margin = fx < 0.0;
+        let pane = if in_margin {
+            tab.visible().into_iter().find(|&p| {
+                let r = tab.panes[p].rect;
+                r.col == 0 && fy >= r.row as f32 && fy < (r.row + r.rows) as f32
+            })
+        } else {
+            self.pane_at(event)
+        };
+        let Some(p) = pane else { return false };
+        let rect = tab.panes[p].rect;
+        let row = (fy - rect.row as f32).max(0.0) as usize;
+        let (cmd, folded) = {
+            let term = tab.panes[p].term.lock();
+            let g = term.grid();
+            let line = g.history_len().saturating_sub(g.display_offset()) + row;
+            if line >= g.total_lines() || term.mode.contains(TermMode::ALT_SCREEN) {
+                return false;
+            }
+            (term.command_at_line(line), g.mark(line).has(RowMark::FOLDED))
+        };
+        let Some(cmd) = cmd else { return false };
+        let option = event.modifierFlags().contains(NSEventModifierFlags::Option);
+        let plain = !event.modifierFlags().intersects(NSEventModifierFlags::Command | NSEventModifierFlags::Shift | NSEventModifierFlags::Control);
+        if folded && plain && !option {
+            self.focus_pane(p);
+            self.toggle_fold(cmd);
+            return true;
+        }
+        if !in_margin {
+            return false;
+        }
+        // Only a command that ran has a block (a prompt alone has none).
+        if self.tabs[self.active].panes[p].term.lock().output_range(cmd).is_none() {
+            return false;
+        }
+        self.focus_pane(p);
+        if option {
+            self.toggle_fold(cmd);
+        } else {
+            self.select_output(cmd);
+        }
+        true
+    }
+
     /// Whether a mouse event is on the training chart.
     fn chart_at(&self, event: &NSEvent) -> bool {
         let Some(view) = &self.chart else { return false };
@@ -3056,6 +3168,12 @@ impl TermWindow {
             if let Some((pane, cmd)) = self.metrics_at(event) {
                 self.chart = Some(ChartView { pane, cmd: Some(cmd), made: None });
                 self.request_redraw();
+                return;
+            }
+            // Command blocks: a click on a command's bar in the margin
+            // selects its output (⌥-click folds it), and one on a folded
+            // output's line unfolds it.
+            if self.block_click(event) {
                 return;
             }
         }
@@ -4168,6 +4286,9 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&edit, "Copy", sel!(copy:), "c");
     item(&edit, "Paste", sel!(paste:), "v");
     item(&edit, "Select All", sel!(selectAll:), "a");
+    // The selected command's output, or the last command's.
+    item(&edit, "Copy Output", sel!(tachyonCopyOutput:), "o")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     edit.addItem(&NSMenuItem::separatorItem(mtm));
     item(&edit, "Find…", sel!(tachyonFind:), "f");
     item(&edit, "Find Next", sel!(tachyonFindNext:), "g");
@@ -4190,6 +4311,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Latency Ledger", sel!(tachyonLedger:), "l")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&view, "Training Chart", sel!(tachyonChart:), "c")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    item(&view, "Fold Output", sel!(tachyonFoldOutput:), "k")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Rewind", sel!(tachyonRewindBack:), "[");

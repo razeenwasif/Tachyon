@@ -23,6 +23,7 @@ use vte::{Params, Perform};
 pub use cell::{Cell, CellFlags, Pen, CLUSTER_TAG};
 pub use color::{Color, Palette};
 pub use grid::{Grid, RowMark};
+use grid::{PackedRow, Row};
 pub use parser::Processor;
 
 bitflags! {
@@ -238,6 +239,8 @@ pub struct Term {
     last_outputs: std::collections::VecDeque<(String, Vec<String>)>,
     /// The metric curves of recent runs that had any, by command-line shape.
     last_curves: std::collections::VecDeque<(String, PreviousRun)>,
+    /// Folded command output: the lines taken out, by command.
+    folds: FxHashMap<u32, Vec<PackedRow>>,
     /// Incremented whenever anything a tab's name is made from changes (the
     /// title, the working directory, a command starting or ending), so the
     /// app can cheaply notice.
@@ -301,6 +304,24 @@ pub struct VisibleImage {
     pub rows: usize,
 }
 
+/// Lines of a folded output kept in view at its end.
+const FOLD_KEEP: usize = 3;
+/// The fewest lines worth folding.
+const FOLD_LEAST: usize = 4;
+
+/// 12345 as "12,345".
+fn group_thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// The most a pending image (chunks still coming) may grow to.
 const MAX_IMAGE_PAYLOAD: usize = 64 << 20;
 /// Image bytes kept per terminal, placed and waiting: the oldest go first.
@@ -334,6 +355,7 @@ impl Term {
             jobs: Vec::new(),
             last_outputs: std::collections::VecDeque::new(),
             last_curves: std::collections::VecDeque::new(),
+            folds: FxHashMap::default(),
             title_revision: 0,
             bell_revision: 0,
             ground_signal: false,
@@ -368,6 +390,165 @@ impl Term {
     /// The command whose prompt is showing or which is running.
     pub fn current_command(&self) -> Option<u32> {
         self.current_cmd
+    }
+
+    // ---------------------------------------------------------------------
+    // Command blocks
+    // ---------------------------------------------------------------------
+
+    /// The command whose block absolute line `line` is in: the nearest mark
+    /// at or above it.
+    pub fn command_at_line(&self, line: usize) -> Option<u32> {
+        let lo = line.saturating_sub(rerun::MAX_LINES * 8);
+        (lo..=line.min(self.grid.total_lines().saturating_sub(1))).rev().map(|l| self.grid.mark(l)).find(|m| m.is_some()).map(|m| m.cmd)
+    }
+
+    /// The newest command that has started (running or finished).
+    pub fn last_started_command(&self) -> Option<u32> {
+        let floor = self.next_cmd.wrapping_sub(MAX_COMMANDS);
+        self.commands
+            .iter()
+            .filter(|(_, c)| c.state != CommandState::Prompt)
+            .map(|(&id, _)| id)
+            .max_by_key(|&k| k.wrapping_sub(floor))
+    }
+
+    /// Command `id`'s output: its absolute lines, `start..end`. Empty when it
+    /// printed nothing; `None` when its output has left the scrollback, or on
+    /// the alternate screen.
+    pub fn output_range(&self, id: u32) -> Option<(usize, usize)> {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let total = self.grid.total_lines();
+        let start = (0..total).rev().find(|&l| {
+            let m = self.grid.mark(l);
+            m.cmd == id && m.has(RowMark::OUTPUT)
+        })?;
+        // Up to the next command's prompt, or for the one running, through
+        // the cursor's line.
+        let end = (start + 1..total)
+            .find(|&l| {
+                let m = self.grid.mark(l);
+                m.is_some() && m.cmd != id
+            })
+            .unwrap_or_else(|| (self.grid.history_len() + self.cursor.y + 1).min(total));
+        Some((start, end.max(start)))
+    }
+
+    /// Whether command `id`'s output is folded.
+    pub fn is_folded(&self, id: u32) -> bool {
+        self.folds.contains_key(&id)
+    }
+
+    /// Command `id`'s output as text, folded lines included.
+    pub fn output_text(&self, id: u32) -> Option<String> {
+        let (start, end) = self.output_range(id)?;
+        let mut out = String::new();
+        let line_text = |row: &Row, out: &mut String| {
+            let cells = row.cells();
+            for c in &cells[..row.trimmed_len()] {
+                if c.flags.contains(CellFlags::WIDE_SPACER) {
+                    continue;
+                }
+                if c.ch & CLUSTER_TAG != 0 {
+                    out.extend(self.cluster(c.ch).unwrap_or(&[]));
+                } else {
+                    out.push(char::from_u32(c.ch).filter(|&ch| ch != '\0').unwrap_or(' '));
+                }
+            }
+            if !row.wrapped {
+                out.push('\n');
+            }
+        };
+        for l in start..end {
+            let row = self.grid.line(l);
+            match self.folds.get(&id).filter(|_| row.mark.has(RowMark::FOLDED)) {
+                Some(folded) => {
+                    for p in folded {
+                        line_text(&p.unpack(self.cols()), &mut out);
+                    }
+                }
+                None => line_text(&row, &mut out),
+            }
+        }
+        // A command's output ends at the next prompt: no trailing blank lines.
+        let trimmed = out.trim_end_matches('\n').len();
+        out.truncate(trimmed);
+        Some(out)
+    }
+
+    /// Fold command `id`'s output to one line, keeping its last few lines in
+    /// view; or unfold it. Returns whether anything changed.
+    pub fn toggle_fold(&mut self, id: u32) -> bool {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        if let Some(folded) = self.folds.remove(&id) {
+            let Some((start, end)) = self.output_range(id) else { return false };
+            let Some(at) = (start..end).find(|&l| self.grid.mark(l).has(RowMark::FOLDED)) else { return false };
+            let cols = self.cols();
+            let rows: Vec<Row> = folded.iter().map(|p| p.unpack(cols)).collect();
+            self.splice_lines(at, at + 1, rows);
+            return true;
+        }
+        let Some((start, mut end)) = self.output_range(id) else { return false };
+        // Trailing blank lines aren't output worth keeping in view.
+        while end > start && self.grid.line(end - 1).trimmed_len() == 0 && !self.grid.line(end - 1).mark.is_some() {
+            end -= 1;
+        }
+        // The last lines stay: they're usually the result, or the error.
+        let mut fold_end = end.saturating_sub(FOLD_KEEP).max(start);
+        // At a line's start, not inside a wrapped one.
+        while fold_end > start && self.grid.line(fold_end - 1).wrapped {
+            fold_end -= 1;
+        }
+        let n = fold_end - start;
+        if n < FOLD_LEAST {
+            return false;
+        }
+        let first = self.grid.line(start).into_owned();
+        let taken: Vec<PackedRow> = (start..fold_end).map(|l| PackedRow::pack(&self.grid.line(l))).collect();
+        let style = Cell { flags: CellFlags::DIM, ..Cell::EMPTY };
+        let mut mark = first.mark;
+        mark.cmd = id;
+        mark.kinds |= RowMark::OUTPUT | RowMark::FOLDED;
+        let text = format!("▸ {} lines folded · click to unfold", group_thousands(n));
+        let summary = Row::from_text(self.cols(), &text, style, mark);
+        self.folds.insert(id, taken);
+        self.splice_lines(start, fold_end, vec![summary]);
+        true
+    }
+
+    /// Splice lines in or out of the grid, moving the cursor and images
+    /// with the lines around them.
+    fn splice_lines(&mut self, start: usize, end: usize, with: Vec<Row>) {
+        let (old_hist, base) = (self.grid.history_len() as i64, self.grid.scrolled() as i64);
+        let cursor_line = self.grid.history_len() + self.cursor.y;
+        let (removed, added) = ((end - start) as i64, with.len() as i64);
+        let moved = self.grid.splice(start, end, with, cursor_line);
+        let new_hist = self.grid.history_len();
+        self.cursor.y = moved.saturating_sub(new_hist).min(self.rows() - 1);
+        self.cursor.wrap_pending = false;
+        // Images on the primary screen: by absolute line, then back.
+        let new_hist = new_hist as i64;
+        self.images.retain_mut(|p| {
+            if p.alt {
+                return true;
+            }
+            let abs = p.line - (base - old_hist);
+            let abs = if abs < start as i64 {
+                abs
+            } else if abs >= end as i64 {
+                abs + added - removed
+            } else {
+                return false;
+            };
+            p.line = (base - new_hist) + abs;
+            true
+        });
+        self.grid.damage_all();
+        self.dirty = true;
     }
 
     /// The newest command whose output had metrics: the one running, or the
@@ -502,6 +683,7 @@ impl Term {
             jobs: Vec::new(),
             last_outputs: std::collections::VecDeque::new(),
             last_curves: std::collections::VecDeque::new(),
+            folds: FxHashMap::default(),
             title_revision: 0,
             bell_revision: 0,
             ground_signal: false,
@@ -3334,5 +3516,82 @@ mod image_tests {
         assert_eq!(prev.curves[0].at(1.0), Some(1.5));
         let other = run(&mut t, &mut p, "python eval.py", &[0.3]);
         assert!(t.command(other).unwrap().previous.is_none());
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    fn screen(t: &Term) -> Vec<String> {
+        (0..t.grid().total_lines())
+            .map(|l| t.grid().line(l).cells().iter().map(|c| char::from_u32(c.ch).filter(|c| *c >= ' ').unwrap_or(' ')).collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    /// Two commands: `seq 1 30` and then `ls` (13 lines), with a prompt
+    /// after.
+    fn session() -> (Term, Processor, u32, u32) {
+        let mut t = Term::new(40, 10, 1000);
+        let mut p = Processor::new();
+        p.advance(&mut t, b"\x1b]133;A\x07$ \x1b]133;B\x07seq 1 30\r\n\x1b]133;C;cmdline=seq 1 30\x07");
+        let seq = t.current_command().unwrap();
+        for i in 1..=30 {
+            p.advance(&mut t, format!("{i}\r\n").as_bytes());
+        }
+        p.advance(&mut t, b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C;cmdline=ls\x07a b\r\n");
+        // More of it than a screenful, so folding leaves the screen full.
+        for i in 1..=12 {
+            p.advance(&mut t, format!("f{i}\r\n").as_bytes());
+        }
+        p.advance(&mut t, b"\x1b]133;D;0\x07");
+        let ls = t.current_command().unwrap();
+        p.advance(&mut t, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        (t, p, seq, ls)
+    }
+
+    #[test]
+    fn a_commands_output_is_found_and_copied() {
+        let (t, _, seq, ls) = session();
+        let (start, end) = t.output_range(seq).unwrap();
+        assert_eq!(end - start, 30);
+        assert_eq!(t.output_text(seq).unwrap(), (1..=30).map(|i| i.to_string()).collect::<Vec<_>>().join("\n"));
+        assert!(t.output_text(ls).unwrap().starts_with("a b\nf1\n"));
+        assert_eq!(t.last_started_command(), Some(ls));
+        assert_eq!(t.command_at_line(start + 10), Some(seq));
+    }
+
+    #[test]
+    fn folding_takes_the_lines_out_and_unfolding_puts_them_back() {
+        let (mut t, mut p, seq, _) = session();
+        let before = screen(&t);
+        let cursor = (t.cursor.x, t.cursor.y);
+        assert!(t.toggle_fold(seq));
+        assert!(t.is_folded(seq));
+        let folded = screen(&t);
+        assert_eq!(folded.len(), before.len() - 26, "27 lines became one");
+        assert!(folded.iter().any(|l| l.contains("27 lines folded")), "{folded:?}");
+        assert!(folded.iter().any(|l| l == "30") && !folded.iter().any(|l| l == "5"), "the last lines stay");
+        assert_eq!((t.cursor.x, t.cursor.y), cursor, "the prompt stays where it is");
+        // Copying still has every line.
+        assert_eq!(t.output_text(seq).unwrap().lines().count(), 30);
+        // Typing at the prompt goes where it did.
+        p.advance(&mut t, b"echo");
+        assert!(t.toggle_fold(seq));
+        let mut expected = before.clone();
+        let last = expected.len() - 10 + cursor.1;
+        expected[last] = "$ echo".into();
+        assert_eq!(screen(&t), expected);
+        assert!(!t.is_folded(seq));
+    }
+
+    #[test]
+    fn short_outputs_and_the_alternate_screen_dont_fold() {
+        let (mut t, mut p, _, ls) = session();
+        p.advance(&mut t, b"\x1b]133;C;cmdline=true\x07ok\r\n\x1b]133;D;0\x07");
+        let short = t.current_command().unwrap();
+        assert!(!t.toggle_fold(short), "one line");
+        p.advance(&mut t, b"\x1b[?1049h");
+        assert!(t.output_range(ls).is_none());
     }
 }
