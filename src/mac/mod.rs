@@ -18,6 +18,7 @@
 mod boxdraw;
 mod chart;
 mod dock;
+mod fairy;
 mod font;
 mod images;
 pub mod host;
@@ -492,6 +493,29 @@ define_class!(
             if let Some(on) = on {
                 set_double_click_action(on);
             }
+        }
+
+        #[unsafe(method(tachyonFairy:))]
+        fn fairy_toggle(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_fairy);
+        }
+
+        #[unsafe(method(tachyonFairyAsk:))]
+        fn fairy_ask(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::fairy_ask_or_stop);
+        }
+
+        #[unsafe(method(tachyonFairyQuick:))]
+        fn fairy_quick(&self, sender: Option<&AnyObject>) {
+            let tag = sender.and_then(|s| s.downcast_ref::<objc2_app_kit::NSButton>()).map(|b| b.tag()).unwrap_or(0);
+            if let Some((_, question)) = FAIRY_QUICK.get(tag as usize) {
+                with_window(self.id(), |w| w.fairy_ask(question.to_string()));
+            }
+        }
+
+        #[unsafe(method(tachyonFairyNew:))]
+        fn fairy_new(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::fairy_new);
         }
 
         #[unsafe(method(tachyonCopyOutput:))]
@@ -1197,6 +1221,182 @@ impl FindBar {
     }
 }
 
+/// Fairy's card: it opens above her button at the bottom right, with quick
+/// questions, her answer as she writes it, and a box to ask your own.
+struct FairyCard {
+    host: Retained<NSView>,
+    content: Retained<NSView>,
+    title: Retained<objc2_app_kit::NSTextField>,
+    hint: Retained<objc2_app_kit::NSTextField>,
+    scroll: Retained<objc2_app_kit::NSScrollView>,
+    answer: Retained<objc2_app_kit::NSTextView>,
+    field: Retained<objc2_app_kit::NSTextField>,
+    ask: Retained<objc2_app_kit::NSButton>,
+    new: Retained<objc2_app_kit::NSButton>,
+    close: Retained<objc2_app_kit::NSButton>,
+    quick: Vec<Retained<objc2_app_kit::NSButton>>,
+    /// Questions and answers so far, oldest first.
+    transcript: Vec<(String, String)>,
+    /// The connection while she answers, to stop her.
+    asking: Option<fairy::Asking>,
+    pending: Option<std::sync::mpsc::Receiver<fairy::Asking>>,
+    busy: bool,
+    /// The next question starts a new conversation.
+    fresh: bool,
+}
+
+/// The card's quick questions: their button titles, and what's asked.
+const FAIRY_QUICK: [(&str, &str); 4] = [
+    ("Explain this", "Explain what's on my screen."),
+    ("Why did it fail?", "Why did the last command fail, and how do I fix it?"),
+    ("Fix it", "How do I fix this? Give me the commands to run."),
+    ("Summarize", "Summarize the last command's output: what matters in it?"),
+];
+
+impl FairyCard {
+    const WIDTH: f64 = 460.0;
+    const HEIGHT: f64 = 480.0;
+
+    fn new(mtm: MainThreadMarker, parent: &TachyonView) -> FairyCard {
+        use objc2_app_kit::{NSButton, NSFont, NSTextField};
+        let content = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        let host: Retained<NSView> = if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+            glass.setCornerRadius(18.0);
+            glass.setTintColor(Some(&NSColor::windowBackgroundColor().colorWithAlphaComponent(0.82)));
+            glass.setContentView(Some(&content));
+            Retained::into_super(glass)
+        } else {
+            let blur = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), NSRect::ZERO);
+            blur.setMaterial(NSVisualEffectMaterial::HUDWindow);
+            blur.setState(NSVisualEffectState::Active);
+            blur.addSubview(&content);
+            Retained::into_super(blur)
+        };
+        let target: &AnyObject = parent.as_ref();
+        let label = |text: &str, size: f64, bold: bool| {
+            let l = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+            let font = if bold { NSFont::boldSystemFontOfSize(size) } else { NSFont::systemFontOfSize(size) };
+            l.setFont(Some(&font));
+            l
+        };
+        let title = label("Fairy", 15.0, true);
+        let hint = label("About what's on this screen", 11.0, false);
+        hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        let button = |text: &str, action: Sel| unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(text), Some(target), Some(action), mtm) };
+        let new = button("New", sel!(tachyonFairyNew:));
+        new.setToolTip(Some(&NSString::from_str("Start a new conversation")));
+        let close = button("✕", sel!(tachyonFairy:));
+        close.setBordered(false);
+        close.setToolTip(Some(&NSString::from_str("Close (⌥⌘I)")));
+        let quick: Vec<Retained<NSButton>> = FAIRY_QUICK
+            .iter()
+            .enumerate()
+            .map(|(i, (t, _))| {
+                let b = button(t, sel!(tachyonFairyQuick:));
+                b.setTag(i as isize);
+                b.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                b
+            })
+            .collect();
+        let scroll = objc2_app_kit::NSTextView::scrollableTextView(mtm);
+        scroll.setDrawsBackground(false);
+        scroll.setHasVerticalScroller(true);
+        let answer: Retained<objc2_app_kit::NSTextView> = scroll
+            .documentView()
+            .and_then(|v| v.downcast::<objc2_app_kit::NSTextView>().ok())
+            .expect("a scrollable text view holds a text view");
+        answer.setEditable(false);
+        answer.setSelectable(true);
+        answer.setDrawsBackground(false);
+        answer.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(12.0, unsafe { objc2_app_kit::NSFontWeightRegular })));
+        answer.setTextColor(Some(&NSColor::labelColor()));
+        answer.setTextContainerInset(NSSize::new(4.0, 6.0));
+        let field = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
+        field.setPlaceholderString(Some(&NSString::from_str("Ask Fairy about this screen…")));
+        // Return asks.
+        unsafe {
+            field.setTarget(Some(target));
+            field.setAction(Some(sel!(tachyonFairyAsk:)));
+        }
+        let ask = button("Ask", sel!(tachyonFairyAsk:));
+        ask.setKeyEquivalent(&NSString::from_str(""));
+        for v in [&*title as &NSView, &hint, &new, &close, &scroll, &field, &ask] {
+            content.addSubview(v);
+        }
+        for b in &quick {
+            content.addSubview(b);
+        }
+        host.setHidden(true);
+        parent.addSubview(&host);
+        let card = FairyCard {
+            host,
+            content,
+            title,
+            hint,
+            scroll,
+            answer,
+            field,
+            ask,
+            new,
+            close,
+            quick,
+            transcript: Vec::new(),
+            asking: None,
+            pending: None,
+            busy: false,
+            fresh: false,
+        };
+        card.render();
+        card
+    }
+
+    /// Place it above `bottom` points, at the right of a view of `size`, below
+    /// `top` points.
+    fn place(&self, size: NSSize, bottom: f64, top: f64) {
+        let w = Self::WIDTH.min(size.width - 24.0).max(240.0);
+        let h = Self::HEIGHT.min(size.height - bottom - top - 16.0).max(200.0);
+        let frame = NSRect::new(NSPoint::new(size.width - w - 12.0, bottom + 6.0), NSSize::new(w, h));
+        self.host.setFrame(frame);
+        self.content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        let pad = 14.0;
+        self.title.setFrame(NSRect::new(NSPoint::new(pad, h - 34.0), NSSize::new(w - 2.0 * pad - 90.0, 20.0)));
+        self.hint.setFrame(NSRect::new(NSPoint::new(pad, h - 50.0), NSSize::new(w - 2.0 * pad - 90.0, 16.0)));
+        self.new.setFrame(NSRect::new(NSPoint::new(w - pad - 86.0, h - 38.0), NSSize::new(56.0, 26.0)));
+        self.close.setFrame(NSRect::new(NSPoint::new(w - pad - 24.0, h - 36.0), NSSize::new(24.0, 22.0)));
+        // Quick questions, two to a row.
+        let bw = (w - 2.0 * pad - 8.0) / 2.0;
+        for (i, b) in self.quick.iter().enumerate() {
+            let (col, row) = ((i % 2) as f64, (i / 2) as f64);
+            b.setFrame(NSRect::new(NSPoint::new(pad + col * (bw + 8.0), h - 84.0 - row * 30.0), NSSize::new(bw, 26.0)));
+        }
+        let below = 52.0;
+        let above = h - 126.0;
+        self.scroll.setFrame(NSRect::new(NSPoint::new(pad - 4.0, below), NSSize::new(w - 2.0 * pad + 8.0, (above - below).max(40.0))));
+        self.field.setFrame(NSRect::new(NSPoint::new(pad, 14.0), NSSize::new(w - 2.0 * pad - 70.0, 26.0)));
+        self.ask.setFrame(NSRect::new(NSPoint::new(w - pad - 64.0, 12.0), NSSize::new(64.0, 30.0)));
+    }
+
+    /// Show the conversation, scrolled to its end.
+    fn render(&self) {
+        let text = if self.transcript.is_empty() {
+            "Ask about what's on the screen: the last command, its output, an error. \
+             Fairy sees the screen, the last command and its output (or what you've selected), and the folder."
+                .to_string()
+        } else {
+            self.transcript
+                .iter()
+                .map(|(q, a)| format!("› {q}\n\n{a}"))
+                .collect::<Vec<_>>()
+                .join("\n\n────────\n\n")
+        };
+        self.answer.setString(&NSString::from_str(&text));
+        let len = NSString::from_str(&text).length();
+        self.answer.scrollRangeToVisible(objc2_foundation::NSRange::new(len, 0));
+        self.ask.setTitle(&NSString::from_str(if self.busy { "Stop" } else { "Ask" }));
+    }
+}
+
 struct RewindBadge {
     glass: Retained<NSGlassEffectView>,
     label: Retained<objc2_app_kit::NSTextField>,
@@ -1431,6 +1631,21 @@ impl Tab {
     }
 }
 
+/// Fairy's socket, when she's turned on in the config and installed.
+fn fairy_socket(cfg: &Config) -> Option<std::path::PathBuf> {
+    if !cfg.macos.fairy {
+        return None;
+    }
+    let configured = cfg.macos.fairy_socket.trim();
+    if configured.is_empty() {
+        return fairy::default_socket();
+    }
+    match (configured.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => Some(std::path::PathBuf::from(home).join(rest)),
+        _ => Some(std::path::PathBuf::from(configured)),
+    }
+}
+
 /// A cell's size in whole device pixels, as terminals report it.
 fn cell_pixels(r: &renderer::Renderer) -> (u32, u32) {
     let m = r.metrics();
@@ -1560,6 +1775,12 @@ struct TermWindow {
     chart: Option<ChartView>,
     /// Closing because its last shell ended, not by hand: nothing to keep.
     shell_ended: bool,
+    /// Shortcut hints along the bottom.
+    hints: bool,
+    /// Fairy's socket, when she's on and installed; her button and card.
+    fairy_socket: Option<std::path::PathBuf>,
+    fairy_button: Option<Retained<objc2_app_kit::NSButton>>,
+    fairy_card: Option<FairyCard>,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -1789,7 +2010,14 @@ impl TermWindow {
                 }
             }) as Box<dyn Fn(f64)>
         });
-        self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, panel.as_ref(), presented);
+        let hints = if self.hints {
+            let k = focus_at.unwrap_or(0);
+            self.hint_list(&guards[k])
+        } else {
+            Vec::new()
+        };
+        let hints_right = self.fairy_button.as_ref().map_or(self.renderer.padding_right_edge(), |b| (b.frame().origin.x * self.scale()) as f32 - 12.0);
+        self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, panel.as_ref(), &hints, hints_right, presented);
         let overlay = match focus_at {
             Some(k) if blink => {
                 let rect = tab.panes[tab.focus].rect;
@@ -2243,6 +2471,231 @@ impl TermWindow {
         tab.visible().into_iter().find(|&p| tab.panes[p].rect.contains(fx as usize, fy as usize))
     }
 
+    /// The shortcuts worth showing along the bottom: what fits the moment
+    /// first (a suggestion to take, a failure to ask about, a long output to
+    /// fold), then the everyday ones.
+    fn hint_list(&self, term: &Term) -> Vec<(String, String)> {
+        let mut out: Vec<(&str, &str)> = Vec::new();
+        if self.ghost.is_some() {
+            out.push(("Tab", "take suggestion"));
+        }
+        let last = term.last_started_command();
+        let info = last.and_then(|c| term.command(c));
+        let failed = info.is_some_and(|c| c.state == CommandState::Done && c.exit.is_some_and(|e| e != 0));
+        if failed && self.fairy_socket.is_some() {
+            out.push(("⌥⌘I", "ask Fairy why it failed"));
+        }
+        if last.and_then(|c| term.output_range(c)).is_some_and(|(s, e)| e - s > 40) && !last.is_some_and(|c| term.is_folded(c)) {
+            out.push(("⌥⌘K", "fold output"));
+        }
+        if self.fairy_socket.is_some() && !failed {
+            out.push(("⌥⌘I", "ask Fairy"));
+        }
+        out.extend([
+            ("⌘T", "new tab"),
+            ("⌘D", "split"),
+            ("⌘F", "find"),
+            ("⌘[", "rewind"),
+            ("⌥⌘O", "copy output"),
+            ("⌥⌘C", "chart"),
+            ("⌥⌘T", "reopen tab"),
+            ("⌘↑", "previous command"),
+        ]);
+        let mut seen = std::collections::HashSet::new();
+        out.into_iter().filter(|(k, _)| seen.insert(*k)).map(|(k, w)| (k.to_string(), w.to_string())).collect()
+    }
+
+    /// Put Fairy's button at the right end of the bottom band, and her card
+    /// above it.
+    fn place_fairy(&mut self) {
+        if self.fairy_socket.is_none() {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        if self.fairy_button.is_none() {
+            let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+            let icon = workspace
+                .URLForApplicationWithBundleIdentifier(&NSString::from_str(fairy::BUNDLE_ID))
+                .and_then(|url| url.path())
+                .map(|path| workspace.iconForFile(&path));
+            let Some(icon) = icon else {
+                // Not installed after all.
+                self.fairy_socket = None;
+                return;
+            };
+            icon.setSize(NSSize::new(18.0, 18.0));
+            let target: &AnyObject = self.view.as_ref();
+            let button = unsafe { objc2_app_kit::NSButton::buttonWithImage_target_action(&icon, Some(target), Some(sel!(tachyonFairy:)), mtm) };
+            button.setBordered(false);
+            button.setImageScaling(objc2_app_kit::NSImageScaling::ScaleProportionallyDown);
+            button.setToolTip(Some(&NSString::from_str("Ask Fairy about this screen (⌥⌘I)")));
+            self.view.addSubview(&button);
+            self.fairy_button = Some(button);
+        }
+        let scale = self.scale();
+        let size = self.view.bounds().size;
+        let (y0, h) = self.renderer.hints_rect();
+        let band_bottom = (self.view.bounds().size.height * scale - (y0 + h) as f64).max(0.0) / scale;
+        let band_h = h as f64 / scale;
+        let side = 20.0;
+        let pad_x = self.renderer.padding().0 as f64 / scale;
+        if let Some(b) = &self.fairy_button {
+            b.setFrame(NSRect::new(NSPoint::new(size.width - pad_x - side, band_bottom + (band_h - side) / 2.0), NSSize::new(side, side)));
+        }
+        if let Some(card) = &self.fairy_card {
+            card.place(size, band_bottom + band_h, self.title_bar_height());
+        }
+    }
+
+    /// Open or close Fairy's card.
+    fn toggle_fairy(&mut self) {
+        if self.fairy_socket.is_none() {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let open = self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden());
+        if open {
+            if let Some(c) = &self.fairy_card {
+                c.host.setHidden(true);
+            }
+            self.window.makeFirstResponder(Some(&self.view));
+            return;
+        }
+        if self.fairy_card.is_none() {
+            self.fairy_card = Some(FairyCard::new(mtm, &self.view));
+        }
+        self.place_fairy();
+        if let Some(c) = &self.fairy_card {
+            c.host.setHidden(false);
+            self.window.makeFirstResponder(Some(&c.field));
+        }
+    }
+
+    /// What the focused pane shows, for Fairy: its screen, its last command
+    /// and that command's output, the folder, and any selection.
+    fn fairy_context(&self) -> fairy::Context {
+        let term = self.term.lock();
+        let g = term.grid();
+        let first = g.history_len().saturating_sub(g.display_offset());
+        let (rows, cols) = (term.rows(), term.cols());
+        let screen = term.text_range(first, 0, first + rows - 1, cols.saturating_sub(1));
+        let screen = screen.lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim_end().to_string();
+        let last = term.last_started_command();
+        let info = last.and_then(|c| term.command(c));
+        let selection = self
+            .selection
+            .and_then(|s| s.range(&term))
+            .map(|r| term.text_range(r.start.0, r.start.1, r.end.0, r.end.1))
+            .filter(|s| !s.trim().is_empty());
+        fairy::Context {
+            cwd: term.cwd.clone(),
+            command: info.and_then(|c| c.cmdline.clone()),
+            exit: info.and_then(|c| c.exit),
+            output: last.and_then(|c| term.output_text(c)).map(|o| fairy::tail(&o, 4000)),
+            screen: fairy::tail(&screen, 4000),
+            selection: selection.map(|s| fairy::tail(&s, 4000)),
+        }
+    }
+
+    /// The card's Ask button and Return: ask what's typed, or stop her.
+    fn fairy_ask_or_stop(&mut self) {
+        let Some(card) = &mut self.fairy_card else { return };
+        if card.busy {
+            if card.asking.is_none() {
+                card.asking = card.pending.as_ref().and_then(|rx| rx.try_recv().ok());
+            }
+            if let Some(a) = &card.asking {
+                a.stop();
+            }
+            return;
+        }
+        let question = card.field.stringValue().to_string();
+        if question.trim().is_empty() {
+            return;
+        }
+        card.field.setStringValue(&NSString::from_str(""));
+        self.fairy_ask(question);
+    }
+
+    /// Ask Fairy `question` about the focused pane.
+    fn fairy_ask(&mut self, question: String) {
+        let Some(path) = self.fairy_socket.clone() else { return };
+        if self.fairy_card.as_ref().is_none_or(|c| c.host.isHidden()) {
+            self.toggle_fairy();
+        }
+        let context = self.fairy_context();
+        let id = self.id;
+        let Some(card) = &mut self.fairy_card else { return };
+        if card.busy {
+            return;
+        }
+        card.transcript.push((question.clone(), "…".into()));
+        card.busy = true;
+        card.asking = None;
+        let fresh = std::mem::take(&mut card.fresh);
+        card.render();
+        card.pending = Some(fairy::ask(path, question, context, fresh, move |event| {
+            DispatchQueue::main().exec_async(move || with_window(id, |w| w.fairy_event(event)));
+        }));
+    }
+
+    /// What Fairy sent: her reply as it grows, the end of it, or trouble.
+    fn fairy_event(&mut self, event: fairy::Event) {
+        let Some(card) = &mut self.fairy_card else { return };
+        if card.asking.is_none() {
+            card.asking = card.pending.as_ref().and_then(|rx| rx.try_recv().ok());
+        }
+        let last = card.transcript.last_mut().map(|(_, a)| a);
+        match event {
+            fairy::Event::Waking => {
+                if let Some(a) = last {
+                    *a = "Waking Fairy…".into();
+                }
+            }
+            fairy::Event::Hello(name) => {
+                if !name.is_empty() {
+                    card.title.setStringValue(&NSString::from_str(&name));
+                    card.field.setPlaceholderString(Some(&NSString::from_str(&format!("Ask {name} about this screen…"))));
+                }
+                return;
+            }
+            fairy::Event::Text(t) => {
+                if let Some(a) = last {
+                    *a = t;
+                }
+            }
+            fairy::Event::Done(t) => {
+                if let Some(a) = last {
+                    *a = t;
+                }
+                card.busy = false;
+                card.asking = None;
+                card.pending = None;
+            }
+            fairy::Event::Error(m) => {
+                if let Some(a) = last {
+                    *a = if a == "…" || a == "Waking Fairy…" { format!("⚠︎ {m}") } else { format!("{a}\n\n⚠︎ {m}") };
+                }
+                card.busy = false;
+                card.asking = None;
+                card.pending = None;
+            }
+        }
+        card.render();
+    }
+
+    /// The card's New: the next question starts a new conversation.
+    fn fairy_new(&mut self) {
+        let Some(card) = &mut self.fairy_card else { return };
+        if card.busy {
+            return;
+        }
+        card.transcript.clear();
+        card.fresh = true;
+        card.render();
+        self.window.makeFirstResponder(Some(&card.field));
+    }
+
     /// Open the training chart over the focused pane, for `cmd` or (with
     /// `None`) the newest command with metrics; or close it.
     fn toggle_chart(&mut self, cmd: Option<u32>) {
@@ -2490,6 +2943,9 @@ impl TermWindow {
             self.renderer.set_strip_band(Some((band * scale).round() as f32));
             self.place_capsule(strip);
         }
+        // The band along the bottom: hints, and Fairy's button at its right.
+        self.renderer.set_hints_band(self.hints || self.fairy_socket.is_some());
+        self.place_fairy();
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
             crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
@@ -3914,6 +4370,10 @@ impl App {
             ghost_cache: None,
             chart: None,
             shell_ended: false,
+            hints: cfg.window.hints,
+            fairy_socket: fairy_socket(cfg),
+            fairy_button: None,
+            fairy_card: None,
             find_bar: None,
             find: None,
             cursor_layer,
@@ -4313,6 +4773,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Training Chart", sel!(tachyonChart:), "c")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&view, "Fold Output", sel!(tachyonFoldOutput:), "k")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    item(&view, "Ask Fairy", sel!(tachyonFairy:), "i")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Rewind", sel!(tachyonRewindBack:), "[");

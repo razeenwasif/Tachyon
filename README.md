@@ -145,6 +145,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
+| ⌥⌘I | Ask Fairy about the screen (her card at the bottom right) |
 | ⌥⌘O / ⌥⌘K | Copy a command's output (the selected one's, or the last) / fold or unfold it |
 | ⌥⌘T | Reopen the tab, pane or window's tab closed last (kept ten minutes, shells running) |
 | ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
@@ -381,6 +382,25 @@ afresh. kitty and iTerm2 images reach Tachyon only through tmux's passthrough
 (`set -g allow-passthrough on`), wrapped by the program; tmux doesn't know
 they're there, so they last until it repaints (switching windows, for one),
 as in kitty and iTerm2 themselves. In tmux, prefer a tool's sixel output.
+
+**Fairy.** Fairy, the assistant on this Mac, has a button at the bottom right
+of the window (her app icon) and ⌥⌘I (View > Ask Fairy). It opens a card above
+it: **Explain this**, **Why did it fail?**, **Fix it** and **Summarize** ask
+about the screen in a click, and the box below asks anything else. Her answer
+streams in as she writes it, in her own name and persona, and **Stop** halts
+it. Each question takes along what she needs: the screen, the last command
+with its exit status and output (or what you've selected), and the folder.
+She's told it's material to look at, never instructions, so output can't steer
+her. Questions go on in one conversation, kept in Fairy as a chat called
+Terminal; **New** starts another. Tachyon reaches her through a private socket
+in her data folder that only you can open, and opens her in the background if
+she isn't running. `fairy.enabled = false` hides the button; `fairy.socket`
+points elsewhere.
+
+**Shortcut hints.** A band along the bottom lists the shortcuts worth knowing,
+what fits the moment first: Tab when a suggestion shows, ⌥⌘I to ask Fairy
+why a command failed, ⌥⌘K for a long output, then ⌘T, ⌘D, ⌘F, ⌘[, ⌥⌘O,
+⌥⌘C, ⌥⌘T and ⌘↑, as many as fit. `window.hints = false` gives its row back.
 
 **Suggestions.** As you type at a prompt, Tachyon shows in grey the rest of a
 command you've run before; Tab, → or End (or ⌃F) types it in for you, ⌥→ one
