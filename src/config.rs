@@ -396,11 +396,13 @@ pub struct MacConfig {
     pub editor: String,
     /// The quick terminal's global hotkey (`ctrl+\``), or `none`.
     pub quick_hotkey: String,
+    /// The system monitor's button at the bottom right.
+    pub monitor: bool,
 }
 
 impl Default for MacConfig {
     fn default() -> Self {
-        MacConfig { option_as_meta: OptionAsMeta::default(), notify_after_secs: 10, fairy: true, fairy_socket: String::new(), editor: "auto".into(), quick_hotkey: "ctrl+`".into() }
+        MacConfig { option_as_meta: OptionAsMeta::default(), notify_after_secs: 10, fairy: true, fairy_socket: String::new(), editor: "auto".into(), quick_hotkey: "ctrl+`".into(), monitor: true }
     }
 }
 
@@ -639,6 +641,7 @@ impl Config {
             "fairy.enabled" => self.macos.fairy = parse_bool(value)?,
             "fairy.socket" => self.macos.fairy_socket = value.to_string(),
             "editor" => self.macos.editor = value.to_string(),
+            "monitor.enabled" => self.macos.monitor = parse_bool(value)?,
             "quick.hotkey" => {
                 #[cfg(target_os = "macos")]
                 crate::mac::hotkey::parse(value)?;

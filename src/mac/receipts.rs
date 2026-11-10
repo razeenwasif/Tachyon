@@ -31,8 +31,8 @@ const PROC_PGRP_ONLY: u32 = 2;
 /// followed by the fields added in v5 and v6.
 #[repr(C)]
 #[derive(Default)]
-struct RusageV6 {
-    v4: RusageV4,
+pub(super) struct RusageV6 {
+    pub(super) v4: RusageV4,
     flags: u64,
     user_ptime: u64,
     system_ptime: u64,
@@ -50,7 +50,7 @@ struct RusageV6 {
 
 /// `libc::rusage_info_v4`, wrapped so it can derive `Default`.
 #[repr(transparent)]
-struct RusageV4(libc::rusage_info_v4);
+pub(super) struct RusageV4(pub(super) libc::rusage_info_v4);
 
 impl Default for RusageV4 {
     fn default() -> Self {
@@ -59,7 +59,7 @@ impl Default for RusageV4 {
     }
 }
 
-fn rusage(pid: libc::pid_t) -> Option<RusageV6> {
+pub(super) fn rusage(pid: libc::pid_t) -> Option<RusageV6> {
     let mut r = RusageV6::default();
     // SAFETY: the buffer is at least as large as rusage_info_v6.
     let rc = unsafe {
@@ -73,7 +73,7 @@ fn rusage(pid: libc::pid_t) -> Option<RusageV6> {
 // libc marks the timebase struct deprecated in favour of the mach2 crate; the
 // call itself is the documented API and one more dependency is not worth it.
 #[allow(deprecated)]
-fn to_nanos(ticks: u64) -> u64 {
+pub(super) fn to_nanos(ticks: u64) -> u64 {
     static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     let &(numer, denom) = TIMEBASE.get_or_init(|| {
         let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };

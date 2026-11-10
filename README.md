@@ -147,6 +147,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
 | ⌘-click / ⌥⌘-click | Open a URL, a file in Quick Look, or a traceback's file:line in your editor / any file in your editor |
 | ⌃` (from any app) | The quick terminal, dropping from the notch, or away again |
+| ⌥⌘U | System monitor (the gauge beside Fairy's icon) |
 | ⌥⌘I | Ask Fairy about the screen (her card at the bottom right) |
 | ⌥⌘O / ⌥⌘K | Copy a command's output (the selected one's, or the last) / fold or unfold it |
 | ⌥⌘T | Reopen the tab, pane or window's tab closed last (kept ten minutes, shells running) |
@@ -419,6 +420,15 @@ Terminal; **New** starts another. Tachyon reaches her through a private socket
 in her data folder that only you can open, and opens her in the background if
 she isn't running. `fairy.enabled = false` hides the button; `fairy.socket`
 points elsewhere.
+
+**System monitor.** The gauge left of Fairy's icon (and ⌥⌘U, View > System
+Monitor) pulls up a card of what the Mac is doing, read once a second while it
+shows: CPU overall and per core with a recent history, load averages, the
+GPU's busy share, memory as Activity Monitor counts it (app memory, wired and
+compressed) with pressure and swap, network speed in and out, free space on
+the startup disk, the battery and thermal state, and the six busiest of your
+processes with their CPU and memory. Nothing is read while it's closed.
+`monitor.enabled = false` hides the gauge.
 
 **Shortcut hints.** A band along the bottom lists the shortcuts worth knowing,
 what fits the moment first: Tab when a suggestion shows, ⌥⌘I to ask Fairy
