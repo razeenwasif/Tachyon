@@ -146,6 +146,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘T / ⌘N | New tab / new window |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
 | ⌘-click / ⌥⌘-click | Open a URL, a file in Quick Look, or a traceback's file:line in your editor / any file in your editor |
+| ⌃` (from any app) | The quick terminal, dropping from the notch, or away again |
 | ⌥⌘I | Ask Fairy about the screen (her card at the bottom right) |
 | ⌥⌘O / ⌥⌘K | Copy a command's output (the selected one's, or the last) / fold or unfold it |
 | ⌥⌘T | Reopen the tab, pane or window's tab closed last (kept ten minutes, shells running) |
@@ -392,6 +393,18 @@ afresh. kitty and iTerm2 images reach Tachyon only through tmux's passthrough
 (`set -g allow-passthrough on`), wrapped by the program; tmux doesn't know
 they're there, so they last until it repaints (switching windows, for one),
 as in kitty and iTerm2 themselves. In tmux, prefer a tool's sixel output.
+
+**Quick terminal.** ⌃` from any app drops a terminal down from the top of the
+screen the pointer is on, out of the notch on a MacBook: over whatever you're
+doing, full-screen apps included, on every Space. It's a panel that takes the
+keys without making Tachyon the active app, as Spotlight does, so Tachyon's
+other windows (and Stage Manager's stage) stay where they were. ⌃` again, or a click
+elsewhere, puts it away, and the hotkey gives focus back to the app you were
+in. It keeps its shell (and its tabs and splits) between showings, and with
+the session host, across restarts too, coming back hidden until the hotkey.
+`quick.hotkey` sets the combination (`ctrl+\``, `cmd+shift+space`,
+`option+space`, `f12`; `none` turns it off); it's a system hotkey, so it needs
+no accessibility permission. Window > Quick Terminal does the same.
 
 **Fairy.** Fairy, the assistant on this Mac, has a button at the bottom right
 of the window (her app icon) and ⌥⌘I (View > Ask Fairy). It opens a card above
