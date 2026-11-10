@@ -19,6 +19,7 @@ mod boxdraw;
 mod chart;
 mod dock;
 mod editor;
+pub mod hotkey;
 mod fairy;
 mod font;
 mod images;
@@ -976,7 +977,13 @@ define_class!(
 
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _n: &NSNotification) {
-            with_window(self.ivars().id.get(), |w| w.set_focused(false));
+            with_window(self.ivars().id.get(), |w| {
+                w.set_focused(false);
+                // The quick terminal goes when you click elsewhere.
+                if w.quick && w.quick_shown {
+                    w.hide_quick(false);
+                }
+            });
         }
     }
 );
@@ -1068,6 +1075,12 @@ define_class!(
             open_window();
         }
 
+        /// Window > Quick Terminal, the same as its hotkey.
+        #[unsafe(method(tachyonQuickTerminal:))]
+        fn quick_terminal(&self, _sender: Option<&AnyObject>) {
+            toggle_quick();
+        }
+
         /// ⌥⌘T with no window open: the tab comes back in a new one.
         #[unsafe(method(tachyonReopenTab:))]
         fn reopen_tab(&self, _sender: Option<&AnyObject>) {
@@ -1091,6 +1104,8 @@ struct App {
     title_bar: bool,
     gpu: Rc<Gpu>,
     windows: Vec<TermWindow>,
+    /// The quick terminal's window, shown and hidden by the hotkey.
+    quick: Option<u64>,
     next_id: u64,
     /// Where the next window's top-left corner goes, so new windows cascade.
     cascade: NSPoint,
@@ -1838,6 +1853,12 @@ struct TermWindow {
     fairy_socket: Option<std::path::PathBuf>,
     fairy_button: Option<Retained<objc2_app_kit::NSButton>>,
     fairy_card: Option<FairyCard>,
+    /// The quick terminal: borderless, dropping from the screen's top, and
+    /// whether it's showing; the app that was in front, to go back to.
+    quick: bool,
+    quick_shown: bool,
+    quick_inset: f64,
+    quick_previous: Option<Retained<objc2_app_kit::NSRunningApplication>>,
 
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
@@ -2555,6 +2576,91 @@ impl TermWindow {
         tab.visible().into_iter().find(|&p| tab.panes[p].rect.contains(fx as usize, fy as usize))
     }
 
+    /// Drop the quick terminal down from the top of the screen the pointer
+    /// is on: under the notch, over everything, on every Space.
+    fn show_quick(&mut self, previous: Option<Retained<objc2_app_kit::NSRunningApplication>>) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        self.quick_previous = previous;
+        let mouse = NSEvent::mouseLocation();
+        let screens = NSScreen::screens(mtm);
+        let screen = screens
+            .iter()
+            .find(|s| {
+                let f = s.frame();
+                mouse.x >= f.origin.x && mouse.x < f.origin.x + f.size.width && mouse.y >= f.origin.y && mouse.y < f.origin.y + f.size.height
+            })
+            .or_else(|| NSScreen::mainScreen(mtm));
+        let Some(screen) = screen else { return };
+        let sf = screen.frame();
+        // The window's top corners sit above the screen's edge, so it reads
+        // as hanging from it; the grid starts below the notch.
+        const HIDDEN: f64 = 18.0;
+        let notch = screen.safeAreaInsets().top;
+        let w = (sf.size.width * 0.62).clamp(600.0_f64.min(sf.size.width - 40.0), (sf.size.width - 40.0).max(400.0));
+        let h = (sf.size.height * 0.46).clamp(260.0, (sf.size.height - 80.0).max(260.0));
+        let frame = NSRect::new(
+            NSPoint::new(sf.origin.x + (sf.size.width - w) / 2.0, sf.origin.y + sf.size.height - h),
+            NSSize::new(w, h + HIDDEN),
+        );
+        self.quick_inset = HIDDEN + notch.max(0.0) + 4.0;
+        self.window.setStyleMask(NSWindowStyleMask::Borderless);
+        // Above the menu bar, beside the notch.
+        self.window.setLevel(25);
+        self.window.setCollectionBehavior(
+            objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle
+                | objc2_app_kit::NSWindowCollectionBehavior::Transient,
+        );
+        self.window.setHasShadow(true);
+        // From just above the screen, down into place.
+        let mut start = frame;
+        start.origin.y += h;
+        self.window.setAlphaValue(0.0);
+        self.window.setFrame_display(start, false);
+        self.layout();
+        self.quick_shown = true;
+        self.window.makeKeyAndOrderFront(None);
+        self.window.makeFirstResponder(Some(&self.view));
+        NSApplication::sharedApplication(mtm).activate();
+        objc2_app_kit::NSAnimationContext::beginGrouping();
+        objc2_app_kit::NSAnimationContext::currentContext().setDuration(0.16);
+        let animator: Retained<NSWindow> = unsafe { msg_send![&*self.window, animator] };
+        animator.setFrame_display(frame, true);
+        animator.setAlphaValue(1.0);
+        objc2_app_kit::NSAnimationContext::endGrouping();
+        self.request_redraw();
+    }
+
+    /// Slide the quick terminal back up and out of sight; with `refocus`,
+    /// the app that was in front before comes back.
+    fn hide_quick(&mut self, refocus: bool) {
+        if !self.quick_shown {
+            return;
+        }
+        self.quick_shown = false;
+        let mut end = self.window.frame();
+        end.origin.y += end.size.height;
+        let window = self.window.clone();
+        objc2_app_kit::NSAnimationContext::beginGrouping();
+        let context = objc2_app_kit::NSAnimationContext::currentContext();
+        context.setDuration(0.14);
+        let done = block2::RcBlock::new(move || window.orderOut(None));
+        context.setCompletionHandler(Some(&done));
+        let animator: Retained<NSWindow> = unsafe { msg_send![&*self.window, animator] };
+        animator.setFrame_display(end, true);
+        animator.setAlphaValue(0.0);
+        objc2_app_kit::NSAnimationContext::endGrouping();
+        if let (true, Some(app)) = (refocus, self.quick_previous.take()) {
+            // macOS hands activation over cooperatively: yield it to that app,
+            // then ask it forward.
+            if let Some(mtm) = MainThreadMarker::new() {
+                NSApplication::sharedApplication(mtm).yieldActivationToApplication(&app);
+            }
+            app.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::empty());
+        }
+    }
+
     /// The shortcuts worth showing along the bottom: what fits the moment
     /// first (a suggestion to take, a failure to ask about, a long output to
     /// fold), then the everyday ones.
@@ -3078,6 +3184,9 @@ impl TermWindow {
 
     /// How tall the title bar is, in points: zero edge-to-edge.
     fn title_bar_height(&self) -> f64 {
+        if self.quick {
+            return self.quick_inset;
+        }
         if self.notch.is_some() {
             return self.window.screen().map_or(0.0, |s| s.safeAreaInsets().top);
         }
@@ -4458,6 +4567,10 @@ impl App {
             fairy_socket: fairy_socket(cfg),
             fairy_button: None,
             fairy_card: None,
+            quick: false,
+            quick_shown: false,
+            quick_inset: 0.0,
+            quick_previous: None,
             find_bar: None,
             find: None,
             cursor_layer,
@@ -4662,6 +4775,9 @@ fn shell_exited(pane: u64) {
 fn remove_window(id: u64) {
     let removed = with_app(|app| {
         let i = app.windows.iter().position(|w| w.id == id)?;
+        if app.quick == Some(id) {
+            app.quick = None;
+        }
         Some(app.windows.remove(i))
     })
     .flatten();
@@ -4676,6 +4792,58 @@ fn remove_window(id: u64) {
     };
     for tab in tabs {
         keep_closed(tab);
+    }
+}
+
+/// The quick terminal's hotkey: drop it down, or put it away. The first
+/// press makes it, with a shell of its own that keeps running in between.
+fn toggle_quick() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let ours = std::process::id() as i32;
+    let previous = NSWorkspace::sharedWorkspace().frontmostApplication().filter(|a| a.processIdentifier() != ours);
+    let existing = with_app(|a| a.quick).flatten();
+    let id = match existing {
+        Some(id) => {
+            let shown = query_window(id, |w| w.quick_shown).unwrap_or(false);
+            if shown {
+                with_window(id, |w| w.hide_quick(true));
+                return;
+            }
+            id
+        }
+        None => match with_app(|app| app.create_window(mtm, None)) {
+            Some(Ok((_, _, id))) => {
+                with_app(|a| a.quick = Some(id));
+                with_window(id, |w| {
+                    w.quick = true;
+                    w.apply_appearance();
+                });
+                schedule_layout_save();
+                id
+            }
+            Some(Err(e)) => {
+                crate::log::force(&format!("quick terminal: {e}"));
+                return;
+            }
+            None => return,
+        },
+    };
+    with_window(id, |w| w.show_quick(previous));
+}
+
+/// Take the quick terminal's hotkey from the config.
+fn register_quick_hotkey(setting: &str) {
+    match hotkey::parse(setting) {
+        Ok(Some(combo)) => {
+            // Called from the run loop; the window work follows the event.
+            let pressed: fn() = || DispatchQueue::main().exec_async(toggle_quick);
+            match hotkey::register(combo, pressed) {
+                Ok(()) => crate::log!("quick terminal: hotkey {setting}"),
+                Err(e) => crate::log::force(&format!("quick terminal: hotkey {setting}: {e}")),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => crate::log::force(&format!("quick terminal: hotkey {setting}: {e}")),
     }
 }
 
@@ -4868,6 +5036,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let window = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Window"));
     item(&window, "Minimize", sel!(performMiniaturize:), "m");
     item(&window, "Zoom", sel!(performZoom:), "");
+    // Its key is a global hotkey (quick.hotkey), not a menu equivalent.
+    item(&window, "Quick Terminal", sel!(tachyonQuickTerminal:), "");
     window.addItem(&NSMenuItem::separatorItem(mtm));
     // "{" and "}" are ⌘⇧[ and ⌘⇧], as in Safari and Terminal.
     item(&window, "Show Previous Tab", sel!(tachyonPreviousTab:), "{");
@@ -5176,10 +5346,14 @@ fn save_layout() {
         let mut out = String::new();
         for w in &app.windows {
             let f = w.window.frame();
-            out.push_str(&format!(
-                "window {} {} {} {} {}\n",
-                w.active, f.origin.x, f.origin.y, f.size.width, f.size.height
-            ));
+            if w.quick {
+                out.push_str(&format!("quick {}\n", w.active));
+            } else {
+                out.push_str(&format!(
+                    "window {} {} {} {} {}\n",
+                    w.active, f.origin.x, f.origin.y, f.size.width, f.size.height
+                ));
+            }
             for t in &w.tabs {
                 out.push_str(&format!("tab {} {} {}\n", t.pane().id, t.zoomed as u8, t.layout.encode()));
             }
@@ -5202,6 +5376,8 @@ struct SavedWindow {
     frame: Option<NSRect>,
     active: usize,
     tabs: Vec<(u64, bool, panes::Node)>,
+    /// The quick terminal, which comes back hidden.
+    quick: bool,
 }
 
 fn parse_layout(text: &str) -> Vec<SavedWindow> {
@@ -5212,7 +5388,11 @@ fn parse_layout(text: &str) -> Vec<SavedWindow> {
             Some("window") => {
                 let n: Vec<f64> = words.filter_map(|w| w.parse().ok()).collect();
                 let frame = (n.len() == 5).then(|| NSRect::new(NSPoint::new(n[1], n[2]), NSSize::new(n[3], n[4])));
-                windows.push(SavedWindow { frame, active: n.first().copied().unwrap_or(0.0) as usize, tabs: Vec::new() });
+                windows.push(SavedWindow { frame, active: n.first().copied().unwrap_or(0.0) as usize, tabs: Vec::new(), quick: false });
+            }
+            Some("quick") => {
+                let active = words.next().and_then(|w| w.parse().ok()).unwrap_or(0);
+                windows.push(SavedWindow { frame: None, active, tabs: Vec::new(), quick: true });
             }
             Some("tab") => {
                 let (Some(focus), Some(zoomed)) = (words.next().and_then(|w| w.parse().ok()), words.next()) else {
@@ -5258,7 +5438,7 @@ fn restore_sessions(mtm: MainThreadMarker) -> bool {
     let rest: Vec<u64> = ids.iter().copied().filter(|id| !placed.contains(id)).collect();
     if !rest.is_empty() {
         if saved.is_empty() {
-            saved.push(SavedWindow { frame: None, active: 0, tabs: Vec::new() });
+            saved.push(SavedWindow { frame: None, active: 0, tabs: Vec::new(), quick: false });
         }
         saved[0].tabs.extend(rest.into_iter().map(|id| (id, false, panes::Node::Leaf(id))));
     }
@@ -5308,7 +5488,13 @@ fn restore_sessions(mtm: MainThreadMarker) -> bool {
                     w.layout();
                     w.refresh_label(w.active);
                 });
-                opened.push((window, view));
+                if w.quick {
+                    // Back as the quick terminal, hidden until the hotkey.
+                    with_window(id, |w| w.quick = true);
+                    with_app(|app| app.quick = Some(id));
+                } else {
+                    opened.push((window, view));
+                }
             }
             Some(Err(e)) => crate::log::force(&format!("could not restore a window: {e}")),
             None => {}
@@ -5394,6 +5580,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
             cfg,
             gpu,
             windows: Vec::new(),
+            quick: None,
             next_id: 1,
             title_bar: cfg_title_bar,
             notch_full_screen: cfg_notch,
@@ -5428,6 +5615,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     if with_app(|a| a.windows.is_empty()).unwrap_or(true) {
         return Err("could not open the first window".into());
+    }
+    if let Some(setting) = with_app(|a| a.cfg.macos.quick_hotkey.clone()) {
+        register_quick_hotkey(&setting);
     }
     app.run();
 

@@ -211,6 +211,11 @@ theme.bold_is_bright = false
 # right end). false gives the row back to the grid.
 # window.hints = true
 
+# macOS: the quick terminal's global hotkey: from any app it drops a terminal
+# down from the notch, and puts it away again. Combinations like ctrl+`,
+# cmd+shift+space, option+space, f12; none turns it off.
+# quick.hotkey = ctrl+`
+
 # macOS: the editor Cmd-clicking a traceback's file:line opens (and
 # Option-Cmd-click on any file). auto takes the first installed of Zed, VS
 # Code, Cursor and Sublime Text, else $VISUAL/$EDITOR, else nvim or vim. Or:
