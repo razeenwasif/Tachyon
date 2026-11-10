@@ -25,6 +25,7 @@ mod font;
 mod images;
 pub mod host;
 mod input;
+mod jobwatch;
 mod ledger;
 mod links;
 mod notify;
@@ -5486,6 +5487,14 @@ fn start_session(
                         for (kind, job_id) in found {
                             t.record_job(kind, job_id);
                         }
+                        // A job may end with Tachyon closed, and the session
+                        // host then tells; only the app can ask macOS for
+                        // permission, so it asks now (once).
+                        DispatchQueue::main().exec_async(|| NOTIFIER.with(|n| {
+                            if let Some(n) = n.borrow().as_ref() {
+                                n.ask_permission();
+                            }
+                        }));
                     }
                     // A progress bar is redrawn after a \r rather than ended
                     // with one, so the line being written is its latest state.

@@ -31,9 +31,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 
+use super::jobwatch;
+use super::notify;
 use super::power;
 use super::pty::Pty;
-use crate::term::{Processor, Term};
+use crate::term::{jobs, lens, Processor, Term};
 
 /// Bumped when requests or replies change shape. An app only talks to a host
 /// of its own version (the socket's name carries it), so after an update the
@@ -329,6 +331,11 @@ struct Parsed {
     size: (u16, u16),
     /// A command here was keeping the Mac awake, last we looked.
     awake: bool,
+    /// Its output as lines, for spotting job submissions.
+    lines: lens::LineSplitter,
+    /// Jobs submitted here since the watcher last looked, with the command
+    /// that submitted each.
+    new_jobs: Vec<(jobs::JobRef, Option<String>)>,
 }
 
 /// Output the parser may fall behind by before reading waits for it.
@@ -343,7 +350,26 @@ impl Parsed {
             self.size = ws;
             self.term.resize(ws.0.max(1) as usize, ws.1.max(1) as usize);
         }
+        let before = self.term.running_cmdline().map(str::to_string);
         self.processor.advance(&mut self.term, chunk);
+        // Job submissions in the output, as the app spots them, so they're
+        // watched with the app closed too.
+        let cmdline = self.term.running_cmdline().map(str::to_string).or(before);
+        let mut found = Vec::new();
+        self.lines.feed(chunk, |line| {
+            if let Some(job) = jobs::detect(line, cmdline.as_deref()) {
+                found.push(job);
+            }
+        });
+        for (kind, id) in found {
+            let known = self.term.jobs.len();
+            self.term.record_job(kind, id);
+            if self.term.jobs.len() > known {
+                if let Some(job) = self.term.jobs.last() {
+                    self.new_jobs.push((job.clone(), cmdline.clone()));
+                }
+            }
+        }
         self.term.take_command_events();
         self.term.take_dirty();
         self.term.take_replies()
@@ -375,6 +401,58 @@ const IDLE_EXIT: Duration = Duration::from_secs(20);
 
 /// Run the host on `path` until it has had no shells and no app for a while.
 pub fn run(path: &Path) -> io::Result<()> {
+    run_with(path, |session, key, title, subtitle, body| notify::post_detached(session, key, title, subtitle, body))
+}
+
+/// What the host tells about an ended job: the shell it was submitted in, a
+/// key for it, and the title, subtitle and body.
+type Tell = fn(u64, &str, &str, &str, &str);
+
+/// Watch the jobs submitted in the host's shells, every so often while any
+/// is going, and `tell` of the ones that end while no app shows their shell.
+fn watch_jobs(host: Arc<Mutex<Host>>, tell: Tell) {
+    let mut watcher = jobwatch::Watcher::default();
+    let mut told = jobwatch::Told::default();
+    let poll = std::env::var("TACHYON_JOB_POLL_MS").ok().and_then(|v| v.parse().ok()).map(Duration::from_millis).unwrap_or(jobwatch::POLL);
+    let mut last = Instant::now() - poll;
+    loop {
+        std::thread::sleep((poll / 6).max(Duration::from_millis(50)));
+        // Jobs submitted since the last look.
+        let sessions: Vec<Arc<Session>> = host.lock().sessions.values().cloned().collect();
+        for s in &sessions {
+            for (job, cmdline) in std::mem::take(&mut s.term.lock().new_jobs) {
+                crate::log!("host: watching {} from session {}", job.title(), s.id);
+                watcher.add(s.id, job, cmdline, Instant::now());
+            }
+        }
+        if watcher.is_empty() || last.elapsed() < poll {
+            continue;
+        }
+        last = Instant::now();
+        for e in watcher.poll(Instant::now(), &jobwatch::run_command) {
+            // A window showing its shell has the job's tab, receipt and
+            // notifications: only with none does the host tell.
+            let shown = host.lock().sessions.get(&e.session).cloned().is_some_and(|s| {
+                let mut client = s.client.lock();
+                // An app that quit while its shell was quiet: nothing has
+                // been written to find out yet.
+                if client.as_ref().is_some_and(|c| !alive(c)) {
+                    *client = None;
+                    s.attached.store(false, Ordering::Release);
+                }
+                client.is_some()
+            });
+            crate::log!("host: {} ended ({}), {}", e.job.title(), e.summary, if shown { "an app shows it" } else { "telling" });
+            if !shown && told.first_time(&e.job, Instant::now()) {
+                let (title, subtitle, body) = jobwatch::notification(&e);
+                tell(e.session, &e.job.id, &title, &subtitle, &body);
+            }
+        }
+    }
+}
+
+/// [`run`], telling of ended jobs through `tell`.
+fn run_with(path: &Path, tell: Tell) -> io::Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         libc::umask(0o077);
@@ -386,6 +464,8 @@ pub fn run(path: &Path) -> io::Result<()> {
     let listener = UnixListener::bind(path)?;
     crate::log!("host: listening on {}", path.display());
     let host = Arc::new(Mutex::new(Host { next_id: 1, idle_since: Some(Instant::now()), ..Host::default() }));
+    let jobs_host = Arc::clone(&host);
+    std::thread::Builder::new().name("tachyon-host-jobs".into()).spawn(move || watch_jobs(jobs_host, tell))?;
 
     let watcher = Arc::clone(&host);
     let socket = path.to_path_buf();
@@ -520,6 +600,8 @@ fn spawn_session(host: &Arc<Mutex<Host>>, conn: &UnixStream, req: &[String]) -> 
                 processor: Processor::new(),
                 size: (cols as u16, rows as u16),
                 awake: false,
+                lines: lens::LineSplitter::default(),
+                new_jobs: Vec::new(),
             }),
         });
         h.sessions.insert(id, Arc::clone(&s));
@@ -847,6 +929,113 @@ mod tests {
         // Keys still reach it, and its output still comes here.
         s.pty.write(b"hi\n").unwrap();
         assert!(read_until(&s.pty, "got hi").contains("got hi"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the host told, in the test below.
+    static TOLD: parking_lot::Mutex<Vec<(u64, String, String, String)>> = parking_lot::Mutex::new(Vec::new());
+
+    fn capture(session: u64, _key: &str, title: &str, subtitle: &str, body: &str) {
+        TOLD.lock().push((session, title.into(), subtitle.into(), body.into()));
+    }
+
+    /// A job submitted in a shell, ending while no app shows the shell: the
+    /// host tells, once, with the job and the command that submitted it.
+    #[test]
+    fn a_job_that_ends_with_the_app_closed_is_told() {
+        let dir = std::env::temp_dir().join(format!("tachyon-jobs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stand-in `nexus`: `jobs --all` prints what the state file says.
+        let state = dir.join("state");
+        std::fs::write(&state, "j-0000abcd   running    forge    python train.py\n").unwrap();
+        let stub = dir.join("nexus");
+        std::fs::write(&stub, format!("#!/bin/sh\ncat '{}'\n", state.display())).unwrap();
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // SAFETY: tests that read these don't run concurrently with setting them.
+        unsafe {
+            std::env::set_var("TACHYON_NEXUS", &stub);
+            std::env::set_var("TACHYON_JOB_POLL_MS", "300");
+        }
+        let path = dir.join("h.sock");
+        let p = path.clone();
+        std::thread::spawn(move || run_with(&p, capture));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let app = loop {
+            match Client::connect_to(&path, false) {
+                Ok(c) => break c,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("no host: {e}"),
+            }
+        };
+        // A shell that submits, as `nexus gpu --detach` prints it, marked by
+        // shell integration as the running command.
+        let script = r#"printf '\033]133;A\007$ \033]133;B\007\033]133;C;cmdline=nexus gpu --detach python train.py\007j-0000abcd\n'; sleep 30"#;
+        let s = app.spawn(60, 10, 100, "/bin/sh", &["-c".to_string(), script.to_string()], false, &[], None).unwrap();
+        let session = s.id;
+        assert!(read_until(&s.pty, "j-0000abcd").contains("j-0000abcd"));
+        // The app closes, the job runs on, then ends.
+        drop(s);
+        drop(app);
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(TOLD.lock().is_empty(), "still running: nothing to tell");
+        std::fs::write(&state, "j-0000abcd   failed     forge    python train.py  out of memory\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while TOLD.lock().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let told = TOLD.lock().clone();
+        assert_eq!(told.len(), 1, "{told:?}");
+        let (who, title, subtitle, body) = &told[0];
+        assert_eq!(*who, session);
+        assert_eq!(title, "nexus j-0000abcd didn't finish");
+        assert!(subtitle.starts_with("failed on forge: python train.py out of memory"), "{subtitle}");
+        assert_eq!(body, "nexus gpu --detach python train.py");
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(TOLD.lock().len(), 1, "told once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real thing, with the app bundle's own host (`TACHYON_HOST_BIN`):
+    /// an obviously fake job ends with no app attached, and the host posts a
+    /// macOS notification. Look in its log (`TACHYON_LOG`) for "told".
+    #[test]
+    #[ignore]
+    fn bundle_host_posts_a_notification() {
+        let Some(bin) = std::env::var_os("TACHYON_HOST_BIN") else { return };
+        let dir = std::env::temp_dir().join(format!("tjn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state");
+        std::fs::write(&state, "j-0000abcd   running    forge    tachyon-notification-test\n").unwrap();
+        let stub = dir.join("nexus");
+        std::fs::write(&stub, format!("#!/bin/sh\ncat '{}'\n", state.display())).unwrap();
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let path = dir.join("h.sock");
+        let mut host = std::process::Command::new(bin)
+            .arg("--host")
+            .arg(&path)
+            .env("TACHYON_NEXUS", &stub)
+            .env("TACHYON_JOB_POLL_MS", "500")
+            .env("TACHYON_LOG", "1")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let app = loop {
+            match Client::connect_to(&path, false) {
+                Ok(c) => break c,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => panic!("no host: {e}"),
+            }
+        };
+        let script = r#"printf '\033]133;A\007$ \033]133;B\007\033]133;C;cmdline=nexus gpu --detach echo tachyon-notification-test\007j-0000abcd\n'; sleep 20"#;
+        let s = app.spawn(60, 10, 100, "/bin/sh", &["-c".to_string(), script.to_string()], false, &[], None).unwrap();
+        assert!(read_until(&s.pty, "j-0000abcd").contains("j-0000abcd"));
+        drop(s);
+        drop(app);
+        std::thread::sleep(Duration::from_millis(1200));
+        std::fs::write(&state, "j-0000abcd   finished   forge    tachyon-notification-test\n").unwrap();
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = host.kill();
+        let _ = host.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
