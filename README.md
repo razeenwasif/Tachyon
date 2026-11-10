@@ -145,6 +145,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
+| ⌘-click / ⌥⌘-click | Open a URL, a file in Quick Look, or a traceback's file:line in your editor / any file in your editor |
 | ⌥⌘I | Ask Fairy about the screen (her card at the bottom right) |
 | ⌥⌘O / ⌥⌘K | Copy a command's output (the selected one's, or the last) / fold or unfold it |
 | ⌥⌘T | Reopen the tab, pane or window's tab closed last (kept ten minutes, shells running) |
@@ -176,8 +177,17 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘J, or ⌘-click a job id | Follow the job this tab submitted last, or that one, in its own tab |
 
 **⌘-click** a file path to see it in Quick Look (an image, a CSV, a PDF) or a
-URL to open it. Paths are taken from the tab's folder, and `file:line:col`
-suffixes from compilers are dropped. **Secure Keyboard Entry** turns on by itself
+URL to open it. Paths are taken from the tab's folder. A path at a line opens
+in your editor at that line instead: a Python traceback's
+`File "train.py", line 142` (anywhere from `File` to the number, even when
+the line wraps), a compiler's or pytest's `src/main.rs:42:7`, a stack trace's
+`at f (/app/server.js:10:5)`. ⌥⌘-click opens any file in the editor. The
+editor is the `editor` setting: `auto` (the default) takes the first of Zed,
+VS Code, Cursor and Sublime Text that's installed, through their own
+command-line tools, else `$VISUAL`/`$EDITOR`, else nvim or vim; or name one
+(`zed`, `code`, `cursor`, `subl`, `xcode`, `nvim`, `hx`, `emacs`…). A
+terminal editor opens in a new tab, as does a command of your own with
+`{file}`, `{line}` and `{col}` in it. **Secure Keyboard Entry** turns on by itself
 while a program reads a password (sudo, ssh, getpass), so other apps can't read
 those keystrokes, and turns off after; the prompt line says so while it's on.
 

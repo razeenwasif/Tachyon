@@ -18,6 +18,7 @@
 mod boxdraw;
 mod chart;
 mod dock;
+mod editor;
 mod fairy;
 mod font;
 mod images;
@@ -1541,6 +1542,13 @@ impl Pane {
         Pane::with(id, pty, cfg, cols, rows, job, false)
     }
 
+    /// A shell that types `run` at its first prompt (an editor opened at a
+    /// traceback's line), in `cwd`.
+    fn start_running(cfg: &Config, cols: usize, rows: usize, run: &str, cwd: Option<&str>) -> Result<Pane, String> {
+        let (id, pty) = open_session(cfg, cols, rows, Some(run), cwd)?;
+        Pane::with(id, pty, cfg, cols, rows, None, false)
+    }
+
     /// A shell the session host kept while the app was closed.
     fn attach(cfg: &Config, r: host::Remote) -> Result<Pane, String> {
         let awake = r.awake;
@@ -1628,6 +1636,55 @@ impl Tab {
             }
             p.rect = rect;
         }
+    }
+}
+
+/// Open `path` at `line` in the editor from the config: a GUI editor in the
+/// background, a terminal one in a new tab of window `window`.
+fn open_in_editor(window: u64, path: std::path::PathBuf, line: Option<u32>, col: Option<u32>, cwd: Option<String>) {
+    let setting = with_app(|a| a.cfg.macos.editor.clone()).unwrap_or_default();
+    let workspace = NSWorkspace::sharedWorkspace();
+    let bundle = |id: &str| {
+        workspace
+            .URLForApplicationWithBundleIdentifier(&NSString::from_str(id))
+            .and_then(|u| u.path())
+            .map(|p| std::path::PathBuf::from(p.to_string()))
+    };
+    let env = |k: &str| std::env::var(k).ok();
+    match editor::launch(&setting, &path, line, col, bundle, env, |p| p.exists()) {
+        Some(editor::Launch::Spawn(program, args)) => {
+            crate::log!("editor: {} {:?}", program.display(), args);
+            let started = std::process::Command::new(&program)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match started {
+                // Reaped off the main thread; an editor's tool returns quickly.
+                Ok(mut child) => {
+                    let _ = std::thread::Builder::new().name("tachyon-editor".into()).spawn(move || child.wait());
+                }
+                Err(e) => crate::log::force(&format!("editor: couldn't start {}: {e}", program.display())),
+            }
+        }
+        Some(editor::Launch::Tab(command)) => {
+            crate::log!("editor: new tab running {command}");
+            with_app(|app| {
+                let cfg = &app.cfg;
+                let w = app.windows.iter_mut().find(|w| w.id == window)?;
+                let (cols, rows) = w.grid;
+                match Pane::start_running(cfg, cols.max(1), rows.max(1), &command, cwd.as_deref()) {
+                    Ok(pane) => {
+                        w.save_live();
+                        w.add_tab(Tab::new(pane));
+                    }
+                    Err(e) => crate::log::force(&format!("editor: couldn't open a tab: {e}")),
+                }
+                Some(())
+            });
+        }
+        None => crate::log::force(&format!("editor: none found for `{setting}`")),
     }
 }
 
@@ -2169,10 +2226,25 @@ impl TermWindow {
     /// Returns false when there's nothing there to open.
     fn open_under_pointer(&mut self, event: &NSEvent) -> bool {
         let (pos, _) = self.cell_at(event);
-        let (word, cwd) = {
+        let (word, cwd, row_text, at) = {
             let term = self.term.lock();
-            (selection::word_at(&term, pos.line, pos.cell), term.cwd.clone())
+            let cols = term.cols();
+            // The whole line the click is in, wrapped rows joined: a long
+            // path wraps a traceback's line over two.
+            let g = term.grid();
+            let mut first = pos.line;
+            while first > 0 && g.line(first - 1).wrapped {
+                first -= 1;
+            }
+            let mut last = pos.line;
+            while last + 1 < g.total_lines() && g.line(last).wrapped {
+                last += 1;
+            }
+            let text = term.text_range(first, 0, last, cols.saturating_sub(1)).replace('\n', "");
+            (selection::word_at(&term, pos.line, pos.cell), term.cwd.clone(), text, (pos.line - first) * cols + pos.cell)
         };
+        // ⌥⌘-click: a file goes to the editor, line or not.
+        let to_editor = event.modifierFlags().contains(NSEventModifierFlags::Option);
         // A job id this tab submitted: follow it.
         let id = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
         let job = self.term.lock().jobs.iter().rev().find(|j| j.id == id).cloned();
@@ -2182,7 +2254,11 @@ impl TermWindow {
             return true;
         }
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let target = links::resolve(&word, cwd.as_deref().map(std::path::Path::new), home.as_deref(), |p| p.exists());
+        let (dir, home) = (cwd.as_deref().map(std::path::Path::new), home.as_deref());
+        // A Python traceback's `File "x.py", line 142` first: the line is
+        // beside the file, not on it.
+        let target = links::traceback(&row_text, at, dir, home, |p| p.is_file())
+            .or_else(|| links::resolve(&word, dir, home, |p| p.exists()));
         match target {
             Some(links::Target::Url(u)) => {
                 if let Some(url) = NSURL::URLWithString(&NSString::from_str(&u)) {
@@ -2190,7 +2266,15 @@ impl TermWindow {
                 }
                 true
             }
-            Some(links::Target::Path(path)) => {
+            // At a line (a traceback, a compiler's error): the editor.
+            Some(links::Target::File { path, line, col }) if (line.is_some() || to_editor) && path.is_file() => {
+                // After this event, outside the app-state borrow: it reads
+                // the config, and may open a tab.
+                let window = self.id;
+                DispatchQueue::main().exec_async(move || open_in_editor(window, path, line, col, cwd));
+                true
+            }
+            Some(links::Target::File { path, .. }) => {
                 // After this event, outside the app-state borrow: the panel
                 // taking key status calls back into the window delegate.
                 DispatchQueue::main().exec_async(move || quick_look(path));
