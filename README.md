@@ -150,7 +150,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌥⌘L | Latency ledger: where each keystroke's delay goes |
 | ⌥⌘C | Training chart: the newest command's metrics, plotted (or click them) |
 | ⌥⌘F | Full screen around the notch, or back |
-| → or End, ⌥→ | Take the grey suggestion after the cursor, or one word of it |
+| Tab, → or End, ⌥→ | Take the grey suggestion after the cursor, or one word of it |
 | ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
 | ⌘D / ⌘⇧D | Split the pane: a new shell to the right / below, in the same folder |
 | ⌘⌥← ⌘⌥→ ⌘⌥↑ ⌘⌥↓, or click | Focus the pane on that side, or the one clicked |
@@ -365,8 +365,9 @@ they're there, so they last until it repaints (switching windows, for one),
 as in kitty and iTerm2 themselves. In tmux, prefer a tool's sixel output.
 
 **Suggestions.** As you type at a prompt, Tachyon shows in grey the rest of a
-command you've run before; → or End (or ⌃F) types it in for you, ⌥→ one word
-of it. Suggestions come from your shell's history file (zsh, bash or fish),
+command you've run before; Tab, → or End (or ⌃F) types it in for you, ⌥→ one
+word of it. Tab takes it only while one shows; otherwise Tab is the shell's
+completion as usual. Suggestions come from your shell's history file (zsh, bash or fish),
 read at launch, and from every command run in any Tachyon tab, recorded with
 its folder: the newest match wins, one run in the same folder first. Tachyon's
 record is `~/Library/Application Support/Tachyon/history`, readable only by
