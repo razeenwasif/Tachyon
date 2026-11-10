@@ -932,6 +932,23 @@ impl TachyonWindow {
     }
 }
 
+define_class!(
+    /// The quick terminal's window: a panel that takes keys without making
+    /// Tachyon the active app, as Spotlight does, so Tachyon's other windows
+    /// (and Stage Manager's stage) stay as they were.
+    #[unsafe(super(objc2_app_kit::NSPanel, NSWindow, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TachyonPanel"]
+    struct TachyonPanel;
+
+    impl TachyonPanel {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key(&self) -> bool {
+            true
+        }
+    }
+);
+
 impl TachyonView {
     fn new(mtm: MainThreadMarker, frame: NSRect, id: u64) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(WindowId { id: Cell::new(id) });
@@ -2603,7 +2620,6 @@ impl TermWindow {
             NSSize::new(w, h + HIDDEN),
         );
         self.quick_inset = HIDDEN + notch.max(0.0) + 4.0;
-        self.window.setStyleMask(NSWindowStyleMask::Borderless);
         // Above the menu bar, beside the notch.
         self.window.setLevel(25);
         self.window.setCollectionBehavior(
@@ -2622,7 +2638,9 @@ impl TermWindow {
         self.quick_shown = true;
         self.window.makeKeyAndOrderFront(None);
         self.window.makeFirstResponder(Some(&self.view));
-        NSApplication::sharedApplication(mtm).activate();
+        // A non-activating panel: it takes the keys while the app you were in
+        // stays active, so Tachyon's other windows don't come forward.
+        let _ = mtm;
         objc2_app_kit::NSAnimationContext::beginGrouping();
         objc2_app_kit::NSAnimationContext::currentContext().setDuration(0.16);
         let animator: Retained<NSWindow> = unsafe { msg_send![&*self.window, animator] };
@@ -4389,6 +4407,7 @@ impl App {
         &mut self,
         mtm: MainThreadMarker,
         restored: Option<(Vec<Tab>, usize)>,
+        quick: bool,
     ) -> Result<(Retained<NSWindow>, Retained<TachyonView>, u64), String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -4410,16 +4429,32 @@ impl App {
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable
             | NSWindowStyleMask::FullSizeContentView;
-        let window: Retained<TachyonWindow> = unsafe {
-            msg_send![
-                super(TachyonWindow::alloc(mtm).set_ivars(())),
-                initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), content),
-                styleMask: style,
-                backing: NSBackingStoreType::Buffered,
-                defer: false,
-            ]
+        let window: Retained<NSWindow> = if quick {
+            let panel: Retained<TachyonPanel> = unsafe {
+                msg_send![
+                    super(TachyonPanel::alloc(mtm).set_ivars(())),
+                    initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), content),
+                    styleMask: NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+                    backing: NSBackingStoreType::Buffered,
+                    defer: false,
+                ]
+            };
+            let panel: Retained<objc2_app_kit::NSPanel> = Retained::into_super(panel);
+            // Tachyon is never the active app while it shows.
+            panel.setHidesOnDeactivate(false);
+            Retained::into_super(panel)
+        } else {
+            let window: Retained<TachyonWindow> = unsafe {
+                msg_send![
+                    super(TachyonWindow::alloc(mtm).set_ivars(())),
+                    initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), content),
+                    styleMask: style,
+                    backing: NSBackingStoreType::Buffered,
+                    defer: false,
+                ]
+            };
+            Retained::into_super(window)
         };
-        let window: Retained<NSWindow> = Retained::into_super(window);
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str("Tachyon"));
         // Edge-to-edge: no visible title bar, content runs to the top edge.
@@ -4734,7 +4769,7 @@ fn open_window() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    match with_app(|app| app.create_window(mtm, None)) {
+    match with_app(|app| app.create_window(mtm, None, false)) {
         Some(Ok((window, view, id))) => {
             with_window(id, |w| {
                 w.apply_appearance();
@@ -4811,7 +4846,7 @@ fn toggle_quick() {
             }
             id
         }
-        None => match with_app(|app| app.create_window(mtm, None)) {
+        None => match with_app(|app| app.create_window(mtm, None, true)) {
             Some(Ok((_, _, id))) => {
                 with_app(|a| a.quick = Some(id));
                 with_window(id, |w| {
@@ -4936,7 +4971,7 @@ fn reopen_closed(window: Option<u64>) {
                 w.request_redraw();
             });
         }
-        None => match with_app(|app| app.create_window(mtm, Some((vec![tab], 0)))) {
+        None => match with_app(|app| app.create_window(mtm, Some((vec![tab], 0)), false)) {
             Some(Ok((window, view, id))) => {
                 with_window(id, |w| {
                     w.apply_appearance();
@@ -5478,7 +5513,7 @@ fn restore_sessions(mtm: MainThreadMarker) -> bool {
             continue;
         }
         let active = w.active.min(tabs.len() - 1);
-        match with_app(|app| app.create_window(mtm, Some((tabs, active)))) {
+        match with_app(|app| app.create_window(mtm, Some((tabs, active)), w.quick)) {
             Some(Ok((window, view, id))) => {
                 if let Some(frame) = w.frame {
                     window.setFrame_display(frame, false);

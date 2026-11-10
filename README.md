@@ -396,7 +396,9 @@ as in kitty and iTerm2 themselves. In tmux, prefer a tool's sixel output.
 
 **Quick terminal.** ⌃` from any app drops a terminal down from the top of the
 screen the pointer is on, out of the notch on a MacBook: over whatever you're
-doing, full-screen apps included, on every Space. ⌃` again, or a click
+doing, full-screen apps included, on every Space. It's a panel that takes the
+keys without making Tachyon the active app, as Spotlight does, so Tachyon's
+other windows (and Stage Manager's stage) stay where they were. ⌃` again, or a click
 elsewhere, puts it away, and the hotkey gives focus back to the app you were
 in. It keeps its shell (and its tabs and splits) between showings, and with
 the session host, across restarts too, coming back hidden until the hotkey.
