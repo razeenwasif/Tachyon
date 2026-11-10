@@ -211,6 +211,13 @@ theme.bold_is_bright = false
 # right end). false gives the row back to the grid.
 # window.hints = true
 
+# macOS: the editor Cmd-clicking a traceback's file:line opens (and
+# Option-Cmd-click on any file). auto takes the first installed of Zed, VS
+# Code, Cursor and Sublime Text, else $VISUAL/$EDITOR, else nvim or vim. Or:
+# zed, code, cursor, subl, xcode, nvim, vim, hx, emacs, nano, micro, or a
+# command of your own with {file}, {line} and {col}, run in a new tab.
+# editor = auto
+
 # macOS: Fairy, the assistant on this Mac: a button at the bottom right (and
 # Option-Cmd-I) opens a card where she answers about what's on the screen. She
 # listens on a private socket in her data folder; fairy.socket points elsewhere.

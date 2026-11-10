@@ -391,11 +391,14 @@ pub struct MacConfig {
     /// socket is (empty for where she keeps it).
     pub fairy: bool,
     pub fairy_socket: String,
+    /// The editor ⌘-clicks on tracebacks open: auto, zed, code, cursor,
+    /// subl, xcode, a terminal editor, or a command with {file} and {line}.
+    pub editor: String,
 }
 
 impl Default for MacConfig {
     fn default() -> Self {
-        MacConfig { option_as_meta: OptionAsMeta::default(), notify_after_secs: 10, fairy: true, fairy_socket: String::new() }
+        MacConfig { option_as_meta: OptionAsMeta::default(), notify_after_secs: 10, fairy: true, fairy_socket: String::new(), editor: "auto".into() }
     }
 }
 
@@ -633,6 +636,7 @@ impl Config {
             "window.hints" => self.window.hints = parse_bool(value)?,
             "fairy.enabled" => self.macos.fairy = parse_bool(value)?,
             "fairy.socket" => self.macos.fairy_socket = value.to_string(),
+            "editor" => self.macos.editor = value.to_string(),
             "shell.args" => {
                 self.shell.args = value
                     .split_whitespace()
