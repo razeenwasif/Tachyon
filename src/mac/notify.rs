@@ -86,6 +86,20 @@ impl Notifier {
         Some(Notifier { center, _delegate: delegate })
     }
 
+    /// Ask macOS for permission to notify, if it hasn't been asked: the
+    /// session host, which can't ask, posts under the same permission.
+    pub fn ask_permission(&self) {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let done = RcBlock::new(|granted: Bool, _error: *mut NSError| {
+            crate::log!("notifications: {}", if granted.as_bool() { "allowed" } else { "not allowed" });
+        });
+        self.center
+            .requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &done);
+    }
+
     /// Post one notification. The first time, macOS asks whether Tachyon may
     /// notify; the notification follows if you allow it.
     pub fn post(&self, tab: u64, cmd: u32, title: &str, subtitle: &str, body: &str) {
@@ -115,6 +129,43 @@ impl Notifier {
         self.center
             .requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &done);
     }
+}
+
+/// Post a notification from the session host, which has no app around it:
+/// a cluster job that ended while Tachyon was closed. Clicking it opens
+/// Tachyon at the job's shell (`session`, which is its tab's pane id).
+pub fn post_detached(session: u64, key: &str, title: &str, subtitle: &str, body: &str) {
+    if NSBundle::mainBundle().bundleIdentifier().is_none() {
+        crate::log!("notifications: no bundle, so none for {title}");
+        return;
+    }
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    let content = UNMutableNotificationContent::new();
+    content.setTitle(&NSString::from_str(title));
+    if !subtitle.is_empty() {
+        content.setSubtitle(&NSString::from_str(subtitle));
+    }
+    content.setBody(&NSString::from_str(body));
+    content.setSound(Some(&UNNotificationSound::defaultSound()));
+    content.setThreadIdentifier(&NSString::from_str(&format!("tachyon.tab.{session}")));
+    let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+        &NSString::from_str(&format!("tachyon.tab.{session}.job.{key}")),
+        &content,
+        None,
+    );
+    let title = title.to_string();
+    let posting = center.clone();
+    let done = RcBlock::new(move |granted: Bool, error: *mut NSError| {
+        if granted.as_bool() {
+            posting.addNotificationRequest_withCompletionHandler(&request, None);
+            crate::log!("host: told: {title}");
+        } else {
+            // SAFETY: the error, if any, lives for the handler's call.
+            let why = unsafe { error.as_ref() }.map(|e| e.localizedDescription().to_string()).unwrap_or_default();
+            crate::log!("notifications: not allowed ({why})");
+        }
+    });
+    center.requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &done);
 }
 
 #[cfg(test)]

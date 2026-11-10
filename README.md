@@ -308,7 +308,15 @@ with OSC 133, which gives:
   opens a tab that follows the job's log with `shell/tachyon-job`, named after
   its state (`nexus j-1a2b3c4d · running on forge`, then `· finished` or
   `· failed`), with a receipt and a notification when it ends. A Slurm job
-  submitted over ssh is followed through the same ssh;
+  submitted over ssh is followed through the same ssh. Every submission is
+  watched by the session host too, so a job that ends while Tachyon is closed
+  still gets a notification: `Nexus j-1a2b3c4d didn't finish`, how it ended
+  (`failed on forge: out of memory`), and the command that submitted it; a
+  click opens Tachyon at that shell. The host checks every 30 seconds while
+  any job is going, with `nexus jobs --all`, or `squeue` then `sacct` (over the
+  submission's ssh, in batch mode so it never waits for a password). The first
+  job Tachyon sees makes macOS ask whether it may notify, since only the app
+  can ask;
 - **rerun diff**: run a command again (numbers in the command line ignored, so
   `train.py --lr 3e-4` then `--lr 1e-3` counts) and the lines that differ from
   the last run get an amber mark in the gutter, with `2 lines changed` (or `same
