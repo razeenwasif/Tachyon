@@ -207,6 +207,7 @@ struct Slot {
     bg: Option<Retained<Buffer>>,
     glyphs: Option<Retained<Buffer>>,
     overlay: Option<Retained<Buffer>>,
+    panel_glyphs: Option<Retained<Buffer>>,
     in_flight: Option<Retained<CommandBuffer>>,
 }
 
@@ -268,6 +269,22 @@ pub struct Renderer {
     /// Inline images this frame, by image id, drawn in order.
     images: Vec<(u64, ImageInstance)>,
     textures: FxHashMap<u64, ImageTexture>,
+    /// A panel drawn over everything (the training chart): its picture,
+    /// where, and its text.
+    panel_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    panel_quad: Option<ImageInstance>,
+    panel_glyphs: Vec<GlyphInstance>,
+}
+
+/// A panel over a pane (the training chart), placed in the window's cells.
+pub struct Panel<'a> {
+    pub col: usize,
+    pub row: usize,
+    /// Its picture, when it has changed since the last frame.
+    pub pixels: Option<&'a images::Pixels>,
+    pub labels: &'a [super::chart::Label],
+    pub cols: usize,
+    pub rows: usize,
 }
 
 impl Renderer {
@@ -307,6 +324,9 @@ impl Renderer {
             overlay: Vec::new(),
             images: Vec::new(),
             textures: FxHashMap::default(),
+            panel_texture: None,
+            panel_quad: None,
+            panel_glyphs: Vec::new(),
         })
     }
 
@@ -429,6 +449,32 @@ impl Renderer {
     }
 
     /// Switch colours, for Light and Dark Mode. The caller redraws.
+    /// The theme's background and foreground.
+    pub fn theme_colors(&self) -> ([u8; 3], [u8; 3]) {
+        (self.cfg.theme.background, self.cfg.theme.foreground)
+    }
+
+    /// Lay out a panel for this frame, or none.
+    fn build_panel(&mut self, panel: Option<&Panel>) {
+        self.panel_glyphs.clear();
+        let Some(p) = panel else {
+            self.panel_quad = None;
+            return;
+        };
+        if let Some(px) = p.pixels {
+            self.panel_texture = self.make_texture(px);
+        }
+        let m = self.fonts.metrics;
+        let (x, y) = self.pane_origin(p.col, p.row);
+        self.panel_quad = Some(ImageInstance { dst: [x, y, p.cols as f32 * m.width, p.rows as f32 * m.height], uv: [0.0, 0.0, 1.0, 1.0] });
+        let start = self.glyphs.len();
+        for l in p.labels {
+            self.push_text(&l.text, x + l.col as f32 * m.width, y + l.row as f32 * m.height, l.color);
+        }
+        let tail = self.glyphs.split_off(start);
+        self.panel_glyphs = tail;
+    }
+
     pub fn set_theme(&mut self, theme: &crate::config::ThemeConfig) {
         self.palette = theme.palette();
         self.cfg.theme = theme.clone();
@@ -484,6 +530,7 @@ impl Renderer {
         panes: &[PaneFrame],
         strip: Option<&Strip>,
         dividers: &[[f32; 4]],
+        panel: Option<&Panel>,
         presented: Option<Box<dyn Fn(f64)>>,
     ) {
         if self.atlas.overflowed {
@@ -532,6 +579,7 @@ impl Renderer {
             let cols = self.grid_size_for(self.size.0, self.size.1).0;
             self.build_strip(strip, cols);
         }
+        self.build_panel(panel);
 
         let Some(drawable) = self.layer.nextDrawable() else {
             crate::log!("render: no drawable");
@@ -550,6 +598,7 @@ impl Renderer {
         let bg = upload(device, &mut slot.bg, &self.bg);
         let glyphs = upload(device, &mut slot.glyphs, &self.glyphs);
         let overlay = upload(device, &mut slot.overlay, &self.overlay);
+        let panel_glyphs = upload(device, &mut slot.panel_glyphs, &self.panel_glyphs);
 
         let theme = &self.cfg.theme;
         let opacity = self.cfg.window.opacity;
@@ -631,6 +680,17 @@ impl Renderer {
         unsafe { enc.setFragmentTexture_atIndex(Some(&self.atlas.texture), 0) };
         draw(&self.gpu.glyph_pso, glyphs, self.glyphs.len());
         draw(&self.gpu.rect_pso, overlay, self.overlay.len());
+        // A panel over everything: its picture, then its text.
+        if let (Some(quad), Some(tex)) = (&self.panel_quad, &self.panel_texture) {
+            enc.setRenderPipelineState(&self.gpu.image_pso);
+            unsafe {
+                enc.setVertexBytes_length_atIndex(NonNull::from(quad).cast(), size_of::<ImageInstance>(), 0);
+                enc.setFragmentTexture_atIndex(Some(tex), 0);
+                enc.drawPrimitives_vertexStart_vertexCount_instanceCount(MTLPrimitiveType::TriangleStrip, 0, 4, 1);
+                enc.setFragmentTexture_atIndex(Some(&self.atlas.texture), 0);
+            }
+            draw(&self.gpu.glyph_pso, panel_glyphs, self.panel_glyphs.len());
+        }
         enc.endEncoding();
 
         let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
@@ -667,6 +727,28 @@ impl Renderer {
         }
     }
 
+    /// A texture holding `px` (premultiplied sRGB).
+    fn make_texture(&self, px: &images::Pixels) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm_sRGB,
+                px.width as usize,
+                px.height as usize,
+                false,
+            )
+        };
+        desc.setUsage(MTLTextureUsage::ShaderRead);
+        let tex = self.gpu.device.newTextureWithDescriptor(&desc)?;
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize { width: px.width as usize, height: px.height as usize, depth: 1 },
+        };
+        unsafe {
+            tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(region, 0, NonNull::new(px.data.as_ptr() as *mut _)?, px.width as usize * 4)
+        };
+        Some(tex)
+    }
+
     /// Make sure there's a texture for `image` at about `want` pixels:
     /// decoded again when it shows at a quite different size (the font size
     /// changed, or the window moved to another display).
@@ -680,31 +762,7 @@ impl Renderer {
                 return;
             }
         }
-        let texture = images::decode(image, want.0, want.1).and_then(|px| {
-            let desc = unsafe {
-                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                    MTLPixelFormat::RGBA8Unorm_sRGB,
-                    px.width as usize,
-                    px.height as usize,
-                    false,
-                )
-            };
-            desc.setUsage(MTLTextureUsage::ShaderRead);
-            let tex = self.gpu.device.newTextureWithDescriptor(&desc)?;
-            let region = MTLRegion {
-                origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                size: MTLSize { width: px.width as usize, height: px.height as usize, depth: 1 },
-            };
-            unsafe {
-                tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                    region,
-                    0,
-                    NonNull::new(px.data.as_ptr() as *mut _)?,
-                    px.width as usize * 4,
-                )
-            };
-            Some(tex)
-        });
+        let texture = images::decode(image, want.0, want.1).and_then(|px| self.make_texture(&px));
         if texture.is_none() {
             crate::log!("images: could not decode image {} ({}x{})", image.id, image.width, image.height);
         }
@@ -1419,6 +1477,9 @@ pub struct Decor {
     pub ghost: Option<(usize, usize, String)>,
     /// Find matches on screen: (row, first column, end column, current).
     pub highlights: Vec<(usize, usize, usize, bool)>,
+    /// Notes showing a command's metrics: (row, command, first column, end
+    /// column), where a click opens its chart.
+    pub metrics: Vec<(usize, u32, usize, usize)>,
 }
 
 /// What the cursor layer should show: a rectangle in drawable pixels and, for

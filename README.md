@@ -148,6 +148,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘Q / ⌥⌘Q | Quit, keeping the shells for next time / quit and end them |
 | ⌥⌘A | Keep the Mac awake while this pane's command runs (or its next one) |
 | ⌥⌘L | Latency ledger: where each keystroke's delay goes |
+| ⌥⌘C | Training chart: the newest command's metrics, plotted (or click them) |
 | ⌥⌘F | Full screen around the notch, or back |
 | → or End, ⌥→ | Take the grey suggestion after the cursor, or one word of it |
 | ⌘1–⌘8, ⌘9 | Show that tab, or the last one |
@@ -268,6 +269,16 @@ with OSC 133, which gives:
   `loss 0.398 ▇▆▅▄▃▂ · 48.2 it/s · 45%`. A tqdm bar's percentage also shows as
   a progress bar on the Dock icon. Every line of a training log is read; a flood
   like `cat` of a big file is only sampled, so it costs no throughput;
+- a **training chart**: click a command's metrics, or press ⌥⌘C for the newest
+  command with any, and a panel over the pane plots its whole run, live: each
+  metric in a plot of its own (up to four, the loss first), by the step the log
+  reports (`step=120`, `iter 300`, `'epoch': 0.5`) or else in order. A run of
+  the same command as before (numbers in the command line aside, so `--lr 3e-4`
+  and `--lr 1e-3` count) draws the last run's curves dashed beside its own, and
+  says what the last run had at the same step. A long run is thinned evenly to
+  a couple of thousand points, so its whole shape stays. Esc, ⌥⌘C or a click on
+  it closes it. `python3 scripts/train-demo.py --lr 3e-4`, then `--lr 1e-3`,
+  shows one;
 - **job tabs**: when a command submits a cluster job (`nexus cpu/gpu ...
   --detach` prints its `j-1a2b3c4d`; `sbatch` prints `Submitted batch job N`),
   its prompt line offers `⌘J follows j-1a2b3c4d`. ⌘J (or ⌘-click on the id)
