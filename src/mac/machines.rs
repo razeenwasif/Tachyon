@@ -155,13 +155,16 @@ Host *
 
 Host mini
     HostName 10.0.0.1
+
+Host amaterasu
+    HostName 192.168.68.70
 ";
 
     #[test]
     fn hosts_come_from_the_config_without_aliases_or_patterns() {
         let m = parse(CONFIG);
         let names: Vec<&str> = m.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, ["kagutsuchi", "kagutsuchi-lan", "forge", "raijin"]);
+        assert_eq!(names, ["kagutsuchi", "kagutsuchi-lan", "forge", "raijin", "amaterasu"]);
         assert_eq!(m[0].address, "100.97.247.34");
         assert_eq!(m[2], Machine { name: "forge".into(), address: "192.168.68.200".into(), port: 2222 });
         assert_eq!(m[3].port, 22);

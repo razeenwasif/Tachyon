@@ -22,6 +22,13 @@ pub const POLL: Duration = Duration::from_secs(60);
 /// Hosts that are the Neutrino server's Mac (`mini` names the same one).
 const SERVER_HOSTS: [&str; 4] = ["kagutsuchi", "kagutsuchi-lan", "mini", "mini-lan"];
 
+/// Whether `ntr` is installed here, for the card's button.
+pub fn installed() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:{}", std::env::var("PATH").unwrap_or_default());
+    path.split(':').any(|d| !d.is_empty() && std::path::Path::new(d).join("ntr").is_file())
+}
+
 /// Text without its terminal colours.
 fn plain(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

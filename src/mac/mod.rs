@@ -2140,8 +2140,10 @@ struct TermWindow {
     monitor: bool,
     monitor_button: Option<Retained<objc2_app_kit::NSButton>>,
     monitor_card: Option<MonitorCard>,
-    /// The Neutrino card (⌘⇧N).
+    /// The Neutrino card (⌘⇧N), and its button when `ntr` is installed.
     neutrino_card: Option<NeutrinoCard>,
+    neutrino_button: Option<Retained<objc2_app_kit::NSButton>>,
+    neutrino: bool,
     /// The quick terminal: borderless, dropping from the screen's top, and
     /// whether it's showing; the app that was in front, to go back to.
     quick: bool,
@@ -2386,7 +2388,7 @@ impl TermWindow {
         } else {
             Vec::new()
         };
-        let leftmost = [&self.monitor_button, &self.fairy_button].iter().filter_map(|b| b.as_ref()).map(|b| b.frame().origin.x).fold(f64::INFINITY, f64::min);
+        let leftmost = [&self.neutrino_button, &self.monitor_button, &self.fairy_button].iter().filter_map(|b| b.as_ref()).map(|b| b.frame().origin.x).fold(f64::INFINITY, f64::min);
         let hints_right = if leftmost.is_finite() { (leftmost * self.scale()) as f32 - 12.0 } else { self.renderer.padding_right_edge() };
         self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, panel.as_ref(), &hints, hints_right, presented);
         let overlay = match focus_at {
@@ -3114,12 +3116,44 @@ impl TermWindow {
 
     /// Put the Neutrino card above the bottom band, at the right.
     fn place_neutrino(&mut self) {
-        let Some(card) = &self.neutrino_card else { return };
+        if self.neutrino && self.neutrino_button.is_none() {
+            if let (Some(mtm), Some(icon)) = (
+                MainThreadMarker::new(),
+                objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str("arrow.triangle.branch"),
+                    Some(&NSString::from_str("Neutrino")),
+                ),
+            ) {
+                let target: &AnyObject = self.view.as_ref();
+                let button = unsafe { objc2_app_kit::NSButton::buttonWithImage_target_action(&icon, Some(target), Some(sel!(tachyonNeutrino:)), mtm) };
+                button.setBordered(false);
+                button.setToolTip(Some(&NSString::from_str("Neutrino (⌘⇧N)")));
+                self.view.addSubview(&button);
+                self.neutrino_button = Some(button);
+            }
+        }
         let scale = self.scale();
         let size = self.view.bounds().size;
         let (y0, h) = self.renderer.hints_rect();
         let band_bottom = (size.height * scale - (y0 + h) as f64).max(0.0) / scale;
-        card.place(size, band_bottom + h as f64 / scale, self.title_bar_height());
+        let band_h = h as f64 / scale;
+        let open = self.neutrino_card.as_ref().is_some_and(|c| !c.host.isHidden());
+        if let Some(b) = &self.neutrino_button {
+            // Left of the gauge, else of Fairy, else at the right end.
+            let pad_x = self.renderer.padding().0 as f64 / scale;
+            let right = [&self.monitor_button, &self.fairy_button]
+                .iter()
+                .filter_map(|b| b.as_ref())
+                .map(|b| b.frame().origin.x - 10.0)
+                .fold(size.width - pad_x, f64::min);
+            let side = 20.0;
+            b.setFrame(NSRect::new(NSPoint::new(right - side, band_bottom + (band_h - side) / 2.0), NSSize::new(side, side)));
+            // Highlighted while the card is open.
+            b.setContentTintColor(Some(&*if open { NSColor::controlAccentColor() } else { NSColor::secondaryLabelColor() }));
+        }
+        if let Some(card) = &self.neutrino_card {
+            card.place(size, band_bottom + band_h, self.title_bar_height());
+        }
     }
 
     /// Where `ntr` runs for the focused shell: here in its folder, or on the
@@ -3143,6 +3177,7 @@ impl TermWindow {
         if let Some(card) = self.neutrino_card.as_mut().filter(|c| !c.host.isHidden()) {
             card.host.setHidden(true);
             card.stop();
+            self.place_neutrino();
             return;
         }
         if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
@@ -3160,6 +3195,7 @@ impl TermWindow {
             card.host.setHidden(false);
             card.render(target);
         }
+        self.place_neutrino();
         let id = self.id;
         let running = Arc::new(AtomicBool::new(true));
         if let Some(card) = &mut self.neutrino_card {
@@ -3642,7 +3678,7 @@ impl TermWindow {
             self.place_capsule(strip);
         }
         // The band along the bottom: hints, and Fairy's button at its right.
-        self.renderer.set_hints_band(self.hints || self.fairy_socket.is_some() || self.monitor);
+        self.renderer.set_hints_band(self.hints || self.fairy_socket.is_some() || self.monitor || self.neutrino);
         self.place_fairy();
         self.place_monitor();
         self.place_neutrino();
@@ -5098,6 +5134,8 @@ impl App {
             monitor_button: None,
             monitor_card: None,
             neutrino_card: None,
+            neutrino_button: None,
+            neutrino: neutrino::installed(),
             quick: false,
             quick_shown: false,
             quick_inset: 0.0,

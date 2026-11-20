@@ -439,7 +439,7 @@ the startup disk, the battery and thermal state, and the six busiest of your
 processes with their CPU and memory. Nothing is read while it's closed.
 `monitor.enabled = false` hides the gauge.
 
-**Neutrino.** ⌘⇧N (View > Neutrino) opens a card for Neutrino, the git and
+**Neutrino.** The branch icon left of the gauge (lit while the card is open), ⌘⇧N or View > Neutrino opens a card for Neutrino, the git and
 CI server. The top half is the focused shell's repo, from the folder it
 reported with OSC 7: branch, ahead/behind its upstream, changed files and the
 repo's last five runs. The bottom half is `ntr inbox`: deploys waiting for
