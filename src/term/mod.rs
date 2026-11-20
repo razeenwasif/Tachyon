@@ -737,6 +737,18 @@ impl Term {
         self.cwd.as_deref()
     }
 
+    /// The ssh command running in this terminal, if one is.
+    pub fn ssh_command(&self) -> Option<&str> {
+        self.ssh_session.as_ref().map(|(cmd, _)| cmd.as_str())
+    }
+
+    /// Whether the folder in `cwd` was reported from another machine than
+    /// the one the ssh session started on: the far shell reports its own.
+    pub fn cwd_host(&self) -> Option<&str> {
+        let (_, from) = self.ssh_session.as_ref()?;
+        self.cwd_host.as_deref().filter(|h| from.as_deref() != Some(*h))
+    }
+
     pub fn running_cmdline(&self) -> Option<&str> {
         self.current_cmd
             .and_then(|id| self.commands.get(&id))
