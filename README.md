@@ -148,6 +148,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘-click / ⌥⌘-click | Open a URL, a file in Quick Look, or a traceback's file:line in your editor / any file in your editor |
 | ⌃` (from any app) | The quick terminal, dropping from the notch, or away again |
 | ⌥⌘U | System monitor (the gauge beside Fairy's icon) |
+| ⌘⇧N | Neutrino card: the shell's repo and the server's inbox |
 | ⌥⌘I | Ask Fairy about the screen (her card at the bottom right) |
 | ⌥⌘O / ⌥⌘K | Copy a command's output (the selected one's, or the last) / fold or unfold it |
 | ⌥⌘T | Reopen the tab, pane or window's tab closed last (kept ten minutes, shells running) |
@@ -437,6 +438,25 @@ compressed) with pressure and swap, network speed in and out, free space on
 the startup disk, the battery and thermal state, and the six busiest of your
 processes with their CPU and memory. Nothing is read while it's closed.
 `monitor.enabled = false` hides the gauge.
+
+**Neutrino.** ⌘⇧N (View > Neutrino) opens a card for Neutrino, the git and
+CI server. The top half is the focused shell's repo, from the folder it
+reported with OSC 7: branch, ahead/behind its upstream, changed files and the
+repo's last five runs. The bottom half is `ntr inbox`: deploys waiting for
+approval, pull requests, runs going. Everything comes from running `ntr`, and
+it's read again every 15 seconds while the card shows. Clicking an item types
+its command at the prompt (`ntr run logs N -f`, `ntr pr show N`, and
+`ntr run approve N` after a confirm); nothing runs until you press Return.
+When the shell is an ssh session on the server's Mac (`kagutsuchi`, `mini`),
+the card runs `ssh HOST ntr …` from the folder that shell reports. The session
+host polls `ntr inbox` every minute too, and posts a notification when a run
+finishes, even with Tachyon closed.
+
+**Machines.** Shell > New Tab On lists the hosts in `~/.ssh/config` (the
+first name on each `Host` line; patterns and the `mini`/`mini-lan` aliases are
+left out), each with a dot from a short TCP check on port 22 every minute:
+🟢 answered, ⚪️ didn't. Picking one opens a tab running `ssh HOST`. Typing
+`ssh ` at a prompt suggests them inline when history has nothing better.
 
 **Shortcut hints.** A band along the bottom lists the shortcuts worth knowing,
 what fits the moment first: Tab when a suggestion shows, ⌥⌘I to ask Fairy

@@ -26,6 +26,8 @@ mod images;
 pub mod host;
 mod input;
 mod jobwatch;
+mod machines;
+mod neutrino;
 mod ledger;
 mod links;
 mod notify;
@@ -103,6 +105,8 @@ thread_local! {
     static HOST: RefCell<Option<host::Client>> = const { RefCell::new(None) };
     /// Commands run before, for inline suggestions; `None` when they're off.
     static SUGGESTIONS: RefCell<Option<suggest::History>> = const { RefCell::new(None) };
+    /// Shell > New Tab On's items, retitled as machines are checked.
+    static MACHINE_ITEMS: RefCell<Vec<Retained<NSMenuItem>>> = const { RefCell::new(Vec::new()) };
     /// A layout save is queued.
     static LAYOUT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -502,6 +506,35 @@ define_class!(
         #[unsafe(method(tachyonMonitor:))]
         fn monitor_toggle(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), TermWindow::toggle_monitor);
+        }
+
+        #[unsafe(method(tachyonNeutrino:))]
+        fn neutrino_toggle(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_neutrino);
+        }
+
+        #[unsafe(method(tachyonNeutrinoRefresh:))]
+        fn neutrino_refresh(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::refresh_neutrino);
+        }
+
+        /// A card item: its `ntr` command is typed into the shell.
+        #[unsafe(method(tachyonNeutrinoItem:))]
+        fn neutrino_item(&self, sender: Option<&AnyObject>) {
+            let Some(tag) = sender.and_then(|s| s.downcast_ref::<objc2_app_kit::NSButton>()).map(|b| b.tag()) else { return };
+            with_window(self.id(), |w| w.neutrino_click(tag as usize));
+        }
+
+        /// Shell > New Tab On: a tab running `ssh HOST`.
+        #[unsafe(method(tachyonSshTab:))]
+        fn ssh_tab(&self, sender: Option<&AnyObject>) {
+            let Some(tag) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()).map(|b| b.tag()) else { return };
+            let Some(m) = machines::all().get(tag as usize) else { return };
+            let window = self.id();
+            let run = format!("ssh {}", m.name);
+            if let Some(Err(e)) = with_app(|app| app.open_command_tab(window, &run)) {
+                crate::log::force(&format!("could not open a tab: {e}"));
+            }
         }
 
         #[unsafe(method(tachyonFairy:))]
@@ -1367,6 +1400,150 @@ impl MonitorCard {
     }
 }
 
+/// The Neutrino card: the focused shell's repo above, the server's inbox
+/// below. Each item is a button that types its `ntr` command.
+struct NeutrinoCard {
+    host: Retained<NSView>,
+    content: Retained<NSView>,
+    title: Retained<objc2_app_kit::NSTextField>,
+    refresh: Retained<objc2_app_kit::NSButton>,
+    close: Retained<objc2_app_kit::NSButton>,
+    scroll: Retained<objc2_app_kit::NSScrollView>,
+    list: Retained<NSView>,
+    views: Vec<Retained<NSView>>,
+    model: neutrino::Panel,
+    /// What each item button (by its tag) does.
+    actions: Vec<neutrino::Action>,
+    /// Cleared to stop the refreshing thread.
+    running: Option<Arc<AtomicBool>>,
+}
+
+impl NeutrinoCard {
+    const WIDTH: f64 = 440.0;
+    const HEIGHT: f64 = 520.0;
+    const ROW: f64 = 22.0;
+
+    fn new(mtm: MainThreadMarker, parent: &TachyonView) -> NeutrinoCard {
+        use objc2_app_kit::{NSButton, NSFont, NSTextField};
+        let content = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        let host: Retained<NSView> = if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+            glass.setCornerRadius(18.0);
+            glass.setTintColor(Some(&NSColor::windowBackgroundColor().colorWithAlphaComponent(0.82)));
+            glass.setContentView(Some(&content));
+            Retained::into_super(glass)
+        } else {
+            let blur = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), NSRect::ZERO);
+            blur.setMaterial(NSVisualEffectMaterial::HUDWindow);
+            blur.setState(NSVisualEffectState::Active);
+            blur.addSubview(&content);
+            Retained::into_super(blur)
+        };
+        let target: &AnyObject = parent.as_ref();
+        let title = NSTextField::labelWithString(&NSString::from_str("Neutrino"), mtm);
+        title.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
+        let refresh = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str("↻"), Some(target), Some(sel!(tachyonNeutrinoRefresh:)), mtm) };
+        refresh.setBordered(false);
+        refresh.setToolTip(Some(&NSString::from_str("Refresh")));
+        let close = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str("✕"), Some(target), Some(sel!(tachyonNeutrino:)), mtm) };
+        close.setBordered(false);
+        close.setToolTip(Some(&NSString::from_str("Close (⌘⇧N)")));
+        let scroll = objc2_app_kit::NSScrollView::initWithFrame(objc2_app_kit::NSScrollView::alloc(mtm), NSRect::ZERO);
+        scroll.setDrawsBackground(false);
+        scroll.setHasVerticalScroller(true);
+        let list = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        scroll.setDocumentView(Some(&list));
+        for v in [&*title as &NSView, &refresh, &close, &scroll] {
+            content.addSubview(v);
+        }
+        host.setHidden(true);
+        parent.addSubview(&host);
+        NeutrinoCard {
+            host,
+            content,
+            title,
+            refresh,
+            close,
+            scroll,
+            list,
+            views: Vec::new(),
+            model: neutrino::Panel::default(),
+            actions: Vec::new(),
+            running: None,
+        }
+    }
+
+    fn place(&self, size: NSSize, bottom: f64, top: f64) {
+        let w = Self::WIDTH.min(size.width - 24.0).max(240.0);
+        let h = Self::HEIGHT.min(size.height - bottom - top - 16.0).max(160.0);
+        let frame = NSRect::new(NSPoint::new(size.width - w - 12.0, bottom + 6.0), NSSize::new(w, h));
+        self.host.setFrame(frame);
+        self.content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        let pad = 14.0;
+        self.title.setFrame(NSRect::new(NSPoint::new(pad, h - 34.0), NSSize::new(w - 2.0 * pad - 60.0, 20.0)));
+        self.refresh.setFrame(NSRect::new(NSPoint::new(w - pad - 52.0, h - 36.0), NSSize::new(24.0, 22.0)));
+        self.close.setFrame(NSRect::new(NSPoint::new(w - pad - 24.0, h - 36.0), NSSize::new(24.0, 22.0)));
+        self.scroll.setFrame(NSRect::new(NSPoint::new(pad - 4.0, 10.0), NSSize::new(w - 2.0 * pad + 8.0, (h - 52.0).max(40.0))));
+        self.layout_rows();
+    }
+
+    /// Lay the rows out from the top of the list.
+    fn layout_rows(&self) {
+        let visible = self.scroll.contentSize();
+        let doc_h = (self.views.len() as f64 * Self::ROW + 8.0).max(visible.height);
+        let w = visible.width;
+        self.list.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, doc_h)));
+        for (i, v) in self.views.iter().enumerate() {
+            v.setFrame(NSRect::new(NSPoint::new(4.0, doc_h - 4.0 - (i as f64 + 1.0) * Self::ROW), NSSize::new(w - 8.0, Self::ROW - 2.0)));
+        }
+    }
+
+    /// Show the model.
+    fn render(&mut self, target: &AnyObject) {
+        use objc2_app_kit::{NSButton, NSFont, NSTextField};
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        for v in self.views.drain(..) {
+            v.removeFromSuperview();
+        }
+        self.actions.clear();
+        for row in self.model.rows() {
+            let view: Retained<NSView> = match row {
+                neutrino::Row::Header(t) => {
+                    let l = NSTextField::labelWithString(&NSString::from_str(&t), mtm);
+                    l.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+                    Retained::into_super(Retained::into_super(l))
+                }
+                neutrino::Row::Note(t) => {
+                    let l = NSTextField::labelWithString(&NSString::from_str(&t), mtm);
+                    l.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.5, unsafe { objc2_app_kit::NSFontWeightRegular })));
+                    l.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                    l.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+                    Retained::into_super(Retained::into_super(l))
+                }
+                neutrino::Row::Item(t, action) => {
+                    let b = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(&t), Some(target), Some(sel!(tachyonNeutrinoItem:)), mtm) };
+                    b.setBordered(false);
+                    b.setAlignment(objc2_app_kit::NSTextAlignment::Left);
+                    b.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                    b.setToolTip(Some(&NSString::from_str(&format!("Types `{}`", action.command()))));
+                    b.setTag(self.actions.len() as isize);
+                    self.actions.push(action);
+                    Retained::into_super(Retained::into_super(b))
+                }
+            };
+            self.list.addSubview(&view);
+            self.views.push(view);
+        }
+        self.layout_rows();
+    }
+
+    fn stop(&mut self) {
+        if let Some(r) = self.running.take() {
+            r.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// The card's quick questions: their button titles, and what's asked.
 const FAIRY_QUICK: [(&str, &str); 4] = [
     ("Explain this", "Explain what's on my screen."),
@@ -1963,6 +2140,8 @@ struct TermWindow {
     monitor: bool,
     monitor_button: Option<Retained<objc2_app_kit::NSButton>>,
     monitor_card: Option<MonitorCard>,
+    /// The Neutrino card (⌘⇧N).
+    neutrino_card: Option<NeutrinoCard>,
     /// The quick terminal: borderless, dropping from the screen's top, and
     /// whether it's showing; the app that was in front, to go back to.
     quick: bool,
@@ -2933,6 +3112,136 @@ impl TermWindow {
         });
     }
 
+    /// Put the Neutrino card above the bottom band, at the right.
+    fn place_neutrino(&mut self) {
+        let Some(card) = &self.neutrino_card else { return };
+        let scale = self.scale();
+        let size = self.view.bounds().size;
+        let (y0, h) = self.renderer.hints_rect();
+        let band_bottom = (size.height * scale - (y0 + h) as f64).max(0.0) / scale;
+        card.place(size, band_bottom + h as f64 / scale, self.title_bar_height());
+    }
+
+    /// Where `ntr` runs for the focused shell: here in its folder, or on the
+    /// Neutrino server's Mac over ssh when the shell is an ssh session there.
+    fn neutrino_place(&self) -> neutrino::Place {
+        let term = self.term.lock();
+        match term.ssh_command() {
+            Some(cmd) => match neutrino::server_host(cmd) {
+                // The folder the far shell reported, if it reports one.
+                Some(host) => neutrino::Place { dir: term.cwd_host().is_some().then(|| term.cwd.clone()).flatten(), ssh: Some(host) },
+                None => neutrino::Place { ssh: None, dir: None },
+            },
+            None => neutrino::Place { ssh: None, dir: term.cwd.clone() },
+        }
+    }
+
+    /// Open or close the Neutrino card (⌘⇧N). While it shows, it's read
+    /// again every 15 seconds.
+    fn toggle_neutrino(&mut self) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        if let Some(card) = self.neutrino_card.as_mut().filter(|c| !c.host.isHidden()) {
+            card.host.setHidden(true);
+            card.stop();
+            return;
+        }
+        if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_fairy();
+        }
+        if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_monitor();
+        }
+        if self.neutrino_card.is_none() {
+            self.neutrino_card = Some(NeutrinoCard::new(mtm, &self.view));
+        }
+        self.place_neutrino();
+        let target: &AnyObject = self.view.as_ref();
+        if let Some(card) = &mut self.neutrino_card {
+            card.host.setHidden(false);
+            card.render(target);
+        }
+        let id = self.id;
+        let running = Arc::new(AtomicBool::new(true));
+        if let Some(card) = &mut self.neutrino_card {
+            card.running = Some(Arc::clone(&running));
+        }
+        let _ = std::thread::Builder::new().name("tachyon-neutrino".into()).spawn(move || {
+            while running.load(Ordering::Acquire) {
+                DispatchQueue::main().exec_async(move || with_window(id, TermWindow::refresh_neutrino));
+                for _ in 0..15 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if !running.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Read the repo and the inbox again, on a thread, for the focused shell.
+    fn refresh_neutrino(&mut self) {
+        if self.neutrino_card.as_ref().is_none_or(|c| c.host.isHidden()) {
+            return;
+        }
+        let place = self.neutrino_place();
+        let id = self.id;
+        let _ = std::thread::Builder::new().name("tachyon-neutrino-read".into()).spawn(move || {
+            let run = |args: &str| jobwatch::run_command(&place.command(args), None);
+            let in_repo = place.dir.is_some();
+            let repo = in_repo.then(|| run("status --porcelain=v2 --branch")).flatten().and_then(|t| neutrino::parse_status(&t));
+            let recent = if repo.is_some() {
+                run("runs --limit 5").map(|t| neutrino::parse_runs(&t, None)).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let inbox = run("inbox").map(|t| neutrino::parse_inbox(&t));
+            let error = inbox.is_none().then(|| match &place.ssh {
+                Some(h) => format!("Couldn't run ntr on {h}."),
+                None => "Couldn't run ntr inbox (is ntr installed, and the server up?).".to_string(),
+            });
+            let home = std::env::var("HOME").unwrap_or_default();
+            let dir = place.dir.clone().map(|d| if !home.is_empty() && d.starts_with(&home) { format!("~{}", &d[home.len()..]) } else { d });
+            let where_ = match (&place.ssh, dir) {
+                (Some(h), Some(d)) => Some(format!("{h}:{d}")),
+                (Some(h), None) => Some(h.clone()),
+                (None, d) => d,
+            };
+            let model = neutrino::Panel { place: where_, repo, recent, inbox, error };
+            DispatchQueue::main().exec_async(move || {
+                with_window(id, |w| {
+                    let view = w.view.clone();
+                    let target: &AnyObject = view.as_ref();
+                    if let Some(card) = &mut w.neutrino_card {
+                        if card.model != model {
+                            card.model = model;
+                            card.render(target);
+                        }
+                    }
+                })
+            });
+        });
+    }
+
+    /// An item was clicked: type its `ntr` command at the prompt, after a
+    /// confirm for an approval. Nothing runs until Return.
+    fn neutrino_click(&mut self, tag: usize) {
+        let Some(action) = self.neutrino_card.as_ref().and_then(|c| c.actions.get(tag).cloned()) else { return };
+        let command = action.command();
+        if action.confirm() {
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            let alert = objc2_app_kit::NSAlert::new(mtm);
+            alert.setMessageText(&NSString::from_str("Approve this deploy?"));
+            alert.setInformativeText(&NSString::from_str(&format!("This types `{command}` into the shell. It runs when you press Return.")));
+            alert.addButtonWithTitle(&NSString::from_str("Type It"));
+            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            if alert.runModal() != objc2_app_kit::NSAlertFirstButtonReturn {
+                return;
+            }
+        }
+        self.window.makeFirstResponder(Some(&self.view));
+        self.type_text(&command);
+    }
+
     /// Open or close Fairy's card.
     fn toggle_fairy(&mut self) {
         if self.fairy_socket.is_none() {
@@ -3336,6 +3645,7 @@ impl TermWindow {
         self.renderer.set_hints_band(self.hints || self.fairy_socket.is_some() || self.monitor);
         self.place_fairy();
         self.place_monitor();
+        self.place_neutrino();
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
             crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
@@ -4787,6 +5097,7 @@ impl App {
             monitor: cfg.macos.monitor,
             monitor_button: None,
             monitor_card: None,
+            neutrino_card: None,
             quick: false,
             quick_shown: false,
             quick_inset: 0.0,
@@ -4829,6 +5140,18 @@ impl App {
 }
 
 impl App {
+    /// A new tab in window `window` whose shell runs `run` at its first
+    /// prompt.
+    fn open_command_tab(&mut self, window: u64, run: &str) -> Result<(), String> {
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == window) else {
+            return Ok(());
+        };
+        let (cols, rows) = w.grid;
+        let tab = Tab::new(Pane::start_running(&self.cfg, cols.max(1), rows.max(1), run, None)?);
+        w.add_tab(tab);
+        Ok(())
+    }
+
     /// Split the focused pane of window `window`'s tab in front: a new shell,
     /// in the same folder, takes the right or bottom half and focus.
     fn split_pane(&mut self, window: u64, dir: panes::Dir) -> Result<(), String> {
@@ -5202,6 +5525,33 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&file, "Reopen Closed Tab", sel!(tachyonReopenTab:), "t")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&file, "Follow Job", sel!(tachyonFollowJob:), "j");
+    // The machines in ~/.ssh/config, each with a dot for whether it answered.
+    let on = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("New Tab On"));
+    let machine_items: Vec<Retained<NSMenuItem>> = machines::all()
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let it = item(&on, &machines::title(m), sel!(tachyonSshTab:), "");
+            it.setTag(i as isize);
+            it.setToolTip(Some(&ns(&format!("ssh {} ({})", m.name, m.address))));
+            it
+        })
+        .collect();
+    let on_item = NSMenuItem::new(mtm);
+    on_item.setTitle(&ns("New Tab On"));
+    on_item.setSubmenu(Some(&on));
+    on_item.setEnabled(!machine_items.is_empty());
+    file.addItem(&on_item);
+    MACHINE_ITEMS.with(|m| *m.borrow_mut() = machine_items);
+    machines::start_checks(|| {
+        DispatchQueue::main().exec_async(|| {
+            MACHINE_ITEMS.with(|items| {
+                for (it, m) in items.borrow().iter().zip(machines::all()) {
+                    it.setTitle(&NSString::from_str(&machines::title(m)));
+                }
+            })
+        })
+    });
     file.addItem(&NSMenuItem::separatorItem(mtm));
     item(&file, "Split Right", sel!(tachyonSplitRight:), "d");
     item(&file, "Split Down", sel!(tachyonSplitDown:), "D");
@@ -5250,6 +5600,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&view, "System Monitor", sel!(tachyonMonitor:), "u")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    // A capital letter means Shift as well: ⌘⇧N.
+    item(&view, "Neutrino", sel!(tachyonNeutrino:), "N");
     view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Rewind", sel!(tachyonRewindBack:), "[");
     item(&view, "Forward", sel!(tachyonRewindForward:), "]");

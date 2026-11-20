@@ -33,6 +33,8 @@ pub struct History {
     live: usize,
     /// Tachyon's own record, appended to as commands run.
     file: Option<PathBuf>,
+    /// Machines from `~/.ssh/config`, offered after `ssh `.
+    machines: Vec<super::machines::Machine>,
 }
 
 impl History {
@@ -64,6 +66,7 @@ impl History {
             }
             h.file = Some(file);
         }
+        h.machines = super::machines::all().to_vec();
         crate::log!("suggestions: {} commands", h.live);
         h
     }
@@ -117,7 +120,7 @@ impl History {
                 anywhere.get_or_insert(&it.cmd[typed.len()..]);
             }
         }
-        anywhere
+        anywhere.or_else(|| super::machines::suggest(typed, &self.machines))
     }
 }
 
@@ -241,6 +244,16 @@ mod tests {
         h.record("cargo test", Some("/c"));
         assert_eq!(h.suggest("cargo t", Some("/z")), Some("est"));
         assert_eq!(h.live, 3);
+    }
+
+    #[test]
+    fn machines_follow_ssh_when_history_has_nothing() {
+        let mut h = History::default();
+        h.machines = super::super::machines::parse("Host forge\n  HostName 10.0.0.2\nHost raijin\n");
+        assert_eq!(h.suggest("ssh r", None), Some("aijin"));
+        h.add("ssh raijin -L 8080:localhost:8080", None);
+        assert_eq!(h.suggest("ssh r", None), Some("aijin -L 8080:localhost:8080"), "history first");
+        assert_eq!(h.suggest("ssh f", None), Some("orge"));
     }
 
     #[test]

@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::{Condvar, Mutex};
 
 use super::jobwatch;
+use super::neutrino;
 use super::notify;
 use super::power;
 use super::pty::Pty;
@@ -401,7 +402,10 @@ const IDLE_EXIT: Duration = Duration::from_secs(20);
 
 /// Run the host on `path` until it has had no shells and no app for a while.
 pub fn run(path: &Path) -> io::Result<()> {
-    run_with(path, |session, key, title, subtitle, body| notify::post_detached(session, key, title, subtitle, body))
+    let tell: Tell = |session, key, title, subtitle, body| notify::post_detached(session, key, title, subtitle, body);
+    // Not in tests' hosts: it runs `ntr` for real.
+    std::thread::Builder::new().name("tachyon-host-neutrino".into()).spawn(move || watch_neutrino(tell))?;
+    run_with(path, tell)
 }
 
 /// What the host tells about an ended job: the shell it was submitted in, a
@@ -448,6 +452,27 @@ fn watch_jobs(host: Arc<Mutex<Host>>, tell: Tell) {
                 tell(e.session, &e.job.id, &title, &subtitle, &body);
             }
         }
+    }
+}
+
+/// Watch Neutrino's inbox (when `ntr` is here), and `tell` of each CI run
+/// that finishes, whether or not an app is open.
+fn watch_neutrino(tell: Tell) {
+    let poll = std::env::var("TACHYON_NEUTRINO_POLL_MS").ok().and_then(|v| v.parse().ok()).map(Duration::from_millis).unwrap_or(neutrino::POLL);
+    let mut watch = neutrino::RunWatch::default();
+    loop {
+        if let Some(text) = jobwatch::run_command("ntr inbox", None) {
+            for run in watch.update(&neutrino::parse_inbox(&text)) {
+                let repo = run.repo.clone().unwrap_or_default();
+                let state = jobwatch::run_command(&format!("ntr -r '{}' runs --limit 30", repo.replace('\'', "")), None)
+                    .and_then(|t| neutrino::parse_runs(&t, None).into_iter().find(|r| r.number == run.number))
+                    .map(|r| r.state);
+                crate::log!("host: neutrino run {repo} #{} ended ({state:?})", run.number);
+                let (title, subtitle, body) = neutrino::notification(&run, state.as_deref());
+                tell(0, &format!("neutrino-{repo}-{}", run.number), &title, &subtitle, &body);
+            }
+        }
+        std::thread::sleep(poll);
     }
 }
 
