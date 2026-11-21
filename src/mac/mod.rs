@@ -24,6 +24,7 @@ mod fairy;
 mod font;
 mod images;
 pub mod host;
+mod host_mgr;
 mod input;
 mod jobwatch;
 mod machines;
@@ -31,12 +32,14 @@ mod neutrino;
 mod ledger;
 mod links;
 mod notify;
+mod pane_bar;
 mod panes;
 mod power;
 mod pty;
 mod receipts;
 mod renderer;
 mod selection;
+mod sidebar;
 mod strip;
 mod suggest;
 mod sysmon;
@@ -77,7 +80,7 @@ use objc2_quartz_core::{
 };
 use parking_lot::Mutex;
 
-use crate::config::{Appearance, Backdrop, Config, Contrast, OptionAsMeta, ThemeConfig};
+use crate::config::{Appearance, Backdrop, Config, Contrast, OptionAsMeta, PaneHeaders, ThemeConfig};
 use crate::term::jobs::JobRef;
 use crate::term::rewind::RewindLog;
 use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
@@ -101,8 +104,10 @@ thread_local! {
     /// All main-thread state. AppKit calls into the views and delegates; each
     /// carries its window's id and forwards here.
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
-    /// The session host, when shells persist.
+    /// The legacy session host, when shells persist without Mux v2.
     static HOST: RefCell<Option<host::Client>> = const { RefCell::new(None) };
+    /// Multi-host Mux v2 connection manager (`local` + remote hosts like `kagutsuchi`).
+    static HOST_MGR: RefCell<Option<Arc<host_mgr::HostManager>>> = const { RefCell::new(None) };
     /// Commands run before, for inline suggestions; `None` when they're off.
     static SUGGESTIONS: RefCell<Option<suggest::History>> = const { RefCell::new(None) };
     /// Shell > New Tab On's items, retitled as machines are checked.
@@ -503,6 +508,11 @@ define_class!(
             }
         }
 
+        #[unsafe(method(tachyonToggleSidebar:))]
+        fn toggle_sidebar(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_sidebar);
+        }
+
         #[unsafe(method(tachyonMonitor:))]
         fn monitor_toggle(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), TermWindow::toggle_monitor);
@@ -699,7 +709,6 @@ define_class!(
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, size: NSSize) {
             unsafe { msg_send![super(self), setFrameSize: size] }
-            with_window(self.id(), TermWindow::layout);
         }
 
         #[unsafe(method(viewDidChangeBackingProperties))]
@@ -931,7 +940,7 @@ impl TachyonWindow {
     /// Margin along the window edges left to AppKit for resizing, in points.
     const RESIZE_MARGIN: f64 = 4.0;
 
-    /// The terminal view: the content view, or inside the glass that hosts it.
+    /// The terminal view: the content view, or inside the glass/container that hosts it.
     fn terminal_view(&self) -> Option<Retained<NSView>> {
         fn find(view: Retained<NSView>, depth: u32) -> Option<Retained<NSView>> {
             if view.isKindOfClass(<TachyonView as objc2::ClassType>::class()) {
@@ -942,21 +951,29 @@ impl TachyonWindow {
             }
             view.subviews().iter().find_map(|v| find(v, depth - 1))
         }
-        find(self.contentView()?, 3)
+        find(self.contentView()?, 5)
     }
 
-    fn owns_click(&self, view: &NSView, p: NSPoint) -> bool {
-        let size = view.frame().size;
+    fn owns_click(&self, view: &NSView, win_p: NSPoint) -> bool {
+        let p = view.convertPoint_fromView(win_p, None);
+        let size = view.bounds().size;
         let m = Self::RESIZE_MARGIN;
-        let inside = p.x > m && p.x < size.width - m && p.y > m && p.y < size.height - m;
+        // Clicks outside TachyonView (e.g. inside the left sidebar) belong to AppKit.
+        if p.x < 0.0 || p.x > size.width || p.y < 0.0 || p.y > size.height {
+            return false;
+        }
+        let win_size = self.contentView().map(|v| v.bounds().size).unwrap_or(size);
+        let inside = win_p.x > m
+            && win_p.x < win_size.width - m
+            && win_p.y > m
+            && win_p.y < win_size.height - m;
         // The window buttons, while revealed, take their own clicks.
         let buttons_showing = self
             .standardWindowButton(NSWindowButton::CloseButton)
             .is_some_and(|b| !b.isHidden());
-        let over_buttons = buttons_showing && p.x < BUTTON_ZONE.0 && p.y > size.height - BUTTON_ZONE.1;
-        // The glass tab capsule, a subview of the terminal view, takes its
-        // own clicks.
-        let over_capsule = view.subviews().iter().any(|sub| {
+        let over_buttons = buttons_showing && win_p.x < BUTTON_ZONE.0 && win_p.y > win_size.height - BUTTON_ZONE.1;
+        // Subviews of the terminal view (tab capsule, pane headers, cards) take their own clicks.
+        let over_subview = view.subviews().iter().any(|sub| {
             let f = sub.frame();
             !sub.isHidden()
                 && p.x >= f.origin.x
@@ -968,7 +985,7 @@ impl TachyonWindow {
         // double-clicking, the title.
         let bar = query_window(view_id(view), |w| w.title_bar_height()).unwrap_or(0.0);
         let in_bar = bar > 0.0 && p.y > size.height - bar;
-        inside && !over_buttons && !over_capsule && !in_bar
+        inside && !over_buttons && !over_subview && !in_bar
     }
 }
 
@@ -997,6 +1014,32 @@ impl TachyonView {
 
     fn id(&self) -> u64 {
         self.ivars().id.get()
+    }
+}
+
+define_class!(
+    /// Root container inside the glass/window holding `[sidebar | view]`.
+    /// Relays window/glass frame resizes into `TermWindow::layout()`.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TachyonContainerView"]
+    #[ivars = WindowId]
+    struct ContainerView;
+
+    impl ContainerView {
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: NSSize) {
+            unsafe { msg_send![super(self), setFrameSize: size] }
+            with_window(self.ivars().id.get(), TermWindow::layout);
+        }
+    }
+);
+
+impl ContainerView {
+    fn new(mtm: MainThreadMarker, frame: NSRect, id: u64) -> Retained<NSView> {
+        let this = Self::alloc(mtm).set_ivars(WindowId { id: Cell::new(id) });
+        let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        Retained::into_super(view)
     }
 }
 
@@ -1784,8 +1827,12 @@ struct Pane {
     job: Option<JobRef>,
     /// Its recent output, for Rewind.
     log: Arc<Mutex<RewindLog>>,
-    /// Where it is in the window's grid.
+    /// Where its terminal cells sit in the window's grid.
     rect: panes::Rect,
+    /// Optional 1-row top strip reserved for this pane's header bar.
+    header_rect: Option<panes::Rect>,
+    /// For Mux v2 blocks, only kill on the server when explicitly closed by hand.
+    kill_on_drop: Cell<bool>,
     /// The keystroke in flight, for the latency ledger.
     ledger: Arc<ledger::Slot>,
 }
@@ -1806,6 +1853,8 @@ struct Tab {
     title_rev: u64,
     /// A command finished here while the tab was in the background.
     unseen: Option<Outcome>,
+    /// When backed by a Mux v2 server window: `(host_alias, session_id, window_id)`.
+    mux_target: Option<(String, String, String)>,
 }
 
 /// Per-pane state the window works on directly while the pane has focus.
@@ -1854,7 +1903,24 @@ impl Pane {
         Ok(pane)
     }
 
+    /// Attach to a Mux v2 server block (on `local` or any remote host like `kagutsuchi`).
+    fn attach_mux(
+        cfg: &Config,
+        stream: crate::mux::client::AttachedStream,
+        client: Arc<crate::mux::client::MuxClient>,
+        meta: pty::MuxMeta,
+        pid: u32,
+        awake: bool,
+    ) -> Result<Pane, String> {
+        let cols = stream.cols.max(1) as usize;
+        let rows = stream.rows.max(1) as usize;
+        let id = LOCAL_IDS.fetch_add(1, Ordering::Relaxed);
+        let pty = Pty::mux(stream, client, meta, pid);
+        Pane::with(id, pty, cfg, cols, rows, None, awake)
+    }
+
     fn with(id: u64, pty: Pty, cfg: &Config, cols: usize, rows: usize, job: Option<JobRef>, awake: bool) -> Result<Pane, String> {
+        let kill_on_drop = !pty.is_mux();
         let wake_pending = Arc::new(AtomicBool::new(false));
         let slot = Arc::new(ledger::Slot::default());
         let (term, pty, log) = start_session(id, pty, cfg, cols, rows, Arc::clone(&wake_pending), awake, Arc::clone(&slot))?;
@@ -1867,6 +1933,8 @@ impl Pane {
             job,
             log,
             rect: panes::Rect { col: 0, row: 0, cols, rows },
+            header_rect: None,
+            kill_on_drop: Cell::new(kill_on_drop),
             ledger: slot,
         })
     }
@@ -1874,6 +1942,10 @@ impl Pane {
 
 impl Tab {
     fn new(pane: Pane) -> Tab {
+        let mux_target = pane
+            .pty
+            .mux_meta()
+            .map(|m| (m.host.clone(), m.session_id.clone(), m.window_id.clone()));
         Tab {
             layout: panes::Node::Leaf(pane.id),
             panes: vec![pane],
@@ -1883,6 +1955,7 @@ impl Tab {
             label: String::new(),
             title_rev: u64::MAX,
             unseen: None,
+            mux_target,
         }
     }
 
@@ -1902,8 +1975,9 @@ impl Tab {
     }
 
     /// Lay the panes out in a grid of `cols` by `rows`, resizing each whose
-    /// size changed. `cell` is a cell's size in device pixels.
-    fn lay_out(&mut self, cols: usize, rows: usize, cell: (u32, u32)) {
+    /// size changed. When `header_rows > 0`, reserves that many top rows of
+    /// each pane for its subtle header bar.
+    fn lay_out(&mut self, cols: usize, rows: usize, cell: (u32, u32), header_rows: usize) {
         let area = panes::Rect { col: 0, row: 0, cols, rows };
         let (rects, dividers) = if self.zoomed {
             (vec![(self.pane().id, area)], Vec::new())
@@ -1911,11 +1985,23 @@ impl Tab {
             self.layout.layout(area)
         };
         self.dividers = dividers;
-        for (id, rect) in rects {
+        for (id, outer) in rects {
             let Some(p) = self.panes.iter_mut().find(|p| p.id == id) else {
                 continue;
             };
-            let rect = panes::Rect { cols: rect.cols.max(1), rows: rect.rows.max(1), ..rect };
+            let (header_rect, rect) = if header_rows > 0 && outer.rows >= header_rows + 2 {
+                (
+                    Some(panes::Rect { col: outer.col, row: outer.row, cols: outer.cols.max(1), rows: header_rows }),
+                    panes::Rect {
+                        col: outer.col,
+                        row: outer.row + header_rows,
+                        cols: outer.cols.max(1),
+                        rows: (outer.rows - header_rows).max(1),
+                    },
+                )
+            } else {
+                (None, panes::Rect { cols: outer.cols.max(1), rows: outer.rows.max(1), ..outer })
+            };
             let resized = (rect.cols, rect.rows) != (p.rect.cols, p.rect.rows);
             let cell_changed = {
                 let mut t = p.term.lock();
@@ -1932,6 +2018,7 @@ impl Tab {
             if resized || cell_changed {
                 p.pty.resize(rect.cols as u16, rect.rows as u16, cell);
             }
+            p.header_rect = header_rect;
             p.rect = rect;
         }
     }
@@ -2013,7 +2100,17 @@ impl Drop for Pane {
         if !self.pty.is_remote() {
             power::set(self.id, None);
         }
-        // Quitting leaves the host's shells running, to come back next time.
+        if self.pty.is_mux() {
+            // Mux v2 blocks survive closing windows and quitting; only an
+            // explicit pane/window close (`kill_on_drop`) kills them on the server.
+            if self.kill_on_drop.get() {
+                self.pty.hangup();
+            } else {
+                self.pty.detach();
+            }
+            return;
+        }
+        // Quitting leaves the legacy host's shells running, to come back next time.
         if QUITTING.load(Ordering::Acquire) && self.pty.is_remote() {
             return;
         }
@@ -2151,6 +2248,16 @@ struct TermWindow {
     quick_inset: f64,
     quick_previous: Option<Retained<objc2_app_kit::NSRunningApplication>>,
 
+    /// Root container inside the glass/window holding `[sidebar | view]`.
+    container: Retained<NSView>,
+    /// Rex-style collapsible multi-host sidebar (`None` for the quick terminal).
+    sidebar: Option<sidebar::Sidebar>,
+    sidebar_open: bool,
+    sidebar_width: f64,
+    /// Per-pane header bar mode and active header views.
+    pane_headers_mode: PaneHeaders,
+    pane_headers: Vec<Retained<pane_bar::PaneHeaderView>>,
+
     /// Draws the focused, blinking cursor. Core Animation runs the blink in
     /// the window server, so a blinking cursor costs the app no wake-ups.
     cursor_layer: Retained<CALayer>,
@@ -2258,7 +2365,8 @@ impl TermWindow {
     /// them, and the tab strip.
     fn draw(&mut self) {
         let mut strip = None;
-        if self.tabs.len() > 1 {
+        let show_strip = !self.sidebar_shown() && (self.tabs.len() > 1 || self.notch.is_some());
+        if show_strip {
             let tabs: Vec<_> = self.tabs.iter().map(|t| (t.label.clone(), t.unseen)).collect();
             match &self.capsule {
                 Some(c) if self.native_strip => c.view.set_tabs(tabs, self.active),
@@ -2401,6 +2509,7 @@ impl TermWindow {
         drop(frames);
         drop(guards);
         self.update_cursor_layer(overlay);
+        self.sync_pane_headers();
     }
 
     /// A divider as a hairline down (or across) the middle of its cells, in
@@ -2686,6 +2795,8 @@ impl TermWindow {
         self.save_live();
         self.active = i;
         self.load_live();
+        self.place_pane_headers();
+        self.sync_sidebar();
         self.window.invalidateCursorRectsForView(&self.view);
         schedule_layout_save();
     }
@@ -2754,7 +2865,21 @@ impl TermWindow {
             self.layout();
         }
         self.load_live();
+        self.sync_pane_headers();
         schedule_layout_save();
+    }
+
+    /// Focus a pane by its local pane id (used by pane header clicks).
+    fn focus_pane_by_id(&mut self, pane_id: u64) {
+        if let Some(p) = self.tabs[self.active].index_of(pane_id) {
+            self.focus_pane(p);
+            self.focus_terminal();
+        }
+    }
+
+    /// Return keyboard focus to the terminal view (e.g. after Esc in sidebar filter).
+    fn focus_terminal(&self) {
+        self.window.makeFirstResponder(Some(&self.view));
     }
 
     /// ⌘⌥ and an arrow: focus the pane on that side.
@@ -2779,7 +2904,18 @@ impl TermWindow {
             t.set_keep_awake(on);
             (on, t.keeps_awake().then(|| t.running_cmdline().unwrap_or("").to_string()))
         };
-        if pane.pty.is_remote() {
+        if let Some(meta) = pane.pty.mux_meta().cloned() {
+            if let Some(client) = pane.pty.mux_client().cloned() {
+                let _ = std::thread::Builder::new()
+                    .name("tachyon-mux-awake".into())
+                    .spawn(move || {
+                        let _ = client.set_awake(&meta.block_id, on);
+                    });
+            }
+            if meta.host == "local" {
+                power::set(pane.id, cmdline.as_deref());
+            }
+        } else if pane.pty.is_remote() {
             let id = pane.id;
             let sent = HOST.with(|h| h.borrow().as_ref().map(|c| c.set_awake(id, on)));
             if let Some(Err(e)) = sent {
@@ -2799,6 +2935,16 @@ impl TermWindow {
             return;
         }
         tab.zoomed = !tab.zoomed;
+        if let Some((host, _, wid)) = tab.mux_target.clone() {
+            let zoomed = tab.zoomed;
+            if let Some(client) = mux_client(&host) {
+                let _ = std::thread::Builder::new()
+                    .name("tachyon-mux-zoom".into())
+                    .spawn(move || {
+                        let _ = client.set_window_zoom(&wid, zoomed);
+                    });
+            }
+        }
         self.rewind_exit();
         self.layout();
     }
@@ -2812,14 +2958,20 @@ impl TermWindow {
     /// for the caller to close.
     fn close_pane(&mut self, i: usize, p: usize, keep: bool) -> Option<Retained<NSWindow>> {
         if self.tabs[i].panes.len() == 1 {
+            // Closing a Mux v2 pane by hand kills that block/window on its server.
+            let is_mux = self.tabs[i].panes[p].pty.is_mux();
+            if keep && is_mux {
+                self.tabs[i].panes[p].kill_on_drop.set(true);
+            }
             if self.tabs.len() == 1 {
-                if !keep {
+                if !keep || is_mux {
+                    // Drop immediately on window close (no ⌥⌘T zombie for killed Mux panes).
                     self.shell_ended = true;
                 }
                 return Some(self.window.clone());
             }
             let tab = self.take_tab(i);
-            if keep {
+            if keep && !is_mux {
                 keep_closed(tab);
             }
             return None;
@@ -2833,7 +2985,11 @@ impl TermWindow {
         let next = tab.layout.remove(tab.panes[p].id);
         tab.zoomed = false;
         let pane = tab.panes.remove(p);
-        if keep {
+        let is_mux = pane.pty.is_mux();
+        if keep && is_mux {
+            pane.kill_on_drop.set(true);
+        }
+        if keep && !is_mux {
             keep_closed(Tab::new(pane));
         }
         let tab = &mut self.tabs[i];
@@ -3574,17 +3730,29 @@ impl TermWindow {
 
     /// Drag a divider to the cell under the pointer.
     fn drag_divider(&mut self, event: &NSEvent) {
-        let Some(d) = &self.dragging_divider else {
+        let Some(d) = self.dragging_divider.clone() else {
             return;
         };
         let (fx, fy) = self.grid_point(event);
-        let ratio = panes::ratio_at(d, fx.max(0.0) as usize, fy.max(0.0) as usize);
+        let ratio = panes::ratio_at(&d, fx.max(0.0) as usize, fy.max(0.0) as usize);
+        let header_rows = self.pane_header_rows(&self.tabs[self.active]);
         let tab = &mut self.tabs[self.active];
         let before = tab.dividers.clone();
         tab.layout.set_ratio(&d.path, ratio);
         let (cols, rows) = self.grid;
-        tab.lay_out(cols, rows, cell_pixels(&self.renderer));
+        tab.lay_out(cols, rows, cell_pixels(&self.renderer), header_rows);
+        if let Some((host, _, wid)) = tab.mux_target.clone() {
+            let path = d.path.clone();
+            if let Some(client) = mux_client(&host) {
+                let _ = std::thread::Builder::new()
+                    .name("tachyon-mux-ratio".into())
+                    .spawn(move || {
+                        let _ = client.set_window_ratio(&wid, &path, ratio);
+                    });
+            }
+        }
         if tab.dividers != before {
+            self.place_pane_headers();
             self.view.window().map(|w| w.invalidateCursorRectsForView(&self.view));
             self.request_redraw();
         }
@@ -3657,16 +3825,164 @@ impl TermWindow {
             .strip_index(p.x as f32 * scale, (height - p.y as f32) * scale, self.tabs.len())
     }
 
+    fn sidebar_shown(&self) -> bool {
+        self.sidebar.is_some() && self.sidebar_open && !self.quick && self.notch.is_none()
+    }
+
+    fn pane_header_rows(&self, tab: &Tab) -> usize {
+        if self.quick {
+            return 0;
+        }
+        match self.pane_headers_mode {
+            PaneHeaders::Never => 0,
+            PaneHeaders::Always => 1,
+            PaneHeaders::Auto => {
+                let remote = tab
+                    .mux_target
+                    .as_ref()
+                    .is_some_and(|(h, _, _)| h != "local");
+                if tab.panes.len() > 1 || remote || self.sidebar_shown() {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Position the left sidebar and right terminal view inside `self.container`.
+    fn layout_container(&mut self) {
+        let size = self.container.bounds().size;
+        let show = self.sidebar_shown();
+        if let Some(sb) = &self.sidebar {
+            sb.root.setHidden(!show);
+            if show {
+                let sw = self
+                    .sidebar_width
+                    .clamp(sidebar::MIN_WIDTH, (size.width - 220.0).max(sidebar::MIN_WIDTH));
+                sb.set_frame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(sw, size.height)));
+                self.view.setFrame(NSRect::new(
+                    NSPoint::new(sw, 0.0),
+                    NSSize::new((size.width - sw).max(1.0), size.height),
+                ));
+                return;
+            }
+        }
+        self.view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
+    }
+
+    /// ⌘B: show or hide the left multi-host sidebar.
+    fn toggle_sidebar(&mut self) {
+        if self.sidebar.is_none() || self.quick {
+            return;
+        }
+        self.sidebar_open = !self.sidebar_open;
+        self.layout();
+        self.sync_sidebar();
+    }
+
+    fn set_sidebar_width(&mut self, width: f64) {
+        let clamped = width.clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH);
+        if (clamped - self.sidebar_width).abs() < 0.5 {
+            return;
+        }
+        self.sidebar_width = clamped;
+        self.layout();
+    }
+
+    fn set_sidebar_filter(&mut self, query: String) {
+        if let Some(sb) = &self.sidebar {
+            sb.set_filter(query);
+        }
+    }
+
+    fn sync_sidebar(&self) {
+        if let Some(sb) = &self.sidebar {
+            let active = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| t.mux_target.as_ref().map(|(h, _, w)| (h.clone(), w.clone())));
+            sb.set_hosts(mux_host_views(), active);
+        }
+    }
+
+    /// Create/reposition per-pane header bar subviews over each visible pane's reserved top row.
+    fn place_pane_headers(&mut self) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let visible = self.tabs[self.active].visible();
+        let m = self.renderer.metrics();
+        let scale = self.scale();
+        let view_h = self.view.bounds().size.height;
+
+        let mut needed = 0usize;
+        for &p_idx in &visible {
+            let Some(hr) = self.tabs[self.active].panes[p_idx].header_rect else {
+                continue;
+            };
+            if needed >= self.pane_headers.len() {
+                let hv = pane_bar::PaneHeaderView::new(mtm, self.id);
+                self.view.addSubview(&hv);
+                self.pane_headers.push(hv);
+            }
+            let (px, py) = self.renderer.pane_origin(hr.col, hr.row);
+            let pw = (hr.cols as f32 * m.width) as f64 / scale;
+            let ph = (hr.rows as f32 * m.height) as f64 / scale;
+            let x = px as f64 / scale;
+            let y = view_h - (py as f64 / scale) - ph;
+            let hv = &self.pane_headers[needed];
+            hv.setHidden(false);
+            hv.setFrame(NSRect::new(NSPoint::new(x.round(), y.round()), NSSize::new(pw.round(), ph.round())));
+            needed += 1;
+        }
+        for hv in &self.pane_headers[needed..] {
+            hv.setHidden(true);
+        }
+        self.sync_pane_headers();
+    }
+
+    /// Refresh titles, focus, remote-host pills, and running flags on visible pane headers.
+    fn sync_pane_headers(&self) {
+        let tab = &self.tabs[self.active];
+        let visible = tab.visible();
+        let mut slot = 0usize;
+        for &p_idx in &visible {
+            let pane = &tab.panes[p_idx];
+            if pane.header_rect.is_none() || slot >= self.pane_headers.len() {
+                continue;
+            }
+            let (title, running) = {
+                let t = pane.term.lock();
+                (tab_label(&t), t.command_running())
+            };
+            let remote_host = pane
+                .pty
+                .mux_meta()
+                .filter(|m| m.host != "local")
+                .map(|m| m.host.clone());
+            self.pane_headers[slot].update(pane_bar::PaneHeaderModel {
+                pane_id: pane.id,
+                title,
+                remote_host,
+                focused: p_idx == tab.focus,
+                zoomed: tab.zoomed,
+                running,
+            });
+            slot += 1;
+        }
+    }
+
     /// The view changed size: resize the drawable, and the grid if a whole
     /// cell more or fewer now fits.
     fn layout(&mut self) {
+        self.layout_container();
         let scale = self.scale();
         let bounds = self.view.bounds();
         let (w, h) = ((bounds.size.width * scale) as f32, (bounds.size.height * scale) as f32);
         self.renderer.resize(w, h);
 
-        // Around the notch the tabs always show, left of it.
-        let strip = self.tabs.len() > 1 || self.notch.is_some();
+        // With the sidebar open, sessions/windows live in the sidebar so the
+        // bottom tab capsule stays hidden and gives its row back to the grid.
+        let strip = !self.sidebar_shown() && (self.tabs.len() > 1 || self.notch.is_some());
         self.renderer.set_strip(strip);
         self.apply_chrome();
         let inset = self.title_bar_height();
@@ -3689,9 +4005,26 @@ impl TermWindow {
         }
         // Every tab, so one brought forward is already the right size.
         let cell = cell_pixels(&self.renderer);
+        let pane_headers_mode = self.pane_headers_mode;
+        let quick = self.quick;
+        let sb_shown = self.sidebar_shown();
         for tab in &mut self.tabs {
-            tab.lay_out(grid.0, grid.1, cell);
+            let hdr = if quick {
+                0
+            } else {
+                match pane_headers_mode {
+                    PaneHeaders::Never => 0,
+                    PaneHeaders::Always => 1,
+                    PaneHeaders::Auto => {
+                        let remote = tab.mux_target.as_ref().is_some_and(|(h, _, _)| h != "local");
+                        if tab.panes.len() > 1 || remote || sb_shown { 1 } else { 0 }
+                    }
+                }
+            };
+            tab.lay_out(grid.0, grid.1, cell, hdr);
         }
+        self.place_pane_headers();
+        self.sync_sidebar();
         self.window.invalidateCursorRectsForView(&self.view);
         schedule_layout_save();
         self.update_resize_increments();
@@ -3752,8 +4085,13 @@ impl TermWindow {
         if self.title_bar {
             set_titlebar_hidden(&self.window, false);
             self.buttons_visible = true;
-            let tabs_in_bar = self.native_strip && self.tabs.len() > 1;
+            let tabs_in_bar = self.native_strip && !self.sidebar_shown() && self.tabs.len() > 1;
             self.window.setTitleVisibility(if tabs_in_bar { NSWindowTitleVisibility::Hidden } else { NSWindowTitleVisibility::Visible });
+        } else if self.sidebar_shown() {
+            // Keep macOS traffic lights visible cleanly in the top-left of the sidebar (Rex style).
+            self.window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+            set_titlebar_hidden(&self.window, false);
+            self.buttons_visible = true;
         } else {
             self.window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
             if self.buttons_visible {
@@ -4256,7 +4594,7 @@ impl TermWindow {
     /// Edge-to-edge: the traffic lights stay hidden until the pointer reaches
     /// the top-left corner.
     fn hover(&mut self, location: Option<NSPoint>) {
-        if self.title_bar || self.notch.is_some() {
+        if self.title_bar || self.notch.is_some() || self.sidebar_shown() {
             return;
         }
         let height = self.view.bounds().size.height;
@@ -4947,8 +5285,11 @@ impl App {
         let probe = renderer::grid_metrics(&cfg.font, scale as f32);
         let pad_x = (cfg.window.padding_x as f64 * scale).round();
         let pad_y = (cfg.window.padding_y as f64 * scale).round();
+        let sidebar_open = !quick && cfg.window.sidebar;
+        let sidebar_width = (cfg.window.sidebar_width as f64).clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH);
         let content = NSSize::new(
-            (cfg.window.cols as f64 * probe.width as f64 + 2.0 * pad_x) / scale,
+            (cfg.window.cols as f64 * probe.width as f64 + 2.0 * pad_x) / scale
+                + if sidebar_open { sidebar_width } else { 0.0 },
             (cfg.window.rows as f64 * probe.height as f64 + 2.0 * pad_y) / scale,
         );
 
@@ -5041,13 +5382,20 @@ impl App {
         };
         view.addTrackingArea(&tracking);
 
+        let container = ContainerView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), content), id);
+        container.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        let sidebar = (!quick).then(|| sidebar::Sidebar::new(mtm, &container, id));
+        container.addSubview(&view);
+
         let mut host_glass = None;
         if glass {
-            let (host, glass_view) = glass_host(mtm, &view, content, cfg.window.glass_clear);
+            let (host, glass_view) = glass_host(mtm, &container, content, cfg.window.glass_clear);
             window.setContentView(Some(&host));
             host_glass = glass_view;
         } else {
-            window.setContentView(Some(&view));
+            window.setContentView(Some(&container));
         }
         let delegate = WindowDelegate::new(mtm, id);
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -5140,6 +5488,12 @@ impl App {
             quick_shown: false,
             quick_inset: 0.0,
             quick_previous: None,
+            container,
+            sidebar,
+            sidebar_open,
+            sidebar_width,
+            pane_headers_mode: cfg.window.pane_headers,
+            pane_headers: Vec::new(),
             find_bar: None,
             find: None,
             cursor_layer,
@@ -5149,8 +5503,20 @@ impl App {
         Ok((window, view, id))
     }
 
-    /// Start a shell in a new tab of window `window`.
+    /// Start a shell in a new tab of window `window`. If the active tab is
+    /// backed by a Mux v2 server (local or remote like `kagutsuchi`), creates a
+    /// new Window in that same host session.
     fn new_tab(&mut self, window: u64) -> Result<(), String> {
+        let mux = self
+            .windows
+            .iter()
+            .find(|w| w.id == window)
+            .and_then(|w| w.tabs.get(w.active))
+            .and_then(|t| t.mux_target.clone());
+        if let Some((host, sid, _)) = mux {
+            mux_new_window(window, &host, &sid);
+            return Ok(());
+        }
         self.open_tab_for(window, None)
     }
 
@@ -5211,6 +5577,64 @@ impl App {
         if rect.cols < 2 || rect.rows < 1 {
             // No room for another pane.
             objc2_app_kit::NSBeep();
+            return Ok(());
+        }
+        // If this pane belongs to a Mux v2 server (local or remote like `kagutsuchi`),
+        // split directly on that host so the new pane lives on the same machine.
+        if let (Some(meta), Some(client)) = (from.pty.mux_meta().cloned(), from.pty.mux_client().cloned()) {
+            let mux_dir = match dir {
+                panes::Dir::Right => crate::mux::model::SplitDir::Right,
+                panes::Dir::Down => crate::mux::model::SplitDir::Down,
+            };
+            let cfg = self.cfg.clone();
+            let (cols, rows) = (rect.cols.max(2) as u16, rect.rows.max(1) as u16);
+            let _ = std::thread::Builder::new()
+                .name("tachyon-mux-split".into())
+                .spawn(move || {
+                    let res = client
+                        .split_block(&meta.block_id, mux_dir, cwd.as_deref(), None, None, cols, rows)
+                        .and_then(|(_win, blk)| {
+                            let stream = client.attach(&blk.id, true, true)?;
+                            Ok((blk, stream))
+                        });
+                    match res {
+                        Ok((blk, stream)) => {
+                            let new_meta = pty::MuxMeta {
+                                host: meta.host.clone(),
+                                session_id: blk.session_id.clone(),
+                                window_id: blk.window_id.clone(),
+                                block_id: blk.id.clone(),
+                            };
+                            let pid = blk.pid;
+                            let awake = blk.awake;
+                            DispatchQueue::main().exec_async(move || {
+                                with_app(|app| {
+                                    let w = app.windows.iter_mut().find(|w| w.id == window)?;
+                                    let tab_idx = w
+                                        .tabs
+                                        .iter()
+                                        .position(|t| t.index_of(from_id).is_some())?;
+                                    let pane = Pane::attach_mux(&cfg, stream, client, new_meta, pid, awake).ok()?;
+                                    let tab = &mut w.tabs[tab_idx];
+                                    // Avoid duplicate insert if an event already synced it.
+                                    if tab.panes.iter().any(|p| p.pty.mux_meta().is_some_and(|m| m.block_id == blk.id)) {
+                                        return Some(());
+                                    }
+                                    tab.layout.split(from_id, pane.id, dir);
+                                    tab.zoomed = false;
+                                    tab.panes.push(pane);
+                                    let new = tab.panes.len() - 1;
+                                    w.layout();
+                                    if tab_idx == w.active {
+                                        w.focus_pane(new);
+                                    }
+                                    Some(())
+                                });
+                            });
+                        }
+                        Err(e) => crate::log::force(&format!("mux split failed on {}: {e}", meta.host)),
+                    }
+                });
             return Ok(());
         }
         let mut pane = Pane::start(&self.cfg, rect.cols, rect.rows, None, cwd.as_deref())?;
@@ -5280,11 +5704,16 @@ fn close_active_tab(window: u64) {
     }
 }
 
+/// Close the focused pane from a pane header's `×` button.
+fn close_focused_pane(window: u64) {
+    close_active_tab(window);
+}
+
 /// A view that puts `view` on glass: Liquid Glass on macOS 26 and later,
 /// otherwise the blurred window material macOS used before.
 fn glass_host(
     mtm: MainThreadMarker,
-    view: &TachyonView,
+    view: &NSView,
     size: NSSize,
     clear: bool,
 ) -> (Retained<NSView>, Option<Retained<NSGlassEffectView>>) {
@@ -5625,6 +6054,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Previous Command", sel!(tachyonPreviousCommand:), "\u{F700}");
     item(&view, "Next Command", sel!(tachyonNextCommand:), "\u{F701}");
     view.addItem(&NSMenuItem::separatorItem(mtm));
+    item(&view, "Toggle Sidebar", sel!(tachyonToggleSidebar:), "b");
     item(&view, "Show Title Bar", sel!(tachyonTitleBar:), "");
     item(&view, "Full Screen Around the Notch", sel!(tachyonNotch:), "f")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
@@ -5694,6 +6124,33 @@ fn open_session(cfg: &Config, cols: usize, rows: usize, run: Option<&str>, cwd: 
     let zsh_runs_it = run.is_some() && extra_env.iter().any(|(k, _)| k == "ZDOTDIR");
     if let (Some(cmd), true) = (run, zsh_runs_it) {
         extra_env.push(("TACHYON_RUN".into(), cmd.to_string()));
+    }
+    // Prefer the portable local Mux v2 server when persistence is enabled and
+    // no explicit one-shot startup command is requested.
+    if cfg.shell.persist && run.is_none() {
+        if let Some(client) = mux_client("local") {
+            match client
+                .create_session(None, cwd, None, None, cols.max(2) as u16, rows.max(1) as u16)
+                .and_then(|(_sess, _win, blk)| {
+                    let stream = client.attach(&blk.id, true, true)?;
+                    Ok((blk, stream))
+                })
+            {
+                Ok((blk, stream)) => {
+                    let meta = pty::MuxMeta {
+                        host: "local".into(),
+                        session_id: blk.session_id.clone(),
+                        window_id: blk.window_id.clone(),
+                        block_id: blk.id.clone(),
+                    };
+                    let id = LOCAL_IDS.fetch_add(1, Ordering::Relaxed);
+                    let pty = Pty::mux(stream, client, meta, blk.pid);
+                    crate::log!("tab {id}: spawned local Mux v2 block {}", blk.id);
+                    return Ok((id, pty));
+                }
+                Err(e) => crate::log::force(&format!("local mux server spawn failed: {e}; falling back")),
+            }
+        }
     }
     let at_host = HOST.with(|h| {
         h.borrow()
@@ -5770,10 +6227,10 @@ fn start_session(
             // 128 KiB amortises the syscall over a burst without holding the
             // terminal lock for long.
             let mut buf = vec![0u8; 128 * 1024];
-            // A host's shell: how much of what follows is the restored screen.
+            // A legacy host's shell: how much of what follows is the restored screen.
             let mut replay = 0usize;
             let mut awake_here = false;
-            if reader_pty.is_remote() {
+            if reader_pty.is_remote() && !reader_pty.is_mux() {
                 let mut header = [0u8; 8];
                 let mut got = 0;
                 while got < 8 {
@@ -5789,9 +6246,32 @@ fn start_session(
             }
             loop {
                 let want = if replay > 0 { replay.min(buf.len()) } else { buf.len() };
-                let n = match reader_pty.read(&mut buf[..want]) {
-                    Ok(0) => break,
-                    Ok(n) => n,
+                let n = match reader_pty.read_chunk(&mut buf[..want]) {
+                    Ok(pty::ReadChunk::Eof) => break,
+                    Ok(pty::ReadChunk::Snapshot(vt)) => {
+                        if !vt.is_empty() {
+                            let mut t = reader_term.lock();
+                            t.restoring = true;
+                            processor.advance(&mut t, &vt);
+                            t.restoring = false;
+                            if awake_after_restore {
+                                t.set_keep_awake(true);
+                            }
+                            let _ = t.take_replies();
+                            let _ = t.take_command_events();
+                        }
+                        if !wake_pending.swap(true, Ordering::AcqRel) {
+                            DispatchQueue::main().exec_async(move || {
+                                with_tab(id, |w, i| {
+                                    if i == w.active {
+                                        w.resume();
+                                    }
+                                });
+                            });
+                        }
+                        continue;
+                    }
+                    Ok(pty::ReadChunk::Data(n)) => n,
                     Err(e) => {
                         crate::log!("tab {id}: pty read failed: {e}");
                         break;
@@ -6213,13 +6693,20 @@ pub fn run(cfg: Config) -> Result<(), String> {
         SUGGESTIONS.with(|s| *s.borrow_mut() = Some(suggest::History::load()));
     }
     let persist = with_app(|a| a.cfg.shell.persist).unwrap_or(false);
+    // Start the multi-host Mux v2 manager (`This Mac` + configured remote hosts like `kagutsuchi`).
+    let mgr = host_mgr::HostManager::start(sync_all_sidebars, handle_mux_event);
+    if persist {
+        let _ = mgr.connect_local_now();
+    }
+    HOST_MGR.with(|h| *h.borrow_mut() = Some(mgr));
+
     if persist {
         match host::Client::connect() {
             Ok(c) => HOST.with(|h| *h.borrow_mut() = Some(c)),
-            Err(e) => crate::log::force(&format!("no session host ({e}); shells will end with the app")),
+            Err(e) => crate::log::force(&format!("no legacy session host ({e})")),
         }
     }
-    if !restore_sessions(mtm) {
+    if !restore_mux_local_window(mtm) && !restore_sessions(mtm) {
         open_window();
     }
     // Open around the notch, when that's what full screen means here.
@@ -6243,6 +6730,509 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
     APP.with(|cell| cell.borrow_mut().take());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multi-host Mux v2 UI orchestration (Sidebar <-> HostManager <-> TermWindow)
+// ---------------------------------------------------------------------------
+
+fn host_mgr() -> Option<Arc<host_mgr::HostManager>> {
+    HOST_MGR.with(|h| h.borrow().clone())
+}
+
+fn mux_client(host: &str) -> Option<Arc<crate::mux::client::MuxClient>> {
+    host_mgr()?.client(host)
+}
+
+fn mux_host_views() -> Vec<host_mgr::HostView> {
+    host_mgr().map(|m| m.views()).unwrap_or_default()
+}
+
+fn sync_all_sidebars() {
+    with_app(|app| {
+        for w in &app.windows {
+            w.sync_sidebar();
+            w.sync_pane_headers();
+        }
+    });
+}
+
+fn mux_reconnect_host(alias: &str) {
+    if let Some(m) = host_mgr() {
+        m.reconnect(alias);
+    }
+}
+
+fn mux_refresh_all() {
+    if let Some(m) = host_mgr() {
+        for h in m.views() {
+            m.reconnect(&h.alias);
+        }
+    }
+}
+
+fn mux_add_host(alias: String, uri: String) {
+    if let Some(m) = host_mgr() {
+        if let Err(e) = m.add_host(alias, uri) {
+            crate::log::force(&format!("could not add host: {e}"));
+        }
+    }
+}
+
+fn mux_remove_host(alias: &str) {
+    if let Some(m) = host_mgr() {
+        if let Err(e) = m.remove_host(alias) {
+            crate::log::force(&format!("could not remove host: {e}"));
+        }
+    }
+}
+
+/// Convert a server `LayoutNode` (keyed by block IDs) into a local `panes::Node`
+/// (keyed by local `Pane::id`), returning `None` if a leaf is missing.
+fn build_panes_tree(
+    node: &crate::mux::model::LayoutNode,
+    id_map: &std::collections::HashMap<String, u64>,
+) -> Option<panes::Node> {
+    match node {
+        crate::mux::model::LayoutNode::Leaf(bid) => id_map.get(bid).copied().map(panes::Node::Leaf),
+        crate::mux::model::LayoutNode::Split { dir, ratio, a, b } => {
+            let d = match dir {
+                crate::mux::model::SplitDir::Right => panes::Dir::Right,
+                crate::mux::model::SplitDir::Down => panes::Dir::Down,
+            };
+            match (build_panes_tree(a, id_map), build_panes_tree(b, id_map)) {
+                (Some(na), Some(nb)) => Some(panes::Node::Split {
+                    dir: d,
+                    ratio: *ratio,
+                    a: Box::new(na),
+                    b: Box::new(nb),
+                }),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+struct AttachedWindowData {
+    host: String,
+    window: crate::mux::model::WindowInfo,
+    blocks: Vec<(crate::mux::model::BlockInfo, crate::mux::client::AttachedStream)>,
+    client: Arc<crate::mux::client::MuxClient>,
+}
+
+fn build_tab_from_attached(cfg: &Config, data: AttachedWindowData) -> Result<Tab, String> {
+    let mut panes_vec = Vec::new();
+    let mut id_map = std::collections::HashMap::new();
+    for (blk, stream) in data.blocks {
+        let meta = pty::MuxMeta {
+            host: data.host.clone(),
+            session_id: blk.session_id.clone(),
+            window_id: blk.window_id.clone(),
+            block_id: blk.id.clone(),
+        };
+        let pane = Pane::attach_mux(cfg, stream, Arc::clone(&data.client), meta, blk.pid, blk.awake)?;
+        id_map.insert(blk.id.clone(), pane.id);
+        panes_vec.push(pane);
+    }
+    if panes_vec.is_empty() {
+        return Err("window has no attachable blocks".into());
+    }
+    let layout = build_panes_tree(&data.window.layout, &id_map)
+        .unwrap_or_else(|| panes::Node::Leaf(panes_vec[0].id));
+    let focus = id_map
+        .get(&data.window.focused_block)
+        .and_then(|pid| panes_vec.iter().position(|p| p.id == *pid))
+        .unwrap_or(0);
+    Ok(Tab {
+        panes: panes_vec,
+        focus,
+        layout,
+        zoomed: data.window.zoomed,
+        dividers: Vec::new(),
+        label: data.window.name.unwrap_or_default(),
+        title_rev: u64::MAX,
+        unseen: None,
+        mux_target: Some((data.host, data.window.session_id, data.window.id)),
+    })
+}
+
+/// On launch, if the local Mux v2 server already has running sessions/windows,
+/// reopen the most recent active window in a fresh Tachyon window.
+fn restore_mux_local_window(mtm: MainThreadMarker) -> bool {
+    let Some(client) = mux_client("local") else {
+        return false;
+    };
+    let Ok(snap) = client.state() else {
+        return false;
+    };
+    let Some(win) = snap
+        .sessions
+        .last()
+        .and_then(|s| s.active_window.as_ref().or(s.windows.last()))
+        .and_then(|wid| snap.windows.iter().find(|w| &w.id == wid))
+        .cloned()
+    else {
+        return false;
+    };
+
+    let mut attached = Vec::new();
+    for bid in win.layout.leaves() {
+        let Some(blk) = snap.blocks.iter().find(|b| b.id == bid).cloned() else {
+            continue;
+        };
+        if let Ok(stream) = client.attach(&blk.id, true, true) {
+            attached.push((blk, stream));
+        }
+    }
+    if attached.is_empty() {
+        return false;
+    }
+
+    let data = AttachedWindowData {
+        host: "local".into(),
+        window: win,
+        blocks: attached,
+        client,
+    };
+    let opened = with_app(|app| {
+        let tab = build_tab_from_attached(&app.cfg, data).ok()?;
+        app.create_window(mtm, Some((vec![tab], 0)), false).ok()
+    })
+    .flatten();
+
+    if let Some((window, view, id)) = opened {
+        with_window(id, |w| {
+            w.apply_appearance();
+            w.layout();
+        });
+        window.makeKeyAndOrderFront(None);
+        window.makeFirstResponder(Some(&view));
+        NSApplication::sharedApplication(mtm).activate();
+        return true;
+    }
+    false
+}
+
+/// Switch `win_id` to `(host, window_id)`, attaching its blocks over Mux v2 if
+/// not already open in this window.
+fn mux_select_window(win_id: u64, host: &str, window_id: &str) {
+    // Fast path: already open as a tab in this window.
+    let switched = query_window(win_id, |w| {
+        if let Some(i) = w
+            .tabs
+            .iter()
+            .position(|t| t.mux_target.as_ref().is_some_and(|(h, _, wid)| h == host && wid == window_id))
+        {
+            w.switch_to(i);
+            w.focus_terminal();
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false);
+    if switched {
+        return;
+    }
+
+    let Some(client) = mux_client(host) else {
+        mux_reconnect_host(host);
+        return;
+    };
+    let host_owned = host.to_string();
+    let wid_owned = window_id.to_string();
+    let _ = std::thread::Builder::new()
+        .name("tachyon-mux-attach".into())
+        .spawn(move || {
+            let Ok(snap) = client.state() else { return };
+            let Some(win) = snap.windows.into_iter().find(|w| w.id == wid_owned) else {
+                return;
+            };
+            let mut attached = Vec::new();
+            for bid in win.layout.leaves() {
+                let Some(blk) = snap.blocks.iter().find(|b| b.id == bid).cloned() else {
+                    continue;
+                };
+                if let Ok(stream) = client.attach(&blk.id, true, true) {
+                    attached.push((blk, stream));
+                }
+            }
+            if attached.is_empty() {
+                return;
+            }
+            let data = AttachedWindowData {
+                host: host_owned,
+                window: win,
+                blocks: attached,
+                client,
+            };
+            DispatchQueue::main().exec_async(move || {
+                with_app(|app| {
+                    let cfg = app.cfg.clone();
+                    let w = app.windows.iter_mut().find(|w| w.id == win_id)?;
+                    // Re-check in case another click opened it while attaching.
+                    if let Some(i) = w.tabs.iter().position(|t| {
+                        t.mux_target
+                            .as_ref()
+                            .is_some_and(|(h, _, wid)| h == &data.host && wid == &data.window.id)
+                    }) {
+                        w.switch_to(i);
+                        w.focus_terminal();
+                        return Some(());
+                    }
+                    if let Ok(tab) = build_tab_from_attached(&cfg, data) {
+                        w.add_tab(tab);
+                        w.focus_terminal();
+                    }
+                    Some(())
+                });
+            });
+        });
+}
+
+fn mux_new_session(win_id: u64, host: &str) {
+    let Some(client) = mux_client(host) else {
+        mux_reconnect_host(host);
+        return;
+    };
+    let (cols, rows) = query_window(win_id, |w| (w.grid.0.max(40) as u16, w.grid.1.max(12) as u16))
+        .unwrap_or((120, 32));
+    let host_owned = host.to_string();
+    let mgr = host_mgr();
+    let _ = std::thread::Builder::new()
+        .name("tachyon-mux-new-sess".into())
+        .spawn(move || {
+            let res = client
+                .create_session(None, None, None, None, cols, rows)
+                .and_then(|(_sess, win, blk)| {
+                    let stream = client.attach(&blk.id, true, true)?;
+                    Ok((win, blk, stream))
+                });
+            match res {
+                Ok((win, blk, stream)) => {
+                    if let Some(m) = mgr {
+                        m.refresh_host(&host_owned);
+                    }
+                    let data = AttachedWindowData {
+                        host: host_owned,
+                        window: win,
+                        blocks: vec![(blk, stream)],
+                        client,
+                    };
+                    DispatchQueue::main().exec_async(move || {
+                        with_app(|app| {
+                            let cfg = app.cfg.clone();
+                            let w = app.windows.iter_mut().find(|w| w.id == win_id)?;
+                            if let Ok(tab) = build_tab_from_attached(&cfg, data) {
+                                w.add_tab(tab);
+                                w.focus_terminal();
+                            }
+                            Some(())
+                        });
+                    });
+                }
+                Err(e) => crate::log::force(&format!("new session on {host_owned} failed: {e}")),
+            }
+        });
+}
+
+fn mux_new_window(win_id: u64, host: &str, session_id: &str) {
+    let Some(client) = mux_client(host) else {
+        mux_reconnect_host(host);
+        return;
+    };
+    let (cols, rows) = query_window(win_id, |w| (w.grid.0.max(40) as u16, w.grid.1.max(12) as u16))
+        .unwrap_or((120, 32));
+    let host_owned = host.to_string();
+    let sid = session_id.to_string();
+    let mgr = host_mgr();
+    let _ = std::thread::Builder::new()
+        .name("tachyon-mux-new-win".into())
+        .spawn(move || {
+            let res = client
+                .create_window(&sid, None, None, None, None, cols, rows)
+                .and_then(|(win, blk)| {
+                    let stream = client.attach(&blk.id, true, true)?;
+                    Ok((win, blk, stream))
+                });
+            match res {
+                Ok((win, blk, stream)) => {
+                    if let Some(m) = mgr {
+                        m.refresh_host(&host_owned);
+                    }
+                    let data = AttachedWindowData {
+                        host: host_owned,
+                        window: win,
+                        blocks: vec![(blk, stream)],
+                        client,
+                    };
+                    DispatchQueue::main().exec_async(move || {
+                        with_app(|app| {
+                            let cfg = app.cfg.clone();
+                            let w = app.windows.iter_mut().find(|w| w.id == win_id)?;
+                            if let Ok(tab) = build_tab_from_attached(&cfg, data) {
+                                w.add_tab(tab);
+                                w.focus_terminal();
+                            }
+                            Some(())
+                        });
+                    });
+                }
+                Err(e) => crate::log::force(&format!("new window on {host_owned} failed: {e}")),
+            }
+        });
+}
+
+/// If `win_id` only has one open tab and it belongs to the session/window
+/// about to be killed from the sidebar, open another existing Mux window first
+/// so tidying up old sessions never closes the user's macOS window unexpectedly.
+fn switch_away_before_kill(win_id: u64, host: &str, session_id: Option<&str>, window_id: Option<&str>) {
+    let matches_sole_tab = query_window(win_id, |w| {
+        if w.tabs.len() != 1 {
+            return false;
+        }
+        w.tabs[0].mux_target.as_ref().is_some_and(|(h, s, wid)| {
+            h == host
+                && session_id.map_or(true, |sid| s == sid)
+                && window_id.map_or(true, |target_w| wid == target_w)
+        })
+    })
+    .unwrap_or(false);
+    if !matches_sole_tab {
+        return;
+    }
+    let fallback = mux_host_views().into_iter().find_map(|hv| {
+        let snap = hv.snapshot?;
+        for w in snap.windows {
+            let same_host = hv.alias == host;
+            let same_sess = same_host && session_id.is_some_and(|sid| w.session_id == sid);
+            let same_win = same_host && window_id.is_some_and(|target_w| w.id == target_w);
+            if !same_sess && !same_win {
+                return Some((hv.alias, w.id));
+            }
+        }
+        None
+    });
+    if let Some((other_host, other_wid)) = fallback {
+        mux_select_window(win_id, &other_host, &other_wid);
+    }
+}
+
+fn mux_kill_session(win_id: u64, host: &str, session_id: &str) {
+    switch_away_before_kill(win_id, host, Some(session_id), None);
+    let Some(client) = mux_client(host) else { return };
+    let host_owned = host.to_string();
+    let sid = session_id.to_string();
+    let mgr = host_mgr();
+    let _ = std::thread::Builder::new()
+        .name("tachyon-mux-kill-sess".into())
+        .spawn(move || {
+            let _ = client.kill_session(&sid);
+            if let Some(m) = mgr {
+                m.refresh_host(&host_owned);
+            }
+        });
+}
+
+fn mux_kill_window(win_id: u64, host: &str, window_id: &str) {
+    switch_away_before_kill(win_id, host, None, Some(window_id));
+    let Some(client) = mux_client(host) else { return };
+    let host_owned = host.to_string();
+    let wid = window_id.to_string();
+    let mgr = host_mgr();
+    let _ = std::thread::Builder::new()
+        .name("tachyon-mux-kill-win".into())
+        .spawn(move || {
+            let _ = client.kill_window(&wid);
+            if let Some(m) = mgr {
+                m.refresh_host(&host_owned);
+            }
+        });
+}
+
+/// Live server event handler: when a CLI command or coding agent splits a
+/// window currently open in Tachyon, attach the new pane into the live layout.
+fn handle_mux_event(host: String, ev: serde_json::Value) {
+    if ev.get("event").and_then(serde_json::Value::as_str) != Some("block.created") {
+        return;
+    }
+    let Some(win_info) = crate::mux::model::WindowInfo::from_json(ev.get("window").unwrap_or(&serde_json::Value::Null)) else {
+        return;
+    };
+    let Some(blk_info) = crate::mux::model::BlockInfo::from_json(ev.get("block").unwrap_or(&serde_json::Value::Null)) else {
+        return;
+    };
+    let matching_window_id = with_app(|app| {
+        for w in &app.windows {
+            for t in &w.tabs {
+                if t.mux_target
+                    .as_ref()
+                    .is_some_and(|(h, _, wid)| h == &host && wid == &win_info.id)
+                {
+                    if !t
+                        .panes
+                        .iter()
+                        .any(|p| p.pty.mux_meta().is_some_and(|m| m.block_id == blk_info.id))
+                    {
+                        return Some(w.id);
+                    }
+                }
+            }
+        }
+        None
+    })
+    .flatten();
+
+    let Some(win_id) = matching_window_id else {
+        return;
+    };
+    let Some(client) = mux_client(&host) else { return };
+    let _ = std::thread::Builder::new()
+        .name("tachyon-mux-sync-pane".into())
+        .spawn(move || {
+            let Ok(stream) = client.attach(&blk_info.id, true, true) else {
+                return;
+            };
+            DispatchQueue::main().exec_async(move || {
+                with_app(|app| {
+                    let cfg = app.cfg.clone();
+                    let w = app.windows.iter_mut().find(|w| w.id == win_id)?;
+                    let tab_idx = w.tabs.iter().position(|t| {
+                        t.mux_target
+                            .as_ref()
+                            .is_some_and(|(h, _, wid)| h == &host && wid == &win_info.id)
+                    })?;
+                    let tab = &mut w.tabs[tab_idx];
+                    if tab
+                        .panes
+                        .iter()
+                        .any(|p| p.pty.mux_meta().is_some_and(|m| m.block_id == blk_info.id))
+                    {
+                        return Some(());
+                    }
+                    let meta = pty::MuxMeta {
+                        host: host.clone(),
+                        session_id: blk_info.session_id.clone(),
+                        window_id: blk_info.window_id.clone(),
+                        block_id: blk_info.id.clone(),
+                    };
+                    let pane = Pane::attach_mux(&cfg, stream, client, meta, blk_info.pid, blk_info.awake).ok()?;
+                    tab.panes.push(pane);
+                    let mut id_map = std::collections::HashMap::new();
+                    for p in &tab.panes {
+                        if let Some(m) = p.pty.mux_meta() {
+                            id_map.insert(m.block_id.clone(), p.id);
+                        }
+                    }
+                    if let Some(tree) = build_panes_tree(&win_info.layout, &id_map) {
+                        tab.layout = tree;
+                        tab.zoomed = win_info.zoomed;
+                    }
+                    w.layout();
+                    Some(())
+                });
+            });
+        });
 }
 
 #[cfg(test)]
@@ -6286,5 +7276,37 @@ mod tests {
         assert_eq!(short_path(&home), "~");
         assert_eq!(short_path("/"), "/");
         assert_eq!(short_path("/usr/local/bin/"), "bin");
+    }
+
+    #[test]
+    fn mux_layout_converts_into_panes_tree() {
+        use std::collections::HashMap;
+        use super::{build_panes_tree, panes};
+        use crate::mux::model::{LayoutNode, SplitDir};
+
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Right,
+            ratio: 0.4,
+            a: Box::new(LayoutNode::Leaf("b1".into())),
+            b: Box::new(LayoutNode::Split {
+                dir: SplitDir::Down,
+                ratio: 0.6,
+                a: Box::new(LayoutNode::Leaf("b2".into())),
+                b: Box::new(LayoutNode::Leaf("b3".into())),
+            }),
+        };
+        let ids: HashMap<String, u64> = [("b1".into(), 10), ("b2".into(), 20), ("b3".into(), 30)].into();
+        let node = build_panes_tree(&tree, &ids).expect("full layout maps cleanly");
+        assert_eq!(node.leaves(), vec![10, 20, 30]);
+
+        // Layout produces three non-overlapping rects with 2 dividers.
+        let (rects, divs) = node.layout(panes::Rect { col: 0, row: 0, cols: 100, rows: 40 });
+        assert_eq!(rects.len(), 3);
+        assert_eq!(divs.len(), 2);
+
+        // If one leaf failed to attach, the sibling collapses up cleanly.
+        let partial: HashMap<String, u64> = [("b1".into(), 10), ("b3".into(), 30)].into();
+        let collapsed = build_panes_tree(&tree, &partial).expect("partial layout collapses");
+        assert_eq!(collapsed.leaves(), vec![10, 30]);
     }
 }

@@ -144,6 +144,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | | |
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
+| ⌘B | Toggle the multi-host sidebar (local + remote servers) |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
 | ⌘-click / ⌥⌘-click | Open a URL, a file in Quick Look, or a traceback's file:line in your editor / any file in your editor |
 | ⌃` (from any app) | The quick terminal, dropping from the notch, or away again |
@@ -481,7 +482,19 @@ tachyon -S kagutsuchi events --json
 Remote hosts connect over one persistent `ssh <host> tachyon bridge` per host
 (zero open ports, using `~/.ssh/config` and Tailscale). Every server-managed
 block automatically receives `TACHYON_SERVER`, `TACHYON_SESSION`,
-`TACHYON_WINDOW`, and `TACHYON_BLOCK`. See
+`TACHYON_WINDOW`, and `TACHYON_BLOCK`.
+
+**Multi-host sidebar & pane headers.** On macOS, a collapsible Liquid Glass left
+sidebar (**⌘B**, View > Toggle Sidebar) lists **This Mac** plus every remote
+host in `~/.config/Tachyon/hosts.json` with live connection status, RTT, and
+grouped `Host → Session → Window` trees — click any local or remote window to
+attach immediately with LZ4 screen restore, filter live from the bottom search
+box, right-click for session/window actions, drag the right divider to resize
+(`180–360 pt`), or click the globe button to add discovered `~/.ssh/config`
+hosts. Each visible pane gets a compact header bar showing its title, a remote
+host pill when running on another machine, and hover buttons for split right,
+split down, zoom, and close (`window.sidebar`, `window.sidebar_width`,
+`window.pane_headers = always | auto | never`). See
 [docs/REX_ARCHITECTURE.md](docs/REX_ARCHITECTURE.md) for the full design and
 roadmap.
 

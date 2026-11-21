@@ -77,6 +77,12 @@ window.padding_y = 6.0
 # Tachyon opens that way. Option-Cmd-F goes around the notch either way.
 # window.fullscreen = native
 
+# macOS: collapsible Rex-style multi-host sidebar (`⌘B` toggles at runtime)
+# and per-pane header bars (`always`, `auto`, or `never`).
+# window.sidebar       = true
+# window.sidebar_width = 240
+# window.pane_headers  = always
+
 # macOS: Liquid Glass's style. clear (the default) is less frosted and bends
 # more of what's behind at its edges; regular frosts it more and adapts its
 # tint to what's behind.

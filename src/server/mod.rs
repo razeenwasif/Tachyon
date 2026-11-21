@@ -383,14 +383,14 @@ mod tests {
         (dir, sock, handle)
     }
 
-    fn drain_until(rx: &std::sync::mpsc::Receiver<StreamChunk>, want: &str) -> String {
+    fn drain_until(stream: &crate::mux::client::AttachedStream, want: &str) -> String {
         let mut buf = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if String::from_utf8_lossy(&buf).contains(want) {
                 break;
             }
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            match stream.recv_timeout(Duration::from_millis(100)) {
                 Ok(StreamChunk::Snapshot(b)) | Ok(StreamChunk::Output(b)) => buf.extend_from_slice(&b),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -430,12 +430,12 @@ mod tests {
 
         // Attach and wait for initial output.
         let stream = c1.attach(&blk.id, true, true).unwrap();
-        let seen = drain_until(&stream.rx, "BOOT_OK");
+        let seen = drain_until(&stream, "BOOT_OK");
         assert!(seen.contains("BOOT_OK"), "got: {seen:?}");
 
         // Send input over the live stream and verify echo.
         stream.write(b"tachyon-v2\n").unwrap();
-        let seen2 = drain_until(&stream.rx, "ECHO:tachyon-v2");
+        let seen2 = drain_until(&stream, "ECHO:tachyon-v2");
         assert!(seen2.contains("ECHO:tachyon-v2"), "got: {seen2:?}");
 
         // Capture plain text from server Term.
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(snap.sessions[0].name, "work");
 
         let restored_stream = c2.attach(&blk.id, true, true).unwrap();
-        let first = restored_stream.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let first = restored_stream.recv_timeout(Duration::from_secs(2)).unwrap();
         let StreamChunk::Snapshot(vt) = first else {
             panic!("expected Snapshot as first chunk on attach");
         };
@@ -512,13 +512,13 @@ mod tests {
         // Warm up.
         for _ in 0..10 {
             stream.write(b"x").unwrap();
-            let _ = stream.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let _ = stream.recv_timeout(Duration::from_secs(2)).unwrap();
         }
         let mut times = Vec::with_capacity(500);
         for _ in 0..500 {
             let start = Instant::now();
             stream.write(b"x").unwrap();
-            let _ = stream.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let _ = stream.recv_timeout(Duration::from_secs(2)).unwrap();
             times.push(start.elapsed().as_secs_f64() * 1e6);
         }
         times.sort_by(f64::total_cmp);
