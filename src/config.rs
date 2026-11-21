@@ -141,6 +141,10 @@ pub struct WindowConfig {
     pub sidebar_width: f32,
     /// macOS: per-pane header bars (`always`, `auto`, `never`).
     pub pane_headers: PaneHeaders,
+    /// macOS: tint glass, top hairline, and hints badge for remote / danger hosts.
+    pub host_tint: bool,
+    /// macOS: multiplier for per-host Liquid Glass tint intensity (`0.0..=2.0`).
+    pub host_tint_strength: f32,
     /// Whether the user set `window.opacity` explicitly. Enabling a backdrop
     /// picks a sensible translucency by default, but must not override a value
     /// the user asked for.
@@ -168,6 +172,8 @@ impl Default for WindowConfig {
             sidebar: cfg!(target_os = "macos"),
             sidebar_width: 240.0,
             pane_headers: PaneHeaders::Never,
+            host_tint: true,
+            host_tint_strength: 1.0,
             opacity_explicit: false,
         }
     }
@@ -469,6 +475,9 @@ pub struct Config {
     pub shell: ShellConfig,
     pub agents: AgentsConfig,
     pub macos: MacConfig,
+    /// Per-host accent/danger colour rules (`host.color.<pattern> = <color>`),
+    /// matching Mux remote hosts and plain `ssh <host>` sessions.
+    pub host_colors: Vec<(String, String)>,
     pub scrollback: usize,
     /// Diagnostics produced while loading, surfaced by the caller.
     pub warnings: Vec<String>,
@@ -487,6 +496,7 @@ impl Default for Config {
             shell: ShellConfig::default(),
             agents: AgentsConfig::default(),
             macos: MacConfig::default(),
+            host_colors: Vec::new(),
             scrollback: 10_000,
             warnings: Vec::new(),
         }
@@ -731,6 +741,10 @@ impl Config {
             "window.hints" => self.window.hints = parse_bool(value)?,
             "window.sidebar" => self.window.sidebar = parse_bool(value)?,
             "window.sidebar_width" => self.window.sidebar_width = parse_f32(value, 180.0, 360.0)?,
+            "window.host_tint" => self.window.host_tint = parse_bool(value)?,
+            "window.host_tint_strength" => {
+                self.window.host_tint_strength = parse_f32(value, 0.0, 2.0)?
+            }
             "window.pane_headers" => {
                 self.window.pane_headers = match value.to_ascii_lowercase().as_str() {
                     "always" | "on" | "true" => PaneHeaders::Always,
@@ -758,6 +772,24 @@ impl Config {
             "scrollback" => self.scrollback = parse_usize(value, 0, 5_000_000)?,
 
             _ => {
+                if let Some(pattern) = key.strip_prefix("host.color.") {
+                    let pat = pattern.trim();
+                    if pat.is_empty() {
+                        return Err("host.color.* requires a host name or pattern".into());
+                    }
+                    if !crate::mux::model::HostColor::is_valid_spec(value) {
+                        return Err(format!(
+                            "host.color.{pat}: expected blue|purple|teal|green|amber|orange|red|danger|pink|none|auto or #RRGGBB, got `{value}`"
+                        ));
+                    }
+                    let val = value.trim().to_string();
+                    if let Some(slot) = self.host_colors.iter_mut().find(|(p, _)| p.eq_ignore_ascii_case(pat)) {
+                        slot.1 = val;
+                    } else {
+                        self.host_colors.push((pat.to_string(), val));
+                    }
+                    return Ok(());
+                }
                 // theme.light.* sets the light theme; other theme.* the dark.
                 let known = if let Some(rest) = key.strip_prefix("theme.light.") {
                     self.theme_light.set(rest, value)?
@@ -1081,5 +1113,23 @@ mod contrast_tests {
         assert!(!parsed.agents.auto_name_sessions);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_tint_and_host_color_rules_parse_and_validate() {
+        let cfg = Config::parse(
+            "window.host_tint = true\n\
+             window.host_tint_strength = 1.4\n\
+             host.color.prod* = danger\n\
+             host.color.kagutsuchi = blue\n\
+             host.color.amaterasu = #A876FF\n",
+        );
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        assert!(cfg.window.host_tint);
+        assert!((cfg.window.host_tint_strength - 1.4).abs() < 1e-4);
+        assert_eq!(cfg.host_colors.len(), 3);
+
+        let bad = Config::parse("host.color.foo = chartreuse\nwindow.host_tint_strength = 9\n");
+        assert_eq!(bad.warnings.len(), 2);
     }
 }

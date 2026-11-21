@@ -514,6 +514,17 @@ hosts. Panes stay clean and full-height by default (keyboard-driven splitting an
 closing via `⌘D`, `⌘⇧D`, `⌘⇧↩`, `⌘W`, or optional `window.pane_headers = auto |
 always` for a minimal status/host strip).
 
+**Per-host accent & danger colours.** Remote Mux hosts (and plain `ssh <host>`
+sessions matching `host.color.<pattern>` in `tachyon.conf`) tint the Liquid
+Glass subtly, draw a crisp top-edge accent hairline (costing zero grid rows),
+show a coloured host badge at the left of the bottom hints band (`● kagutsuchi`,
+`▲ prod-01`), and tint the host icon in the sidebar. Remote hosts pick clean OS
+defaults automatically (`macos` blue, `windows` purple, `linux` teal; **This
+Mac** stays neutral), or pick any preset/danger colour from the sidebar
+right-click menu (**Host Colour**), `⌘,` **Settings → Remote Hosts**,
+`tachyon hosts color <alias> <color>`, or `host.color.prod* = danger` in
+`tachyon.conf`.
+
 **Command Palette (`⌘⇧P`), Floating Cheatsheet (`⌘/`), & Settings (`⌘,`).**
 Press **⌘⇧P** (or click `⌘` in the sidebar toolbar) to fuzzy-search every
 Tachyon action and jump straight to any live session or window across **This

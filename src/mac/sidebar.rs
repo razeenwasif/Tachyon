@@ -42,6 +42,8 @@ enum TreeRow {
         display_name: String,
         is_local: bool,
         os: Option<String>,
+        color_spec: Option<String>,
+        color: Option<crate::mux::model::HostColor>,
         connected: bool,
         connecting: bool,
         rtt_ms: Option<f64>,
@@ -271,6 +273,14 @@ define_class!(
             }
         }
 
+        #[unsafe(method(ctxSetHostColor:))]
+        fn ctx_set_host_color(&self, sender: Option<&AnyObject>) {
+            if let Some((host, spec)) = rep_pair(sender) {
+                let color = (!spec.eq_ignore_ascii_case("auto")).then_some(spec);
+                super::mux_set_host_color(&host, color);
+            }
+        }
+
         #[unsafe(method(ctxNewWindow:))]
         fn ctx_new_window(&self, sender: Option<&AnyObject>) {
             if let Some((host, sid)) = rep_pair(sender) {
@@ -337,11 +347,22 @@ impl SidebarTreeView {
         let mut rows = Vec::new();
         let mut y = 6.0;
 
+        let cfg_colors = crate::config::Config::load_default().host_colors;
         for (h_idx, h) in hosts.iter().enumerate() {
             let (connected, connecting, rtt_ms, os, error) = match &h.status {
                 HostStatus::Connected { info, rtt_ms } => (true, false, *rtt_ms, Some(info.os.clone()), None),
                 HostStatus::Connecting => (false, true, None, None, None),
                 HostStatus::Disconnected { error } => (false, false, None, None, Some(error.clone())),
+            };
+            let resolved_color = if h.is_local {
+                None
+            } else {
+                crate::mux::model::resolve_host_color(
+                    &h.alias,
+                    os.as_deref(),
+                    h.color.as_deref(),
+                    &cfg_colors,
+                )
             };
 
             let host_row = TreeRow::Host {
@@ -349,6 +370,8 @@ impl SidebarTreeView {
                 display_name: h.display_name.clone(),
                 is_local: h.is_local,
                 os,
+                color_spec: h.color.clone(),
+                color: resolved_color,
                 connected,
                 connecting,
                 rtt_ms,
@@ -533,6 +556,7 @@ impl SidebarTreeView {
                     display_name,
                     is_local,
                     os,
+                    color,
                     connected,
                     connecting,
                     rtt_ms,
@@ -548,7 +572,7 @@ impl SidebarTreeView {
                         ));
                     }
 
-                    // OS-aware host icon (SF Symbol).
+                    // OS-aware host icon (SF Symbol), tinted with host accent/danger colour.
                     let sym = if *is_local {
                         "laptopcomputer"
                     } else {
@@ -559,10 +583,20 @@ impl SidebarTreeView {
                             _ => "globe",
                         }
                     };
-                    let icon_color = if *connected {
-                        NSColor::labelColor().colorWithAlphaComponent(0.85)
-                    } else {
-                        NSColor::secondaryLabelColor().colorWithAlphaComponent(0.6)
+                    let icon_color = match color {
+                        Some(hc) => NSColor::colorWithSRGBRed_green_blue_alpha(
+                            hc.rgb[0] as f64 / 255.0,
+                            hc.rgb[1] as f64 / 255.0,
+                            hc.rgb[2] as f64 / 255.0,
+                            if *connected { 0.95 } else { 0.55 },
+                        ),
+                        None => {
+                            if *connected {
+                                NSColor::labelColor().colorWithAlphaComponent(0.85)
+                            } else {
+                                NSColor::secondaryLabelColor().colorWithAlphaComponent(0.6)
+                            }
+                        }
                     };
                     draw_symbol(sym, NSRect::new(NSPoint::new(12.0, y0 + 5.0), NSSize::new(14.0, 14.0)), &icon_color);
 
@@ -601,12 +635,21 @@ impl SidebarTreeView {
                         NSRect::new(NSPoint::new(w - 26.0, y0 + 3.0), NSSize::new(18.0, 18.0)),
                     );
 
-                    // Host title + optional RTT suffix for remote hosts.
+                    // Host title + danger marker + optional RTT suffix for remote hosts.
+                    let prefix = if color.is_some_and(|c| c.danger) { "▲ " } else { "" };
                     let label = match (is_local, rtt_ms) {
-                        (false, Some(ms)) => format!("{display_name}  {ms:.0}ms"),
-                        _ => display_name.clone(),
+                        (false, Some(ms)) => format!("{prefix}{display_name}  {ms:.0}ms"),
+                        _ => format!("{prefix}{display_name}"),
                     };
-                    let fg = NSColor::labelColor().colorWithAlphaComponent(0.9);
+                    let fg = match color {
+                        Some(hc) if hc.danger => NSColor::colorWithSRGBRed_green_blue_alpha(
+                            hc.rgb[0] as f64 / 255.0,
+                            hc.rgb[1] as f64 / 255.0,
+                            hc.rgb[2] as f64 / 255.0,
+                            0.95,
+                        ),
+                        _ => NSColor::labelColor().colorWithAlphaComponent(0.9),
+                    };
                     draw_text_left(
                         &label,
                         12.0,
@@ -803,10 +846,40 @@ impl SidebarTreeView {
         };
 
         match row {
-            TreeRow::Host { alias, is_local, .. } => {
+            TreeRow::Host { alias, is_local, color_spec, .. } => {
                 add("New Session", sel!(ctxNewSession:), alias.clone());
                 add("Reconnect / Refresh", sel!(ctxReconnectHost:), alias.clone());
                 if !is_local {
+                    menu.addItem(&NSMenuItem::separatorItem(mtm));
+                    let color_root = unsafe {
+                        menu.addItemWithTitle_action_keyEquivalent(
+                            &NSString::from_str("Host Colour"),
+                            None,
+                            &NSString::from_str(""),
+                        )
+                    };
+                    let sub = NSMenu::new(mtm);
+                    let active_spec = color_spec.as_deref().unwrap_or("auto");
+                    for &(id, title) in crate::mux::model::HOST_COLOR_PRESETS {
+                        let label = if active_spec.eq_ignore_ascii_case(id) {
+                            format!("✓ {title}")
+                        } else {
+                            title.to_string()
+                        };
+                        let item = unsafe {
+                            sub.addItemWithTitle_action_keyEquivalent(
+                                &NSString::from_str(&label),
+                                Some(sel!(ctxSetHostColor:)),
+                                &NSString::from_str(""),
+                            )
+                        };
+                        let rep = format!("{alias}\u{1F}{id}");
+                        unsafe {
+                            item.setTarget(Some(target));
+                            item.setRepresentedObject(Some(NSString::from_str(&rep).as_ref()));
+                        }
+                    }
+                    color_root.setSubmenu(Some(&sub));
                     menu.addItem(&NSMenuItem::separatorItem(mtm));
                     add("Remove Host", sel!(ctxRemoveHost:), alias.clone());
                 }

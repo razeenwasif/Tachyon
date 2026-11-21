@@ -201,6 +201,15 @@ impl Atlas {
     }
 }
 
+/// Active host accent/danger colour drawn as a crisp top edge hairline and a
+/// compact host badge at the left of the bottom hints band (costs zero grid rows).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostAccent {
+    pub label: String,
+    pub rgb: [u8; 3],
+    pub danger: bool,
+}
+
 /// One frame's worth of GPU-visible instance buffers.
 #[derive(Default)]
 struct Slot {
@@ -427,10 +436,26 @@ impl Renderer {
         (self.size.1 - self.strip_height() - h, h)
     }
 
-    /// Shortcut hints along the bottom band: each key a little brighter than
-    /// what it does, as many as fit left of `right` pixels.
-    fn build_hints(&mut self, hints: &[(String, String)], right: f32) {
-        if !self.hints_band || hints.is_empty() {
+    /// Crisp top edge hairline coloured for the active remote or danger host.
+    fn build_host_top_hairline(&mut self, accent: Option<&HostAccent>) {
+        let Some(acc) = accent else { return };
+        let h = if acc.danger {
+            (2.5 * self.scale).round().max(3.0)
+        } else {
+            (1.5 * self.scale).round().max(2.0)
+        };
+        let mut col = srgb(acc.rgb);
+        col[3] = if acc.danger { 0.92 } else { 0.72 };
+        self.overlay.push(RectInstance {
+            rect: [0.0, self.top_inset, self.size.0, h],
+            color: col,
+        });
+    }
+
+    /// Shortcut hints along the bottom band: optional host accent/danger badge
+    /// at the left, followed by key/action pairs left of `right` pixels.
+    fn build_hints(&mut self, hints: &[(String, String)], right: f32, accent: Option<&HostAccent>) {
+        if !self.hints_band || (hints.is_empty() && accent.is_none()) {
             return;
         }
         let m = self.fonts.metrics;
@@ -439,13 +464,47 @@ impl Renderer {
         let mix = |t: f32| -> [u8; 3] {
             std::array::from_fn(|i| (theme.background[i] as f32 + (theme.foreground[i] as f32 - theme.background[i] as f32) * t).round() as u8)
         };
-        let (key, label, line) = (mix(0.72), mix(0.46), mix(0.12));
+        let blend = |a: [u8; 3], b: [u8; 3], t: f32| -> [u8; 3] {
+            std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
+        };
+        let (key, label) = (mix(0.72), mix(0.46));
+        let line = match accent {
+            Some(acc) => blend(theme.background, acc.rgb, if acc.danger { 0.65 } else { 0.38 }),
+            None => mix(0.12),
+        };
         let (y0, h) = self.hints_rect();
         let hair = self.scale.round().max(1.0);
         self.bg.push(RectInstance { rect: [pad_x, y0, (self.size.0 - 2.0 * pad_x).max(0.0), hair], color: srgb(line) });
         let text_y = y0 + ((h - m.height) / 2.0).round();
         let width = |s: &str| s.chars().map(|c| c.width().unwrap_or(1)).sum::<usize>() as f32 * m.width;
         let mut x = pad_x;
+
+        if let Some(acc) = accent {
+            let glyph = if acc.danger { "▲ " } else { "● " };
+            let badge_txt = format!("{glyph}{}", acc.label);
+            let bw = width(&badge_txt);
+            if x + bw <= right {
+                let pad_badge = (m.width * 0.6).round();
+                if acc.danger {
+                    let mut pill = srgb(acc.rgb);
+                    pill[3] = 0.22;
+                    let ph = (m.height + 2.0 * self.scale).min(h - hair);
+                    let py = y0 + ((h - ph) / 2.0).round();
+                    self.bg.push(RectInstance {
+                        rect: [x, py, bw + 2.0 * pad_badge, ph],
+                        color: pill,
+                    });
+                    self.push_text(&badge_txt, x + pad_badge, text_y, acc.rgb);
+                    x += bw + 2.0 * pad_badge + 2.0 * m.width;
+                } else {
+                    self.push_text(glyph, x, text_y, acc.rgb);
+                    let name_col = blend(theme.foreground, acc.rgb, 0.35);
+                    self.push_text(&acc.label, x + width(glyph), text_y, name_col);
+                    x += bw + 2.5 * m.width;
+                }
+            }
+        }
+
         for (k, what) in hints {
             let w = width(k) + m.width + width(what);
             if x + w > right {
@@ -592,6 +651,7 @@ impl Renderer {
         panel: Option<&Panel>,
         hints: &[(String, String)],
         hints_right: f32,
+        host_accent: Option<&HostAccent>,
         presented: Option<Box<dyn Fn(f64)>>,
     ) {
         if self.atlas.overflowed {
@@ -640,7 +700,8 @@ impl Renderer {
             let cols = self.grid_size_for(self.size.0, self.size.1).0;
             self.build_strip(strip, cols);
         }
-        self.build_hints(hints, hints_right);
+        self.build_hints(hints, hints_right, host_accent);
+        self.build_host_top_hairline(host_accent);
         self.build_panel(panel);
 
         let Some(drawable) = self.layer.nextDrawable() else {

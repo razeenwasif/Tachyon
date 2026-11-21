@@ -375,6 +375,33 @@ define_class!(
             }
         }
 
+        #[unsafe(method(hostChangeColor:))]
+        fn host_change_color(&self, sender: Option<&AnyObject>) {
+            let Some(popup) = sender.and_then(|s| s.downcast_ref::<NSPopUpButton>()) else {
+                return;
+            };
+            let row_idx = popup.tag();
+            if row_idx < 0 {
+                return;
+            }
+            let alias = self
+                .ivars()
+                .host_aliases
+                .borrow()
+                .get(row_idx as usize)
+                .cloned();
+            let Some(alias) = alias else { return };
+            let sel_idx = popup.indexOfSelectedItem();
+            let spec = crate::mux::model::HOST_COLOR_PRESETS
+                .get(sel_idx as usize)
+                .map(|(id, _)| *id)
+                .unwrap_or("auto");
+            let color = (!spec.eq_ignore_ascii_case("auto")).then(|| spec.to_string());
+            super::mux_set_host_color(&alias, color);
+            self.set_note(&format!("Set colour for `{alias}` -> {spec}"));
+            refresh_if_open();
+        }
+
         #[unsafe(method(hostAddSsh:))]
         fn host_add_ssh(&self, sender: Option<&AnyObject>) {
             if let Some(name) = tagged_string(sender, &self.ivars().ssh_candidates.borrow()) {
@@ -502,6 +529,15 @@ define_class!(
             let _ = Config::update_default_key("window.hints", if on { "true" } else { "false" });
             super::apply_interface_hints(on);
             self.set_note("Saved `window.hints` to tachyon.conf.");
+            refresh_if_open();
+        }
+
+        #[unsafe(method(toggleHostTintSetting:))]
+        fn toggle_host_tint_setting(&self, sender: Option<&AnyObject>) {
+            let on = switch_is_on(sender);
+            let _ = Config::update_default_key("window.host_tint", if on { "true" } else { "false" });
+            super::apply_interface_host_tint(on);
+            self.set_note("Saved `window.host_tint` to tachyon.conf.");
             refresh_if_open();
         }
 
@@ -772,7 +808,27 @@ impl SettingsWindow {
                     HostStatus::Disconnected { .. } => format!("⚪️ {} (offline) · {}", h.display_name, h.uri),
                 };
                 let lbl = label(mtm, &line, 12.0, false, &NSColor::labelColor());
-                lbl.setFrame(NSRect::new(NSPoint::new(14.0, ry + 5.0), NSSize::new(w - 190.0, 18.0)));
+                lbl.setFrame(NSRect::new(NSPoint::new(14.0, ry + 5.0), NSSize::new(w - 280.0, 18.0)));
+                let color_pop = NSPopUpButton::initWithFrame_pullsDown(
+                    NSPopUpButton::alloc(mtm),
+                    NSRect::new(NSPoint::new(w - 258.0, ry + 1.0), NSSize::new(86.0, 24.0)),
+                    false,
+                );
+                let cur_spec = h.color.as_deref().unwrap_or("auto");
+                let mut sel_idx = 0isize;
+                for (pi, &(id, title)) in crate::mux::model::HOST_COLOR_PRESETS.iter().enumerate() {
+                    let short = title.split(" (").next().unwrap_or(title);
+                    color_pop.addItemWithTitle(&NSString::from_str(short));
+                    if cur_spec.eq_ignore_ascii_case(id) {
+                        sel_idx = pi as isize;
+                    }
+                }
+                color_pop.selectItemAtIndex(sel_idx);
+                color_pop.setTag(idx as isize);
+                unsafe {
+                    color_pop.setTarget(Some(target));
+                    color_pop.setAction(Some(sel!(hostChangeColor:)));
+                }
                 let rec = push_button(mtm, "Reconnect", target, sel!(hostReconnect:));
                 rec.setTag(idx as isize);
                 rec.setFrame(NSRect::new(NSPoint::new(w - 166.0, ry + 1.0), NSSize::new(82.0, 24.0)));
@@ -780,6 +836,7 @@ impl SettingsWindow {
                 rem.setTag(idx as isize);
                 rem.setFrame(NSRect::new(NSPoint::new(w - 80.0, ry + 1.0), NSSize::new(68.0, 24.0)));
                 card.addSubview(&lbl);
+                card.addSubview(&color_pop);
                 card.addSubview(&rec);
                 card.addSubview(&rem);
             }
@@ -961,12 +1018,13 @@ impl SettingsWindow {
     fn build_interface(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
         let target: &AnyObject = self.actions.as_ref();
         let cfg = Config::load_default();
-        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 232.0)));
+        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 276.0)));
 
-        let rows: [(&str, &str, bool, objc2::runtime::Sel); 4] = [
+        let rows: [(&str, &str, bool, objc2::runtime::Sel); 5] = [
             ("Show Multi-Host Sidebar", "Collapsible Liquid Glass sidebar (⌘B)", cfg.window.sidebar, sel!(toggleSidebarSetting:)),
             ("Show Standard Title Bar", "Off uses Tachyon's edge-to-edge layout", cfg.window.title_bar, sel!(toggleTitleBarSetting:)),
             ("Bottom Shortcut Hints Band", "Contextual shortcuts & footer tool icons", cfg.window.hints, sel!(toggleHintsSetting:)),
+            ("Host Accent & Danger Tint", "Subtle glass tint, top edge hairline & badge per remote/SSH host", cfg.window.host_tint, sel!(toggleHostTintSetting:)),
             ("Persist Shells Across Quits", "Run shells inside Tachyon's background server", cfg.shell.persist, sel!(togglePersistSetting:)),
         ];
 
@@ -984,7 +1042,7 @@ impl SettingsWindow {
         }
 
         // Pane headers mode popup.
-        let ry = 12.0 + 4.0 * 44.0;
+        let ry = 12.0 + 5.0 * 44.0;
         let pt = label(mtm, "Per-Pane Header Bars", 12.5, true, &NSColor::labelColor());
         pt.setFrame(NSRect::new(NSPoint::new(14.0, ry), NSSize::new(w - 160.0, 16.0)));
         let pd = label(mtm, "Optional title, OSC 7501 status pill & host badge (off by default)", 11.0, false, &NSColor::secondaryLabelColor());
@@ -1011,7 +1069,7 @@ impl SettingsWindow {
         card.addSubview(&popup);
 
         self.detail.addSubview(&card);
-        *y += 248.0;
+        *y += 292.0;
     }
 
     fn build_notifications(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {

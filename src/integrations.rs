@@ -342,18 +342,62 @@ user can see and interact with every pane directly in Tachyon.
     )
 }
 
-fn claude_hook_entries() -> [(&'static str, &'static str); 4] {
+fn resolve_tachyon_hook_bin() -> String {
+    let home = user_home();
+    #[cfg(windows)]
+    let local_bin = home.join(".local").join("bin").join("tachyon.exe");
+    #[cfg(not(windows))]
+    let local_bin = home.join(".local").join("bin").join("tachyon");
+    if local_bin.is_file() {
+        return quote_hook_bin(&local_bin);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let is_tachyon = exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("tachyon") || n.eq_ignore_ascii_case("tachyon.exe"));
+        if is_tachyon && exe.is_file() {
+            return quote_hook_bin(&exe);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let app_bin = Path::new("/Applications/Tachyon.app/Contents/MacOS/tachyon");
+        if app_bin.is_file() {
+            return quote_hook_bin(app_bin);
+        }
+    }
+    "tachyon".to_string()
+}
+
+fn quote_hook_bin(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if s.contains([' ', '\t']) {
+        format!("\"{s}\"")
+    } else {
+        s.into_owned()
+    }
+}
+
+fn claude_hook_entries(bin: &str) -> [(&'static str, String); 4] {
     [
-        ("UserPromptSubmit", "tachyon hook claude prompt"),
-        ("PreToolUse", "tachyon hook claude working"),
-        ("Notification", "tachyon hook claude blocked"),
-        ("Stop", "tachyon hook claude done"),
+        ("UserPromptSubmit", format!("{bin} hook claude prompt")),
+        ("PreToolUse", format!("{bin} hook claude working")),
+        ("Notification", format!("{bin} hook claude blocked")),
+        ("Stop", format!("{bin} hook claude done")),
     ]
+}
+
+fn cmd_is_tachyon_hook(cmd: &str) -> bool {
+    cmd.contains(HOOK_MARKER)
+        || cmd.contains("tachyon.exe hook claude")
+        || cmd.contains("tachyon\" hook claude")
+        || cmd.contains("tachyon.exe\" hook claude")
 }
 
 fn entry_is_tachyon_hook(entry: &Value) -> bool {
     if let Some(cmd) = entry.get("command").and_then(Value::as_str) {
-        if cmd.contains(HOOK_MARKER) {
+        if cmd_is_tachyon_hook(cmd) {
             return true;
         }
     }
@@ -361,7 +405,7 @@ fn entry_is_tachyon_hook(entry: &Value) -> bool {
         if arr.iter().any(|h| {
             h.get("command")
                 .and_then(Value::as_str)
-                .is_some_and(|c| c.contains(HOOK_MARKER))
+                .is_some_and(cmd_is_tachyon_hook)
         }) {
             return true;
         }
@@ -409,7 +453,8 @@ pub fn install_claude_hooks(path: &Path) -> io::Result<()> {
     }
     let hooks_obj = hooks.as_object_mut().expect("object");
 
-    for (event_name, cmd) in claude_hook_entries() {
+    let bin = resolve_tachyon_hook_bin();
+    for (event_name, cmd) in claude_hook_entries(&bin) {
         let slot = hooks_obj
             .entry(event_name)
             .or_insert_with(|| json!([]));
@@ -495,25 +540,29 @@ pub fn install_antigravity_hooks(path: &Path) -> io::Result<()> {
             "hooks.json root is not a JSON object",
         ));
     };
+    let bin = resolve_tachyon_hook_bin();
+    // Use observational lifecycle hooks (`PreInvocation`, `PostToolUse`, `Stop`)
+    // with the absolute `tachyon` path so `/bin/sh` always finds it and
+    // Antigravity's `PreToolUse` permission gates are never intercepted.
     obj.insert(
         ANTIGRAVITY_HOOK_KEY.to_string(),
         json!({
             "PreInvocation": [{
                 "type": "command",
-                "command": "tachyon hook antigravity prompt",
+                "command": format!("{bin} hook antigravity prompt"),
                 "timeout": 5
             }],
-            "PreToolUse": [{
+            "PostToolUse": [{
                 "matcher": "*",
                 "hooks": [{
                     "type": "command",
-                    "command": "tachyon hook antigravity working",
+                    "command": format!("{bin} hook antigravity posttool"),
                     "timeout": 5
                 }]
             }],
             "Stop": [{
                 "type": "command",
-                "command": "tachyon hook antigravity done",
+                "command": format!("{bin} hook antigravity done"),
                 "timeout": 5
             }]
         }),
@@ -644,8 +693,10 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
     let payload: Value = serde_json::from_str(&stdin_raw).unwrap_or(Value::Null);
 
     let is_agy = agent.eq_ignore_ascii_case("antigravity") || agent.eq_ignore_ascii_case("agy");
+    let ev = event.to_ascii_lowercase();
+    let agy_stdout = antigravity_hook_response(&ev);
 
-    let (state, msg, label) = match event.to_ascii_lowercase().as_str() {
+    let (state, msg, label) = match ev.as_str() {
         "prompt" => {
             let prompt_text = payload
                 .get("prompt")
@@ -657,13 +708,32 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
             let short = truncate_msg(prompt_text, 48);
             (ProgramState::Working, short, Some("Thinking".to_string()))
         }
-        "working" | "pretool" => {
+        "working" | "pretool" | "posttool" => {
             let tool = payload
                 .get("tool_name")
                 .and_then(Value::as_str)
                 .or_else(|| payload.get("toolName").and_then(Value::as_str))
-                .map(|t| format!("Running {t}"));
-            (ProgramState::Working, tool, Some("Working".to_string()))
+                .or_else(|| {
+                    payload
+                        .get("toolCall")
+                        .and_then(|tc| tc.get("name"))
+                        .and_then(Value::as_str)
+                });
+            let tool_err = payload
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            if let Some(err) = tool_err {
+                let note = match tool {
+                    Some(t) => truncate_msg(&format!("{t}: {err}"), 64),
+                    None => truncate_msg(err, 64),
+                };
+                (ProgramState::Error, note, Some("Tool error".to_string()))
+            } else {
+                let verb = if ev == "posttool" { "Ran" } else { "Running" };
+                let note = tool.map(|t| format!("{verb} {t}"));
+                (ProgramState::Working, note, Some("Working".to_string()))
+            }
         }
         "blocked" | "notification" | "approval" => {
             let note = payload
@@ -674,11 +744,26 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
                 .or_else(|| Some("Waiting for input".into()));
             (ProgramState::Blocked, note, Some("Needs input".to_string()))
         }
-        "done" | "stop" => (
-            ProgramState::Done,
-            Some("Finished response".into()),
-            Some("Done".to_string()),
-        ),
+        "done" | "stop" => {
+            let term_reason = payload
+                .get("terminationReason")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if term_reason.eq_ignore_ascii_case("ERROR") {
+                let err = payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .and_then(|s| truncate_msg(s, 64))
+                    .or_else(|| Some("Stopped with error".into()));
+                (ProgramState::Error, err, Some("Error".to_string()))
+            } else {
+                (
+                    ProgramState::Done,
+                    Some("Finished response".into()),
+                    Some("Done".to_string()),
+                )
+            }
+        }
         "error" => {
             let err = payload
                 .get("error")
@@ -690,13 +775,13 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
         "clear" => {
             let _ = emit_osc_7501_tty_only_if(None, is_agy);
             if is_agy {
-                println!("{{}}");
+                println!("{agy_stdout}");
             }
             return 0;
         }
         _ => {
             if is_agy {
-                println!("{{}}");
+                println!("{agy_stdout}");
             }
             return 0;
         }
@@ -711,10 +796,19 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
     };
     let _ = emit_osc_7501_tty_only_if(Some(&status), is_agy);
     if is_agy {
-        // Antigravity hooks expect a JSON object on stdout.
-        println!("{{}}");
+        // Antigravity hooks expect a valid JSON response matching the event contract.
+        println!("{agy_stdout}");
     }
     0
+}
+
+/// JSON stdout payload required by Antigravity's `hooks.json` contract per event.
+pub fn antigravity_hook_response(event: &str) -> &'static str {
+    match event {
+        "done" | "stop" => r#"{"decision":"allow"}"#,
+        "working" | "pretool" => r#"{"decision":"ask"}"#,
+        _ => "{}",
+    }
 }
 
 fn emit_osc_7501_tty_only_if(status: Option<&ProgramStatus>, tty_only: bool) -> io::Result<()> {
@@ -900,10 +994,19 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
         assert!(after_install.get("my-linter").is_some());
         assert!(after_install.get("tachyon").is_some());
-        assert_eq!(
-            after_install["tachyon"]["Stop"][0]["command"],
-            "tachyon hook antigravity done"
+        assert!(
+            after_install["tachyon"].get("PreToolUse").is_none(),
+            "must not install PreToolUse permission gate"
         );
+        let post_cmd = after_install["tachyon"]["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(post_cmd.ends_with("hook antigravity posttool"), "post_cmd: {post_cmd}");
+        let stop_cmd = after_install["tachyon"]["Stop"][0]["command"].as_str().unwrap();
+        assert!(stop_cmd.ends_with("hook antigravity done"), "stop_cmd: {stop_cmd}");
+        assert_eq!(antigravity_hook_response("prompt"), "{}");
+        assert_eq!(antigravity_hook_response("posttool"), "{}");
+        assert_eq!(antigravity_hook_response("done"), r#"{"decision":"allow"}"#);
 
         let after_rm = remove_agent(&home, AgentKind::Antigravity).unwrap();
         assert!(!after_rm.skill_installed);

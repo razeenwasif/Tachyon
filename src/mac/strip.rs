@@ -215,6 +215,11 @@ impl Capsule {
         Capsule { glass, view }
     }
 
+    /// Apply an optional host accent/danger tint to the floating tab capsule.
+    pub fn set_tint(&self, tint: Option<&NSColor>) {
+        self.glass.setTintColor(tint);
+    }
+
     /// Centre the capsule along the bottom of a view `width` points wide.
     pub fn place(&self, width: f64, tabs: usize) {
         self.place_at(width, tabs, ((BAND_HEIGHT - CAPSULE_HEIGHT) / 2.0).round(), SIDE_MARGIN);

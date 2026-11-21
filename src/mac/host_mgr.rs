@@ -39,6 +39,7 @@ pub struct HostView {
     pub display_name: String,
     pub uri: String,
     pub is_local: bool,
+    pub color: Option<String>,
     pub status: HostStatus,
     pub snapshot: Option<ServerSnapshot>,
 }
@@ -47,6 +48,7 @@ struct ManagedHost {
     alias: String,
     uri: String,
     is_local: bool,
+    color: Option<String>,
     status: HostStatus,
     snapshot: Option<ServerSnapshot>,
     client: Option<Arc<MuxClient>>,
@@ -84,6 +86,7 @@ impl HostManager {
             format!("unix://{}", sock.display()),
             Target::Local { socket: sock },
             true,
+            None,
         );
 
         let entries = load_hosts();
@@ -92,13 +95,20 @@ impl HostManager {
                 continue;
             }
             if let Ok(target) = resolve_target(Some(&entry.alias), std::slice::from_ref(&entry)) {
-                mgr.spawn_host(entry.alias, entry.uri, target, false);
+                mgr.spawn_host(entry.alias, entry.uri, target, false, entry.color);
             }
         }
         mgr
     }
 
-    fn spawn_host(self: &Arc<Self>, alias: String, uri: String, target: Target, is_local: bool) {
+    fn spawn_host(
+        self: &Arc<Self>,
+        alias: String,
+        uri: String,
+        target: Target,
+        is_local: bool,
+        color: Option<String>,
+    ) {
         let (wake_tx, wake_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -117,6 +127,7 @@ impl HostManager {
                     alias: alias.clone(),
                     uri,
                     is_local,
+                    color,
                     status: HostStatus::Connecting,
                     snapshot: None,
                     client: None,
@@ -160,6 +171,7 @@ impl HostManager {
                     },
                     uri: h.uri.clone(),
                     is_local: h.is_local,
+                    color: h.color.clone(),
                     status: h.status.clone(),
                     snapshot: h.snapshot.clone(),
                 })
@@ -231,22 +243,52 @@ impl HostManager {
             return Err("invalid host alias".into());
         }
         let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let mut saved = load_hosts();
+        let preserved_color = saved
+            .iter()
+            .find(|e| e.alias == alias)
+            .and_then(|e| e.color.clone());
         let entry = HostEntry {
             alias: alias.clone(),
             uri: uri.clone(),
             remote_bin: None,
             token,
+            color: preserved_color.clone(),
         };
         let target = resolve_target(Some(&alias), std::slice::from_ref(&entry))
             .map_err(|e| e.to_string())?;
-        let mut saved = load_hosts();
         if let Some(prev) = saved.iter_mut().find(|e| e.alias == alias) {
             *prev = entry;
         } else {
             saved.push(entry);
         }
         save_hosts(&saved).map_err(|e| e.to_string())?;
-        self.spawn_host(alias, uri, target, false);
+        self.spawn_host(alias, uri, target, false, preserved_color);
+        self.notify_change();
+        Ok(())
+    }
+
+    /// Update and persist a remote host's accent / danger colour preset (`None` = auto by OS).
+    pub fn set_host_color(&self, alias: &str, color: Option<String>) -> Result<(), String> {
+        let normalized = color
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("auto"));
+        if let Some(ref c) = normalized {
+            if !crate::mux::model::HostColor::is_valid_spec(c) {
+                return Err(format!("invalid host colour `{c}`"));
+            }
+        }
+        {
+            let mut hosts = self.hosts.lock();
+            if let Some(h) = hosts.get_mut(alias) {
+                h.color = normalized.clone();
+            }
+        }
+        let mut saved = load_hosts();
+        if let Some(entry) = saved.iter_mut().find(|e| e.alias == alias) {
+            entry.color = normalized;
+            save_hosts(&saved).map_err(|e| e.to_string())?;
+        }
         self.notify_change();
         Ok(())
     }
