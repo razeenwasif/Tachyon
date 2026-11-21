@@ -737,6 +737,7 @@ pub struct AgentEntry {
     pub message: Option<String>,
     pub cwd: Option<String>,
     pub command: Option<String>,
+    pub created_at: u64,
     pub inferred: bool,
 }
 
@@ -756,6 +757,7 @@ impl AgentEntry {
             "message": self.message,
             "cwd": self.cwd,
             "command": self.command,
+            "created_at": self.created_at,
             "inferred": self.inferred,
         })
     }
@@ -910,6 +912,7 @@ pub fn collect_agent_entries(
                     message: msg,
                     cwd: blk.cwd.clone(),
                     command: blk.command.clone(),
+                    created_at: blk.created_at,
                     inferred,
                 },
             ));
@@ -945,6 +948,175 @@ pub fn short_path(path: &str) -> String {
         .find(|s| !s.is_empty())
         .unwrap_or(path)
         .to_string()
+}
+
+/// Read the active git branch (or short detached SHA) for `path` without
+/// spawning a git subprocess. Supports worktrees whose `.git` is a `gitdir:` file.
+pub fn git_branch_for_dir(path: &std::path::Path) -> Option<String> {
+    let raw = path.to_string_lossy();
+    let expanded: std::path::PathBuf = if raw == "~" {
+        std::path::PathBuf::from(std::env::var("HOME").ok()?)
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        let home = std::env::var("HOME").ok()?;
+        std::path::PathBuf::from(home).join(rest)
+    } else {
+        path.to_path_buf()
+    };
+
+    for dir in expanded.ancestors() {
+        let dot_git = dir.join(".git");
+        let Ok(meta) = std::fs::metadata(&dot_git) else {
+            continue;
+        };
+        let head_path = if meta.is_dir() {
+            dot_git.join("HEAD")
+        } else if meta.is_file() {
+            let content = std::fs::read_to_string(&dot_git).ok()?;
+            let line = content.lines().next()?.trim();
+            let target = line.strip_prefix("gitdir:")?.trim();
+            if target.is_empty() {
+                return None;
+            }
+            let target_path = std::path::Path::new(target);
+            let gitdir = if target_path.is_absolute() {
+                target_path.to_path_buf()
+            } else {
+                dir.join(target_path)
+            };
+            gitdir.join("HEAD")
+        } else {
+            return None;
+        };
+
+        let head = std::fs::read_to_string(head_path).ok()?;
+        let s = head.trim();
+        if let Some(branch) = s.strip_prefix("ref: refs/heads/") {
+            let b = branch.trim();
+            return (!b.is_empty()).then(|| b.to_string());
+        }
+        if let Some(r) = s.strip_prefix("ref: ") {
+            return r
+                .trim()
+                .rsplit('/')
+                .next()
+                .filter(|seg| !seg.is_empty())
+                .map(str::to_string);
+        }
+        if s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(s[..7].to_string());
+        }
+        return None;
+    }
+    None
+}
+
+/// Compact 1-character uppercase monogram (or `~` / `>`) for sidebar Space avatars.
+pub fn space_monogram(title: &str) -> String {
+    let t = title.trim();
+    if t.starts_with('~') {
+        let after_sep = t.trim_start_matches('~').trim_start_matches(['/', '\\']);
+        if !after_sep.chars().any(|c| c.is_ascii_alphanumeric()) {
+            return "~".to_string();
+        }
+    }
+    t.chars()
+        .find(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| ">".to_string())
+}
+
+/// Compact elapsed duration string for live sidebar agent timers (`42s`, `1m 05s`, `18m`, `1h 05m`).
+pub fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Clean project display name for an agent pane (`cwd` basename, falling back to session/window).
+pub fn project_name_for_agent(entry: &AgentEntry) -> String {
+    if let Some(raw) = entry.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let trimmed = raw.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() && raw.starts_with('/') {
+            return "/".to_string();
+        }
+        if trimmed == "~" {
+            return "~".to_string();
+        }
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            let home_trim = home.trim_end_matches(['/', '\\']);
+            if !home_trim.is_empty() && trimmed == home_trim {
+                return "~".to_string();
+            }
+        }
+        if let Some(last) = trimmed.rsplit(['/', '\\']).find(|s| !s.is_empty()) {
+            return last.to_string();
+        }
+    }
+    if !entry.session_name.trim().is_empty() {
+        return entry.session_name.clone();
+    }
+    entry.window_name.clone()
+}
+
+/// Project-grouped slice of live coding agents for Zone 2 of the sidebar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectAgentGroup {
+    pub project: String,
+    pub host: String,
+    pub host_display: String,
+    pub host_color: Option<HostColor>,
+    pub entries: Vec<AgentEntry>,
+}
+
+/// Group `entries` by `(host, project)` and rank the most urgent project groups first.
+pub fn group_agents_by_project(entries: &[AgentEntry]) -> Vec<ProjectAgentGroup> {
+    let mut index: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    let mut groups: Vec<ProjectAgentGroup> = Vec::new();
+
+    for e in entries {
+        let proj = project_name_for_agent(e);
+        let key = (e.host.clone(), proj.to_ascii_lowercase());
+        if let Some(&idx) = index.get(&key) {
+            groups[idx].entries.push(e.clone());
+        } else {
+            let idx = groups.len();
+            index.insert(key, idx);
+            groups.push(ProjectAgentGroup {
+                project: proj,
+                host: e.host.clone(),
+                host_display: e.host_display.clone(),
+                host_color: e.host_color,
+                entries: vec![e.clone()],
+            });
+        }
+    }
+
+    for g in &mut groups {
+        g.entries.sort_by(|a, b| {
+            agent_state_priority(b.state)
+                .cmp(&agent_state_priority(a.state))
+                .then_with(|| a.window_name.cmp(&b.window_name))
+                .then_with(|| a.block_id.cmp(&b.block_id))
+        });
+    }
+
+    groups.sort_by(|a, b| {
+        let top_a = a.entries.iter().map(|e| agent_state_priority(e.state)).max().unwrap_or(0);
+        let top_b = b.entries.iter().map(|e| agent_state_priority(e.state)).max().unwrap_or(0);
+        top_b
+            .cmp(&top_a)
+            .then_with(|| (a.host != "local").cmp(&(b.host != "local")))
+            .then_with(|| a.project.to_ascii_lowercase().cmp(&b.project.to_ascii_lowercase()))
+            .then_with(|| a.host.cmp(&b.host))
+    });
+
+    groups
 }
 
 /// Friendly adjective-noun session names like Rex (`misty-sierra`, `dawn-bluff`).
@@ -1144,5 +1316,89 @@ mod tests {
         assert_eq!(counts.working, 1);
         assert_eq!(counts.done, 1);
         assert_eq!(counts.attention(), 1);
+    }
+
+    #[test]
+    fn sidebar_model_helpers_git_branch_monogram_elapsed_and_project_groups() {
+        // Monogram edge cases
+        assert_eq!(space_monogram("Tachyon"), "T");
+        assert_eq!(space_monogram("~"), "~");
+        assert_eq!(space_monogram("~/"), "~");
+        assert_eq!(space_monogram("✳ claude"), "C");
+        assert_eq!(space_monogram(""), ">");
+        assert_eq!(space_monogram(">_"), ">");
+
+        // Elapsed duration formatting
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(42), "42s");
+        assert_eq!(format_elapsed(65), "1m 05s");
+        assert_eq!(format_elapsed(1080), "18m");
+        assert_eq!(format_elapsed(3900), "1h 05m");
+
+        // Git branch detection across normal repo, nested subdir, detached SHA, and worktree file
+        let base = std::env::temp_dir().join(format!("tachyon-git-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let sub = repo.join("src").join("nested");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/herdr-sidebar\n").unwrap();
+        assert_eq!(git_branch_for_dir(&repo).as_deref(), Some("herdr-sidebar"));
+        assert_eq!(git_branch_for_dir(&sub).as_deref(), Some("herdr-sidebar"));
+
+        std::fs::write(repo.join(".git/HEAD"), "abcdef1234567890fedcba0987654321\n").unwrap();
+        assert_eq!(git_branch_for_dir(&sub).as_deref(), Some("abcdef1"));
+
+        let wt = base.join("wt");
+        let wt_gitdir = base.join("worktrees/wt1");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::write(wt_gitdir.join("HEAD"), "ref: refs/heads/feat/worktree\n").unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../worktrees/wt1\n").unwrap();
+        assert_eq!(git_branch_for_dir(&wt).as_deref(), Some("feat/worktree"));
+
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        // `/tmp` shouldn't have `.git`, so if base is in `/tmp` or `/var/folders` check specifically:
+        if git_branch_for_dir(&base).is_none() {
+            assert_eq!(git_branch_for_dir(&plain), None);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Project grouping sorts most urgent group first and separates local vs remote
+        let entry = |host: &str, cwd: &str, block: &str, state: ProgramState| AgentEntry {
+            host: host.into(),
+            host_display: host.into(),
+            host_color: None,
+            session_id: "s1".into(),
+            session_name: "dev".into(),
+            window_id: "w1".into(),
+            window_name: "win".into(),
+            block_id: block.into(),
+            app_id: "claude".into(),
+            agent_name: "Claude Code".into(),
+            glyph: "✳",
+            state,
+            message: None,
+            cwd: Some(cwd.into()),
+            command: Some("claude".into()),
+            created_at: 100,
+            inferred: false,
+        };
+        let entries = vec![
+            entry("local", "/Users/me/alpha/", "b1", ProgramState::Done),
+            entry("kagutsuchi", "/srv/Tachyon", "b2", ProgramState::Blocked),
+            entry("local", "/Users/me/Tachyon", "b3", ProgramState::Working),
+            entry("local", "/Users/me/tachyon", "b4", ProgramState::Done),
+        ];
+        let groups = group_agents_by_project(&entries);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].host, "kagutsuchi");
+        assert_eq!(groups[0].project, "Tachyon");
+        assert_eq!(groups[1].host, "local");
+        assert_eq!(groups[1].project, "Tachyon");
+        assert_eq!(groups[1].entries.len(), 2);
+        assert_eq!(groups[1].entries[0].block_id, "b3"); // Working before Done
+        assert_eq!(groups[2].project, "alpha");
     }
 }
