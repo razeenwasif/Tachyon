@@ -218,14 +218,25 @@ impl HostManager {
             });
     }
 
-    /// Add and persist a new remote host (`alias`, `ssh://...`) and connect immediately.
-    pub fn add_host(self: &Arc<Self>, alias: String, uri: String) -> Result<(), String> {
+    /// Add and persist a new remote host (`alias`, `ssh://...` or `tcp://...`) and connect immediately.
+    pub fn add_host(
+        self: &Arc<Self>,
+        alias: String,
+        uri: String,
+        token: Option<String>,
+    ) -> Result<(), String> {
         let alias = alias.trim().to_string();
         let uri = uri.trim().to_string();
         if alias.is_empty() || alias == "local" {
             return Err("invalid host alias".into());
         }
-        let entry = HostEntry { alias: alias.clone(), uri: uri.clone(), remote_bin: None };
+        let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let entry = HostEntry {
+            alias: alias.clone(),
+            uri: uri.clone(),
+            remote_bin: None,
+            token,
+        };
         let target = resolve_target(Some(&alias), std::slice::from_ref(&entry))
             .map_err(|e| e.to_string())?;
         let mut saved = load_hosts();

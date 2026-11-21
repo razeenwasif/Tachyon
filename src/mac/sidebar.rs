@@ -41,6 +41,7 @@ enum TreeRow {
         alias: String,
         display_name: String,
         is_local: bool,
+        os: Option<String>,
         connected: bool,
         connecting: bool,
         rtt_ms: Option<f64>,
@@ -337,16 +338,17 @@ impl SidebarTreeView {
         let mut y = 6.0;
 
         for (h_idx, h) in hosts.iter().enumerate() {
-            let (connected, connecting, rtt_ms, error) = match &h.status {
-                HostStatus::Connected { rtt_ms, .. } => (true, false, *rtt_ms, None),
-                HostStatus::Connecting => (false, true, None, None),
-                HostStatus::Disconnected { error } => (false, false, None, Some(error.clone())),
+            let (connected, connecting, rtt_ms, os, error) = match &h.status {
+                HostStatus::Connected { info, rtt_ms } => (true, false, *rtt_ms, Some(info.os.clone()), None),
+                HostStatus::Connecting => (false, true, None, None, None),
+                HostStatus::Disconnected { error } => (false, false, None, None, Some(error.clone())),
             };
 
             let host_row = TreeRow::Host {
                 alias: h.alias.clone(),
                 display_name: h.display_name.clone(),
                 is_local: h.is_local,
+                os,
                 connected,
                 connecting,
                 rtt_ms,
@@ -530,6 +532,7 @@ impl SidebarTreeView {
                 TreeRow::Host {
                     display_name,
                     is_local,
+                    os,
                     connected,
                     connecting,
                     rtt_ms,
@@ -545,8 +548,17 @@ impl SidebarTreeView {
                         ));
                     }
 
-                    // Host icon (SF Symbol).
-                    let sym = if *is_local { "laptopcomputer" } else { "globe" };
+                    // OS-aware host icon (SF Symbol).
+                    let sym = if *is_local {
+                        "laptopcomputer"
+                    } else {
+                        match os.as_deref() {
+                            Some("macos") => "macmini",
+                            Some("linux") => "server.rack",
+                            Some("windows") => "pc",
+                            _ => "globe",
+                        }
+                    };
                     let icon_color = if *connected {
                         NSColor::labelColor().colorWithAlphaComponent(0.85)
                     } else {

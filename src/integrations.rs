@@ -549,8 +549,8 @@ pub fn remove_antigravity_hooks(path: &Path) -> io::Result<()> {
     fs::write(path, format!("{formatted}\n"))
 }
 
-/// Emit an OSC 7501 escape sequence to `/dev/tty` (when `use_tty` is true and
-/// `/dev/tty` is openable) or stdout otherwise.
+/// Emit an OSC 7501 escape sequence to `/dev/tty` (or `CONOUT$` on Windows)
+/// when `use_tty` is true and openable, or stdout otherwise.
 pub fn emit_osc_7501(status: Option<&ProgramStatus>, use_tty: bool) -> io::Result<()> {
     let seq = match status {
         Some(st) => st.encode_osc_7501(),
@@ -558,7 +558,11 @@ pub fn emit_osc_7501(status: Option<&ProgramStatus>, use_tty: bool) -> io::Resul
     };
     if use_tty {
         #[cfg(unix)]
-        if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let tty_path = "/dev/tty";
+        #[cfg(windows)]
+        let tty_path = "CONOUT$";
+        #[cfg(any(unix, windows))]
+        if let Ok(mut tty) = fs::OpenOptions::new().write(true).open(tty_path) {
             tty.write_all(seq.as_bytes())?;
             tty.flush()?;
             return Ok(());
@@ -722,10 +726,16 @@ fn emit_osc_7501_tty_only_if(status: Option<&ProgramStatus>, tty_only: bool) -> 
         None => "\x1b]7501;state=clear\x07".to_string(),
     };
     #[cfg(unix)]
-    if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty") {
+    let tty_path = "/dev/tty";
+    #[cfg(windows)]
+    let tty_path = "CONOUT$";
+    #[cfg(any(unix, windows))]
+    if let Ok(mut tty) = fs::OpenOptions::new().write(true).open(tty_path) {
         tty.write_all(seq.as_bytes())?;
         tty.flush()?;
     }
+    #[cfg(not(any(unix, windows)))]
+    let _ = seq;
     Ok(())
 }
 

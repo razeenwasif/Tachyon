@@ -183,3 +183,91 @@ fn cli_end_to_end_server_sessions_splits_run_capture_and_bridge() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_end_to_end_tcp_listener_with_bearer_token_auth() {
+    let dir = temp_dir("tcp-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    let tok_file = dir.join("server.token");
+
+    // Pick a free loopback port by briefly binding port 0.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let listen = format!("127.0.0.1:{port}");
+
+    // 1. Pre-generate bearer token via `tachyon server token`.
+    let (code, tok_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["server", "token", "--token-file", tok_file.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let token = tok_out.trim().to_string();
+    assert_eq!(token.len(), 64, "token: {token:?}");
+
+    // 2. Launch server with both local Unix socket and TCP listener.
+    let mut srv = Command::new(bin())
+        .args([
+            "server",
+            "run",
+            "--socket",
+            sock.to_str().unwrap(),
+            "--listen",
+            &listen,
+            "--token-file",
+            tok_file.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tcp tachyon server");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while !sock.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 3. Register a `tcp://` host with a WRONG token -> `hosts test` must fail.
+    let uri = format!("tcp://{listen}");
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "add", "bad-tcp", &uri, "--token", "nope"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "test", "bad-tcp"]);
+    assert_ne!(code, 0, "expected unauthorized failure for bad token");
+    assert!(err.contains("unauthorized"), "stderr: {err}");
+
+    // 4. Register a `tcp://` host with the REAL token -> `hosts test` & `run --wait` succeed!
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "add", "ok-tcp", &uri, "--token", &token]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, out, err) = run_cli(&sock, &hosts, &["hosts", "test", "ok-tcp", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["ok"], true);
+
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "-S",
+            "ok-tcp",
+            "run",
+            "--wait",
+            "--capture",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo OVER_TCP_OK",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("OVER_TCP_OK"), "out: {out:?}");
+
+    // 5. Stop server cleanly over TCP!
+    let (code, _, err) = run_cli(&sock, &hosts, &["-S", "ok-tcp", "server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = srv.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

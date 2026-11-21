@@ -448,10 +448,13 @@ impl ServerSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostEntry {
     pub alias: String,
-    /// e.g. `ssh://kagutsuchi`, `ssh://user@host`, or `unix:///path`.
+    /// e.g. `ssh://kagutsuchi`, `ssh://user@host`, `tcp://100.x.y.z:7501`,
+    /// `unix:///path`, or `pipe://tachyon-server-user`.
     pub uri: String,
-    /// Optional explicit path to `tachyon` on the remote host.
+    /// Optional explicit path to `tachyon` on the remote host (SSH targets).
     pub remote_bin: Option<String>,
+    /// Optional bearer auth token for direct `tcp://` (Tailscale) targets.
+    pub token: Option<String>,
 }
 
 impl HostEntry {
@@ -463,6 +466,9 @@ impl HostEntry {
         if let Some(bin) = &self.remote_bin {
             obj["remote_bin"] = json!(bin);
         }
+        if let Some(tok) = &self.token {
+            obj["token"] = json!(tok);
+        }
         obj
     }
 
@@ -471,25 +477,30 @@ impl HostEntry {
             alias: v.get("alias")?.as_str()?.to_string(),
             uri: v.get("uri")?.as_str()?.to_string(),
             remote_bin: v.get("remote_bin").and_then(Value::as_str).map(str::to_string),
+            token: v.get("token").and_then(Value::as_str).map(str::to_string),
         })
     }
 }
 
-/// Shorten a home-rooted path for display (`/Users/me/foo` -> `~/foo`).
+/// Shorten a home-rooted path for display (`/Users/me/foo` -> `~/foo`,
+/// `C:\Users\me\foo` -> `~\foo`).
 pub fn short_path(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         if !home.is_empty() {
             if path == home {
                 return "~".to_string();
             }
             if let Some(rest) = path.strip_prefix(&home) {
-                if rest.starts_with('/') {
+                if rest.starts_with('/') || rest.starts_with('\\') {
                     return format!("~{rest}");
                 }
             }
         }
     }
-    path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path).to_string()
+    path.rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// Friendly adjective-noun session names like Rex (`misty-sierra`, `dawn-bluff`).

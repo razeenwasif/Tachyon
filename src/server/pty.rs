@@ -25,10 +25,13 @@ pub fn find_integration_dir() -> Option<PathBuf> {
             candidates.push(dir.join("../share/tachyon/shell"));
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let h = PathBuf::from(home);
         candidates.push(h.join(".config/Tachyon/shell"));
         candidates.push(h.join(".local/share/tachyon/shell"));
+    }
+    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local_app).join("Tachyon/shell"));
     }
     candidates.push(PathBuf::from("/Applications/Tachyon.app/Contents/Resources/shell"));
     candidates.into_iter().find(|p| p.join("tachyon-integration.zsh").is_file())
@@ -383,12 +386,24 @@ mod win_pty {
         pub login: bool,
     }
 
-    pub fn integration(_program: &str, _dir: &Path, _login: bool) -> Option<Integration> {
+    pub fn integration(program: &str, _dir: &Path, _login: bool) -> Option<Integration> {
+        let lower = program.to_ascii_lowercase();
+        if lower.ends_with("pwsh.exe")
+            || lower.ends_with("powershell.exe")
+            || lower == "pwsh"
+            || lower == "powershell"
+        {
+            return Some(Integration {
+                env: Vec::new(),
+                args: vec!["-NoLogo".to_string()],
+                login: false,
+            });
+        }
         None
     }
 
     pub fn default_shell() -> String {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
+        crate::pty::default_shell().0
     }
 
     pub struct HostPty {
@@ -404,10 +419,10 @@ mod win_pty {
             program: &str,
             args: &[String],
             _login: bool,
-            _extra_env: &[(String, String)],
+            extra_env: &[(String, String)],
             cwd: Option<&str>,
         ) -> io::Result<Self> {
-            let inner = crate::pty::Pty::spawn(cols, rows, program, args, cwd)
+            let inner = crate::pty::Pty::spawn_with_env(cols, rows, program, args, extra_env, cwd)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             Ok(Self {
                 inner,
@@ -417,7 +432,7 @@ mod win_pty {
         }
 
         pub fn pid(&self) -> u32 {
-            0
+            self.inner.pid()
         }
 
         pub fn size(&self) -> (u16, u16) {
@@ -443,7 +458,7 @@ mod win_pty {
         }
 
         pub fn wait_exit(&self) -> i32 {
-            0
+            self.inner.wait_exit()
         }
     }
 }

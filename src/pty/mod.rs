@@ -69,8 +69,10 @@ pub struct Pty {
     output_read: HANDLE,
     process: HANDLE,
     thread: HANDLE,
+    pid: u32,
     attr_list: Vec<u8>,
     closed: Arc<AtomicBool>,
+    hpcon_closed: AtomicBool,
     /// Serialises `WriteFile` on the input pipe.
     ///
     /// Both the UI thread (keystrokes, pastes) and the reader thread (device
@@ -94,7 +96,18 @@ impl Pty {
         args: &[String],
         cwd: Option<&str>,
     ) -> Result<Pty> {
-        let mut environment = build_environment();
+        Self::spawn_with_env(cols, rows, program, args, &[], cwd)
+    }
+
+    pub fn spawn_with_env(
+        cols: u16,
+        rows: u16,
+        program: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<Pty> {
+        let mut environment = build_environment(extra_env);
         unsafe {
             // Pipe A: us -> child stdin.
             let mut in_read = HANDLE::default();
@@ -201,11 +214,40 @@ impl Pty {
                 output_read: out_read,
                 process: pi.hProcess,
                 thread: pi.hThread,
+                pid: pi.dwProcessId,
                 attr_list,
                 closed: Arc::new(AtomicBool::new(false)),
+                hpcon_closed: AtomicBool::new(false),
                 write_lock: Mutex::new(()),
             })
         }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Blocking read from the child's ConPTY output pipe (`Ok(0)` on EOF).
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        read_output(self.output_handle(), buf)
+    }
+
+    /// Close the pseudoconsole early to signal the child and unblock `read()`.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if !self.hpcon_closed.swap(true, Ordering::AcqRel) {
+            unsafe {
+                ClosePseudoConsole(self.hpcon);
+            }
+        }
+    }
+
+    /// Wait for the child process to exit and return its exit code.
+    pub fn wait_exit(&self) -> i32 {
+        unsafe {
+            let _ = WaitForSingleObject(self.process, INFINITE);
+        }
+        self.exit_code() as i32
     }
 
     /// Handle the reader thread should poll. Cloning it is safe; the `Pty`
@@ -274,7 +316,9 @@ impl Drop for Pty {
         unsafe {
             // Closing the pseudoconsole signals the child and unblocks the
             // reader thread's `ReadFile` with a broken pipe.
-            ClosePseudoConsole(self.hpcon);
+            if !self.hpcon_closed.swap(true, Ordering::AcqRel) {
+                ClosePseudoConsole(self.hpcon);
+            }
             let _ = CloseHandle(self.input_write);
             let _ = CloseHandle(self.output_read);
             let _ = CloseHandle(self.thread);
@@ -319,7 +363,7 @@ const TERMINAL_ENV: &[(&str, &str)] = &[
 ///
 /// The block is `KEY=VALUE\0` repeated, terminated by an extra `\0`. Windows
 /// expects it sorted case-insensitively by name.
-fn build_environment() -> Vec<u16> {
+fn build_environment(extra: &[(String, String)]) -> Vec<u16> {
     use std::collections::BTreeMap;
 
     // Key the map on the uppercased name so our overrides replace an inherited
@@ -334,8 +378,36 @@ fn build_environment() -> Vec<u16> {
         vars.insert(k.to_uppercase(), (k, v));
     }
 
+    // Prepend the tachyon.exe directory to PATH so managed panes and coding
+    // agents on Windows can invoke `tachyon` directly.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent().map(|d| d.to_string_lossy().into_owned()) {
+            if !dir.is_empty() {
+                let (key_name, cur_path) = vars
+                    .get("PATH")
+                    .cloned()
+                    .unwrap_or_else(|| ("Path".to_string(), String::new()));
+                let already = cur_path
+                    .split(';')
+                    .any(|p| p.eq_ignore_ascii_case(&dir));
+                if !already {
+                    let next = if cur_path.is_empty() {
+                        dir
+                    } else {
+                        format!("{dir};{cur_path}")
+                    };
+                    vars.insert("PATH".into(), (key_name, next));
+                }
+            }
+        }
+    }
+
     for (k, v) in TERMINAL_ENV {
         vars.insert(k.to_uppercase(), ((*k).to_string(), (*v).to_string()));
+    }
+
+    for (k, v) in extra {
+        vars.insert(k.to_uppercase(), (k.clone(), v.clone()));
     }
 
     // WSLENV is how Win32 variables cross into a WSL distribution: each name

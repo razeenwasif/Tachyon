@@ -13,9 +13,10 @@ use serde_json::{json, Value};
 use crate::mux::client::MuxClient;
 use crate::mux::model::{HostEntry, SplitDir};
 use crate::mux::{
-    default_socket_path, load_hosts, resolve_target, save_hosts, transport, Target,
+    default_local_uri, default_socket_path, default_token_path, generate_auth_token, load_hosts,
+    load_or_create_token, resolve_target, save_hosts, transport, write_token_file, Target,
 };
-use crate::server;
+use crate::server::{self, RunOptions, ServiceOptions};
 
 /// Global CLI flags accepted before or after a subcommand.
 #[derive(Default)]
@@ -165,20 +166,48 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
 
     let mut socket = default_socket_path();
+    let mut listen: Option<String> = None;
+    let mut auth_token: Option<String> = None;
+    let mut token_file: Option<PathBuf> = None;
+    let mut regenerate = false;
+
     let mut i = 0;
     while i < rest.len() {
-        if rest[i] == "--socket" {
-            let p = rest.get(i + 1).ok_or("--socket requires a path")?;
-            socket = PathBuf::from(p);
-            i += 2;
-        } else {
-            return Err(format!("unknown server option `{}`", rest[i]));
+        match rest[i].as_str() {
+            "--socket" => {
+                let p = rest.get(i + 1).ok_or("--socket requires a path")?;
+                socket = PathBuf::from(p);
+                i += 2;
+            }
+            "--listen" => {
+                let addr = rest
+                    .get(i + 1)
+                    .ok_or("--listen requires <ip:port>, <ip>, or `tailscale`")?;
+                listen = Some(addr.clone());
+                i += 2;
+            }
+            "--token" => {
+                let t = rest.get(i + 1).ok_or("--token requires a bearer token")?;
+                auth_token = Some(t.clone());
+                i += 2;
+            }
+            "--token-file" => {
+                let p = rest.get(i + 1).ok_or("--token-file requires a path")?;
+                token_file = Some(PathBuf::from(p));
+                i += 2;
+            }
+            "--regenerate" => {
+                regenerate = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown server option `{other}`")),
         }
     }
 
     match sub {
         "run" => {
-            server::run(&socket).map_err(|e| e.to_string())?;
+            let run_opts = RunOptions { listen, auth_token, token_file };
+            server::run_with_options(&socket, run_opts).map_err(|e| e.to_string())?;
             Ok(0)
         }
         "start" => {
@@ -270,8 +299,30 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                 }
             }
         }
+        "token" => {
+            let path = token_file.unwrap_or_else(default_token_path);
+            let (token, created) = if regenerate {
+                let tok = generate_auth_token().map_err(|e| e.to_string())?;
+                write_token_file(&path, &tok).map_err(|e| e.to_string())?;
+                (tok, true)
+            } else {
+                load_or_create_token(&path).map_err(|e| e.to_string())?
+            };
+            if opts.json {
+                print_json(&json!({
+                    "token": token,
+                    "path": path.to_string_lossy(),
+                    "created": created,
+                }));
+            } else {
+                println!("{token}");
+            }
+            Ok(0)
+        }
         "install-service" => {
-            let path = server::install_service(&socket).map_err(|e| e.to_string())?;
+            let svc_opts = ServiceOptions { listen, token_file };
+            let path = server::install_service_with_options(&socket, &svc_opts)
+                .map_err(|e| e.to_string())?;
             if opts.json {
                 print_json(&json!({ "installed": path.to_string_lossy() }));
             } else {
@@ -303,39 +354,60 @@ fn cmd_hosts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     match sub {
         "ls" | "list" => {
             let hosts = load_hosts();
+            let local_uri = default_local_uri();
             if opts.json {
                 let mut entries = vec![json!({
                     "alias": "local",
-                    "uri": format!("unix://{}", default_socket_path().display()),
+                    "uri": local_uri,
                 })];
                 entries.extend(hosts.iter().map(HostEntry::to_json));
                 print_json(&json!({ "hosts": entries }));
             } else {
-                println!("{:<18} {}", "local", format!("unix://{}", default_socket_path().display()));
+                println!("{:<18} {}", "local", local_uri);
                 for h in &hosts {
-                    match &h.remote_bin {
-                        Some(b) => println!("{:<18} {} (bin: {})", h.alias, h.uri, b),
-                        None => println!("{:<18} {}", h.alias, h.uri),
+                    let mut notes = Vec::new();
+                    if let Some(b) = &h.remote_bin {
+                        notes.push(format!("bin: {b}"));
+                    }
+                    if h.token.is_some() {
+                        notes.push("token ✓".into());
+                    }
+                    if notes.is_empty() {
+                        println!("{:<18} {}", h.alias, h.uri);
+                    } else {
+                        println!("{:<18} {} ({})", h.alias, h.uri, notes.join(", "));
                     }
                 }
             }
             Ok(0)
         }
         "add" => {
-            let alias = rest.first().ok_or("usage: tachyon hosts add <alias> <uri> [--bin PATH]")?;
-            let uri = rest.get(1).ok_or("usage: tachyon hosts add <alias> <uri> [--bin PATH]")?;
+            let usage = "usage: tachyon hosts add <alias> <uri> [--bin PATH] [--token TOKEN]";
+            let alias = rest.first().ok_or(usage)?;
+            let uri = rest.get(1).ok_or(usage)?;
             let mut remote_bin = None;
+            let mut token = None;
             let mut i = 2;
             while i < rest.len() {
-                if rest[i] == "--bin" {
-                    remote_bin = Some(rest.get(i + 1).ok_or("--bin requires a path")?.clone());
-                    i += 2;
-                } else {
-                    return Err(format!("unknown hosts add flag `{}`", rest[i]));
+                match rest[i].as_str() {
+                    "--bin" => {
+                        remote_bin = Some(rest.get(i + 1).ok_or("--bin requires a path")?.clone());
+                        i += 2;
+                    }
+                    "--token" => {
+                        token = Some(rest.get(i + 1).ok_or("--token requires a bearer token")?.clone());
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown hosts add flag `{other}`")),
                 }
             }
             // Validate URI syntax up front.
-            let entry = HostEntry { alias: alias.clone(), uri: uri.clone(), remote_bin };
+            let entry = HostEntry {
+                alias: alias.clone(),
+                uri: uri.clone(),
+                remote_bin,
+                token,
+            };
             let _ = resolve_target(Some(&entry.alias), std::slice::from_ref(&entry))
                 .map_err(|e| e.to_string())?;
             let mut hosts = load_hosts();
@@ -1275,13 +1347,16 @@ Usage:
 
 Server & Hosts:
   tachyon server run|start|stop|status      manage the persistent local server
-  tachyon server install-service            install launchd (macOS) / systemd (Linux) agent
+    [--socket PATH] [--listen ADDR|tailscale] [--token TOK | --token-file PATH]
+  tachyon server token [--regenerate]       show or rotate the TCP bearer auth token
+  tachyon server install-service            install launchd (macOS), systemd (Linux), or Task (Windows)
   tachyon server uninstall-service          remove the user service
-  tachyon bridge                            stdio <-> local socket bridge (invoked over SSH)
+  tachyon bridge                            stdio <-> local socket/pipe bridge (invoked over SSH)
   tachyon hosts ls                          list local & configured remote hosts
-  tachyon hosts add <alias> <uri> [--bin P] save a remote host (e.g. ssh://kagutsuchi)
+  tachyon hosts add <alias> <uri> [--bin P] [--token T]
+                                            save an ssh:// or direct tcp:// remote host
   tachyon hosts remove <alias>              remove a saved host
-  tachyon hosts test <alias>                verify SSH bridge, server version & RTT
+  tachyon hosts test <alias>                verify SSH/TCP transport, server version & RTT
 
 Sessions, Windows & Automation:
   tachyon ls                                list sessions, windows & blocks

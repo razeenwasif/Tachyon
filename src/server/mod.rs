@@ -1,26 +1,170 @@
-//! Persistent Tachyon Mux v2 server daemon (`tachyon server`).
+//! Persistent Tachyon Mux v2 server daemon.
 //!
-//! Listens on a private local Unix domain socket (macOS & Linux; Windows named
-//! pipe in Milestone 4), accepts multiple concurrent clients (local GUI, CLI,
-//! or remote SSH `tachyon bridge` relays), and keeps sessions, split windows,
-//! and PTYs alive across disconnects and app restarts.
+//! Runs identically on macOS (MacBook & Mac mini), Linux, and Windows
+//! (`--no-default-features`), accepts multiplexed client connections over:
+//! - local Unix domain sockets (macOS / Linux, peer-UID verified),
+//! - local overlapped Windows named pipes (`\\.\pipe\tachyon-server-*`, local-only),
+//! - optional direct TCP (`--listen <addr>`, e.g. Tailscale IPv4:7501) protected
+//!   by a mandatory 256-bit bearer token verified in `hello`,
+//! and keeps sessions, split windows, and PTYs alive across disconnects and
+//! app restarts.
 
 pub mod pty;
 pub mod state;
 
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::mux::proto::{self, Frame, FrameKind};
-use crate::mux::transport::tune_unix_socket;
+use crate::mux::{default_token_path, load_or_create_token, resolve_listen_addr};
 
-use state::{ClientOutbox, OutboxPop, ServerState};
+use state::{ClientOutbox, OutboxPop, RpcOutcome, ServerState};
+
+/// Startup options for `tachyon server run`.
+#[derive(Clone, Debug, Default)]
+pub struct RunOptions {
+    /// Optional direct TCP bind specification (`<ip>:<port>`, `<ip>`,
+    /// `tailscale`, or `tailscale:<port>`).
+    pub listen: Option<String>,
+    /// Explicit bearer token for TCP auth (takes precedence over `token_file`).
+    pub auth_token: Option<String>,
+    /// File storing the bearer token when `--listen` is enabled.
+    pub token_file: Option<PathBuf>,
+}
+
+/// Information reported once listeners are bound (used by tests and CLI logging).
+#[derive(Clone, Debug)]
+pub struct BoundInfo {
+    pub tcp_addr: Option<SocketAddr>,
+    pub token: Option<String>,
+    pub token_path: Option<PathBuf>,
+    pub token_created: bool,
+}
+
+/// Options forwarded into persistent user service definitions
+/// (`launchd` on macOS, `systemd --user` on Linux, Scheduled Task on Windows).
+#[derive(Clone, Debug, Default)]
+pub struct ServiceOptions {
+    pub listen: Option<String>,
+    pub token_file: Option<PathBuf>,
+}
 
 /// Run the persistent multiplexer server on `socket` until `server.shutdown`
 /// is received or the process is terminated.
-#[cfg(unix)]
 pub fn run(socket: &Path) -> io::Result<()> {
+    run_with_options(socket, RunOptions::default())
+}
+
+/// Run the persistent multiplexer server on `socket` plus an optional direct
+/// TCP listener (`opts.listen`).
+pub fn run_with_options(socket: &Path, opts: RunOptions) -> io::Result<()> {
+    run_with_ready(socket, opts, |info| {
+        if let Some(addr) = info.tcp_addr {
+            if info.token_created {
+                if let Some(path) = &info.token_path {
+                    eprintln!("tachyon server: generated bearer token -> {}", path.display());
+                }
+            }
+            crate::log!("mux server: TCP listening on {addr}");
+        }
+    })
+}
+
+/// Internal entry point that invokes `on_ready` right after local & TCP
+/// listeners are bound (enabling deterministic ephemeral-port tests).
+pub(crate) fn run_with_ready(
+    socket: &Path,
+    opts: RunOptions,
+    on_ready: impl FnOnce(&BoundInfo),
+) -> io::Result<()> {
+    // Prepare optional TCP listener + mandatory bearer token before binding local socket.
+    let mut tcp_listener: Option<(TcpListener, SocketAddr)> = None;
+    let mut resolved_token: Option<String> = None;
+    let mut token_path: Option<PathBuf> = None;
+    let mut token_created = false;
+
+    if let Some(spec) = opts.listen.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let bind_addr = resolve_listen_addr(spec)?;
+        let (tok, tpath, created) = if let Some(explicit) =
+            opts.auth_token.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            (explicit.to_string(), None, false)
+        } else {
+            let path = opts.token_file.clone().unwrap_or_else(default_token_path);
+            let (t, c) = load_or_create_token(&path)?;
+            (t, Some(path), c)
+        };
+        let listener = TcpListener::bind(&bind_addr).map_err(|e| {
+            io::Error::new(e.kind(), format!("failed to bind TCP listener on `{bind_addr}`: {e}"))
+        })?;
+        let local_addr = listener.local_addr()?;
+        tcp_listener = Some((listener, local_addr));
+        resolved_token = Some(tok);
+        token_path = tpath;
+        token_created = created;
+    }
+
+    let state = ServerState::with_auth_token(resolved_token.clone());
+    let tcp_addr = tcp_listener.as_ref().map(|(_, a)| *a);
+    let info = BoundInfo {
+        tcp_addr,
+        token: resolved_token,
+        token_path,
+        token_created,
+    };
+
+    #[cfg(unix)]
+    {
+        run_unix(socket, state, tcp_listener, &info, on_ready)
+    }
+    #[cfg(windows)]
+    {
+        run_windows(socket, state, tcp_listener, &info, on_ready)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (socket, state, tcp_listener, info, on_ready);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "multiplexer server is unsupported on this OS",
+        ))
+    }
+}
+
+fn spawn_tcp_accept_thread(
+    state: Arc<ServerState>,
+    listener: TcpListener,
+    wake_all: Arc<dyn Fn() + Send + Sync>,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("tachyon-mux-tcp-accept".into())
+        .spawn(move || {
+            for conn in listener.incoming() {
+                if state.is_shutting_down() {
+                    break;
+                }
+                let Ok(stream) = conn else { continue };
+                let _ = stream.set_nodelay(true);
+                let Ok(writer) = stream.try_clone() else { continue };
+                let st = Arc::clone(&state);
+                let wake = Arc::clone(&wake_all);
+                let _ = std::thread::Builder::new()
+                    .name("tachyon-mux-tcp-conn".into())
+                    .spawn(move || serve_connection(st, stream, writer, false, wake));
+            }
+        })
+}
+
+#[cfg(unix)]
+fn run_unix(
+    socket: &Path,
+    state: Arc<ServerState>,
+    tcp_listener: Option<(TcpListener, SocketAddr)>,
+    info: &BoundInfo,
+    on_ready: impl FnOnce(&BoundInfo),
+) -> io::Result<()> {
     use std::os::unix::net::{UnixListener, UnixStream};
 
     unsafe {
@@ -33,7 +177,7 @@ pub fn run(socket: &Path) -> io::Result<()> {
     }
 
     // Remove a stale socket file left by an earlier crashed daemon, but refuse
-    // to clobber a live server listening on the same path.
+    // to clobber an active server listening on the same path.
     if socket.exists() {
         if UnixStream::connect(socket).is_ok() {
             return Err(io::Error::new(
@@ -45,10 +189,32 @@ pub fn run(socket: &Path) -> io::Result<()> {
     }
 
     let listener = UnixListener::bind(socket)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
+    }
     crate::log!("mux server: listening on {}", socket.display());
 
-    let state = ServerState::new();
-    let socket_path = socket.to_path_buf();
+    let sock_wake = socket.to_path_buf();
+    let tcp_wake = info.tcp_addr;
+    let wake_all: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = UnixStream::connect(&sock_wake);
+        if let Some(addr) = tcp_wake {
+            let _ = TcpStream::connect(addr);
+        }
+    });
+
+    let tcp_thread = match tcp_listener {
+        Some((tcp, _)) => Some(spawn_tcp_accept_thread(
+            Arc::clone(&state),
+            tcp,
+            Arc::clone(&wake_all),
+        )?),
+        None => None,
+    };
+
+    on_ready(info);
 
     for conn in listener.incoming() {
         if state.is_shutting_down() {
@@ -58,31 +224,210 @@ pub fn run(socket: &Path) -> io::Result<()> {
         if !peer_is_self(&stream) {
             continue;
         }
-        tune_unix_socket(&stream);
-        let state = Arc::clone(&state);
-        let sock_for_wake = socket_path.clone();
+        crate::mux::transport::tune_unix_socket(&stream);
+        let Ok(writer) = stream.try_clone() else { continue };
+        let st = Arc::clone(&state);
+        let wake = Arc::clone(&wake_all);
         let _ = std::thread::Builder::new()
             .name("tachyon-mux-conn".into())
-            .spawn(move || serve_connection(state, stream, sock_for_wake));
+            .spawn(move || serve_connection(st, stream, writer, true, wake));
     }
 
+    if let Some(addr) = tcp_wake {
+        let _ = TcpStream::connect(addr);
+    }
+    if let Some(t) = tcp_thread {
+        let _ = t.join();
+    }
     let _ = std::fs::remove_file(socket);
     crate::log!("mux server: stopped");
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub fn run(_socket: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Windows named-pipe server listener is planned for Milestone 4",
-    ))
+#[cfg(windows)]
+fn run_windows(
+    socket: &Path,
+    state: Arc<ServerState>,
+    tcp_listener: Option<(TcpListener, SocketAddr)>,
+    info: &BoundInfo,
+    on_ready: impl FnOnce(&BoundInfo),
+) -> io::Result<()> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{
+        CloseHandle, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL,
+        INVALID_HANDLE_VALUE,
+    };
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    use windows::Win32::System::Threading::{CreateEventW, ResetEvent};
+
+    let pipe_path = crate::mux::normalize_pipe_path(&socket.to_string_lossy());
+    if crate::mux::transport::win_pipe::connect_named_pipe(&pipe_path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("tachyon server is already running at {}", pipe_path.display()),
+        ));
+    }
+
+    // Owner-only DACL (creator owner + LocalSystem) combined with
+    // PIPE_REJECT_REMOTE_CLIENTS keeps the local named pipe private to this user.
+    let sddl = HSTRING::from("D:P(A;;GA;;;OW)(A;;GA;;;SY)");
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let has_sd = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+        .is_ok()
+    };
+
+    let pipe_wide = HSTRING::from(pipe_path.as_os_str());
+    let create_instance = || -> io::Result<HANDLE> {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: false.into(),
+        };
+        let sa_ptr = if has_sd { Some(&sa as *const SECURITY_ATTRIBUTES) } else { None };
+        let h = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(pipe_wide.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_UNLIMITED_INSTANCES,
+                256 * 1024,
+                256 * 1024,
+                0,
+                sa_ptr,
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(h)
+        }
+    };
+
+    // Create the first pipe instance before invoking `on_ready` so clients can
+    // connect immediately once ready.
+    let mut next_pipe = create_instance()?;
+    let connect_ev = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+        .map_err(|e| io::Error::other(format!("CreateEventW(connect): {e}")))?;
+
+    let pipe_wake = pipe_path.clone();
+    let tcp_wake = info.tcp_addr;
+    let wake_all: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Ok(h) = crate::mux::transport::win_pipe::connect_named_pipe(&pipe_wake) {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+        }
+        if let Some(addr) = tcp_wake {
+            let _ = TcpStream::connect(addr);
+        }
+    });
+
+    let tcp_thread = match tcp_listener {
+        Some((tcp, _)) => Some(spawn_tcp_accept_thread(
+            Arc::clone(&state),
+            tcp,
+            Arc::clone(&wake_all),
+        )?),
+        None => None,
+    };
+
+    crate::log!("mux server: listening on {}", pipe_path.display());
+    on_ready(info);
+
+    loop {
+        if state.is_shutting_down() {
+            unsafe {
+                let _ = CloseHandle(next_pipe);
+            }
+            break;
+        }
+        unsafe {
+            let _ = ResetEvent(connect_ev);
+        }
+        let mut ov = OVERLAPPED { hEvent: connect_ev, ..Default::default() };
+        let connected = unsafe {
+            match ConnectNamedPipe(next_pipe, Some(&mut ov)) {
+                Ok(()) => true,
+                Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => true,
+                Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
+                    let mut dummy = 0u32;
+                    GetOverlappedResult(next_pipe, &ov, &mut dummy, true).is_ok()
+                }
+                Err(_) => false,
+            }
+        };
+
+        if state.is_shutting_down() {
+            unsafe {
+                let _ = CloseHandle(next_pipe);
+            }
+            break;
+        }
+
+        if connected {
+            if let Ok((reader, writer)) =
+                crate::mux::transport::win_pipe::split_overlapped_pipe(next_pipe)
+            {
+                let st = Arc::clone(&state);
+                let wake = Arc::clone(&wake_all);
+                let _ = std::thread::Builder::new()
+                    .name("tachyon-mux-pipe-conn".into())
+                    .spawn(move || serve_connection(st, reader, writer, true, wake));
+            }
+        } else {
+            unsafe {
+                let _ = CloseHandle(next_pipe);
+            }
+        }
+
+        match create_instance() {
+            Ok(h) => next_pipe = h,
+            Err(_) => break,
+        }
+    }
+
+    unsafe {
+        let _ = CloseHandle(connect_ev);
+        if has_sd && !sd.0.is_null() {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+    }
+    if let Some(addr) = tcp_wake {
+        let _ = TcpStream::connect(addr);
+    }
+    if let Some(t) = tcp_thread {
+        let _ = t.join();
+    }
+    crate::log!("mux server: stopped");
+    Ok(())
 }
 
-#[cfg(unix)]
-fn serve_connection(state: Arc<ServerState>, mut reader: std::os::unix::net::UnixStream, socket_path: PathBuf) {
-    let Ok(mut writer) = reader.try_clone() else { return };
-    let outbox = state.register_client();
+fn serve_connection<R, W>(
+    state: Arc<ServerState>,
+    mut reader: R,
+    mut writer: W,
+    pre_authenticated: bool,
+    wake_shutdown: Arc<dyn Fn() + Send + Sync>,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let outbox = state.register_client_with_auth(pre_authenticated);
 
     let writer_state = Arc::clone(&state);
     let writer_outbox = Arc::clone(&outbox);
@@ -90,7 +435,7 @@ fn serve_connection(state: Arc<ServerState>, mut reader: std::os::unix::net::Uni
         .name(format!("tachyon-mux-wr-{}", outbox.id))
         .spawn(move || writer_loop(&writer_state, &writer_outbox, &mut writer));
 
-    let mut wake_shutdown = false;
+    let mut trigger_shutdown = false;
     loop {
         let frame = match proto::read_frame(&mut reader) {
             Ok(f) => f,
@@ -99,9 +444,13 @@ fn serve_connection(state: Arc<ServerState>, mut reader: std::os::unix::net::Uni
         match frame.kind {
             FrameKind::RpcReq => {
                 if let Ok(req) = frame.parse_json() {
-                    if state.handle_rpc(&outbox, frame.channel, &req) {
-                        wake_shutdown = true;
-                        break;
+                    match state.handle_rpc(&outbox, frame.channel, &req) {
+                        RpcOutcome::Continue => {}
+                        RpcOutcome::CloseClient => break,
+                        RpcOutcome::ShutdownServer => {
+                            trigger_shutdown = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -114,11 +463,17 @@ fn serve_connection(state: Arc<ServerState>, mut reader: std::os::unix::net::Uni
                 }
             }
             FrameKind::Ping => {
-                if let Ok(ts) = proto::decode_timestamp(&frame.payload) {
-                    outbox.push_priority(Frame::pong(frame.channel, ts));
+                if outbox.authenticated.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Ok(ts) = proto::decode_timestamp(&frame.payload) {
+                        outbox.push_priority(Frame::pong(frame.channel, ts));
+                    }
                 }
             }
-            FrameKind::Pong | FrameKind::RpcRes | FrameKind::Event | FrameKind::PtyOut | FrameKind::PtySnapshot => {}
+            FrameKind::Pong
+            | FrameKind::RpcRes
+            | FrameKind::Event
+            | FrameKind::PtyOut
+            | FrameKind::PtySnapshot => {}
         }
     }
 
@@ -126,13 +481,13 @@ fn serve_connection(state: Arc<ServerState>, mut reader: std::os::unix::net::Uni
     if let Ok(handle) = writer_thread {
         let _ = handle.join();
     }
-    if wake_shutdown {
-        // Poke the accept loop only after the shutdown RpcRes has been flushed.
-        let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+    if trigger_shutdown {
+        // Poke accept loops only after the shutdown RpcRes has been flushed.
+        wake_shutdown();
     }
 }
 
-fn writer_loop<W: io::Write>(state: &ServerState, outbox: &ClientOutbox, writer: &mut W) {
+fn writer_loop<W: Write>(state: &ServerState, outbox: &ClientOutbox, writer: &mut W) {
     loop {
         match outbox.pop_next() {
             OutboxPop::Frame(frame) => {
@@ -185,24 +540,40 @@ fn peer_is_self(_stream: &std::os::unix::net::UnixStream) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Persistent user service installer (launchd on macOS, systemd --user on Linux)
+// Persistent user service installers (macOS launchd, Linux systemd --user,
+// Windows Scheduled Task) + portable template renderers
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "macos")]
-pub fn install_service(socket: &Path) -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("HOME is not set"))?;
-    let exe = std::env::current_exe()?;
-    let agents_dir = home.join("Library/LaunchAgents");
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Render a macOS `launchd` LaunchAgent plist for `tachyon server run`.
+pub fn render_launchd_plist(
+    exe: &Path,
+    socket: &Path,
+    home: &Path,
+    opts: &ServiceOptions,
+) -> String {
     let log_dir = home.join("Library/Logs/Tachyon");
-    std::fs::create_dir_all(&agents_dir)?;
-    std::fs::create_dir_all(&log_dir)?;
-    let plist_path = agents_dir.join("dev.tachyon.server.plist");
     let log_out = log_dir.join("server.log");
     let log_err = log_dir.join("server.err.log");
-
-    let plist = format!(
+    let mut extra_args = String::new();
+    if let Some(listen) = opts.listen.as_deref().filter(|s| !s.trim().is_empty()) {
+        extra_args.push_str(&format!(
+            "        <string>--listen</string>\n        <string>{}</string>\n",
+            xml_escape(listen.trim()),
+        ));
+    }
+    if let Some(tf) = &opts.token_file {
+        extra_args.push_str(&format!(
+            "        <string>--token-file</string>\n        <string>{}</string>\n",
+            xml_escape(&tf.to_string_lossy()),
+        ));
+    }
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -216,7 +587,7 @@ pub fn install_service(socket: &Path) -> io::Result<PathBuf> {
         <string>run</string>
         <string>--socket</string>
         <string>{sock}</string>
-    </array>
+{extra_args}    </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -238,7 +609,88 @@ pub fn install_service(socket: &Path) -> io::Result<PathBuf> {
         out = xml_escape(&log_out.to_string_lossy()),
         err = xml_escape(&log_err.to_string_lossy()),
         home = xml_escape(&home.to_string_lossy()),
+    )
+}
+
+fn systemd_quote(s: &str) -> String {
+    if s.contains([' ', '\t', '"', '\\']) {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Render a Linux `systemd --user` service unit for `tachyon server run`.
+pub fn render_systemd_unit(exe: &Path, socket: &Path, opts: &ServiceOptions) -> String {
+    let mut exec = format!(
+        "{} server run --socket {}",
+        systemd_quote(&exe.to_string_lossy()),
+        systemd_quote(&socket.to_string_lossy()),
     );
+    if let Some(listen) = opts.listen.as_deref().filter(|s| !s.trim().is_empty()) {
+        exec.push_str(&format!(" --listen {}", systemd_quote(listen.trim())));
+    }
+    if let Some(tf) = &opts.token_file {
+        exec.push_str(&format!(
+            " --token-file {}",
+            systemd_quote(&tf.to_string_lossy()),
+        ));
+    }
+    format!(
+        "[Unit]\n\
+         Description=Tachyon Persistent Multiplexer Server\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         Type=simple\n\
+         Environment=\"PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\"\n\
+         ExecStart={exec}\n\
+         Restart=on-failure\n\
+         RestartSec=1\n\
+         KillMode=process\n\n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
+/// Render the Windows Scheduled Task (`/TR`) command line for `tachyon.exe server run`.
+pub fn render_windows_task_command(exe: &Path, socket: &Path, opts: &ServiceOptions) -> String {
+    let mut cmd = format!(
+        "\"{}\" server run --socket \"{}\"",
+        exe.to_string_lossy(),
+        socket.to_string_lossy(),
+    );
+    if let Some(listen) = opts.listen.as_deref().filter(|s| !s.trim().is_empty()) {
+        cmd.push_str(&format!(" --listen \"{}\"", listen.trim()));
+    }
+    if let Some(tf) = &opts.token_file {
+        cmd.push_str(&format!(" --token-file \"{}\"", tf.to_string_lossy()));
+    }
+    cmd
+}
+
+pub fn install_service(socket: &Path) -> io::Result<PathBuf> {
+    install_service_with_options(socket, &ServiceOptions::default())
+}
+
+#[cfg(target_os = "macos")]
+pub fn install_service_with_options(socket: &Path, opts: &ServiceOptions) -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("HOME is not set"))?;
+    let exe = std::env::current_exe()?;
+    let agents_dir = home.join("Library/LaunchAgents");
+    let log_dir = home.join("Library/Logs/Tachyon");
+    std::fs::create_dir_all(&agents_dir)?;
+    std::fs::create_dir_all(&log_dir)?;
+    let plist_path = agents_dir.join("dev.tachyon.server.plist");
+
+    if opts.listen.is_some() {
+        let tf = opts.token_file.clone().unwrap_or_else(default_token_path);
+        let _ = load_or_create_token(&tf)?;
+    }
+
+    let plist = render_launchd_plist(&exe, socket, &home, opts);
     std::fs::write(&plist_path, plist)?;
 
     let domain = format!("gui/{}", unsafe { libc::getuid() });
@@ -289,15 +741,8 @@ pub fn uninstall_service() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 #[cfg(target_os = "linux")]
-pub fn install_service(socket: &Path) -> io::Result<PathBuf> {
+pub fn install_service_with_options(socket: &Path, opts: &ServiceOptions) -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("HOME is not set"))?;
@@ -305,13 +750,13 @@ pub fn install_service(socket: &Path) -> io::Result<PathBuf> {
     let unit_dir = home.join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
     let unit_path = unit_dir.join("tachyon-server.service");
-    let unit = format!(
-        "[Unit]\nDescription=Tachyon Persistent Multiplexer Server\nAfter=network.target\n\n\
-         [Service]\nExecStart={} server run --socket {}\nRestart=on-failure\nRestartSec=1\n\n\
-         [Install]\nWantedBy=default.target\n",
-        exe.display(),
-        socket.display(),
-    );
+
+    if opts.listen.is_some() {
+        let tf = opts.token_file.clone().unwrap_or_else(default_token_path);
+        let _ = load_or_create_token(&tf)?;
+    }
+
+    let unit = render_systemd_unit(&exe, socket, opts);
     std::fs::write(&unit_path, unit)?;
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
@@ -321,9 +766,17 @@ pub fn install_service(socket: &Path) -> io::Result<PathBuf> {
         .status()?;
     if !status.success() {
         return Err(io::Error::other(format!(
-            "wrote {}, but `systemctl --user enable --now` failed",
+            "wrote {}, but `systemctl --user enable --now` failed (if over SSH, ensure `loginctl enable-linger $USER`)",
             unit_path.display()
         )));
+    }
+    // Enable user lingering best-effort so the daemon stays alive after SSH logout.
+    if let Ok(user) = std::env::var("USER") {
+        let _ = std::process::Command::new("loginctl")
+            .args(["enable-linger", &user])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
     Ok(unit_path)
 }
@@ -340,28 +793,140 @@ pub fn uninstall_service() -> io::Result<()> {
     if unit_path.exists() {
         std::fs::remove_file(&unit_path)?;
     }
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn install_service(_socket: &Path) -> io::Result<PathBuf> {
+#[cfg(windows)]
+const WIN_TASK_NAME: &str = "Tachyon Server";
+
+#[cfg(windows)]
+pub fn install_service_with_options(socket: &Path, opts: &ServiceOptions) -> io::Result<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let exe = std::env::current_exe()?;
+    let pipe = crate::mux::normalize_pipe_path(&socket.to_string_lossy());
+    if opts.listen.is_some() {
+        let tf = opts.token_file.clone().unwrap_or_else(default_token_path);
+        let _ = load_or_create_token(&tf)?;
+    }
+
+    let task_cmd = render_windows_task_command(&exe, &pipe, opts);
+    let status = std::process::Command::new("schtasks.exe")
+        .args([
+            "/Create",
+            "/TN",
+            WIN_TASK_NAME,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "LIMITED",
+            "/F",
+            "/TR",
+            &task_cmd,
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(
+            "`schtasks.exe /Create` failed to register the Tachyon Server logon task",
+        ));
+    }
+
+    // Also launch the server immediately in the background if not already running.
+    if crate::mux::transport::win_pipe::connect_named_pipe(&pipe).is_err() {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["server", "run", "--socket"]).arg(&pipe);
+        if let Some(listen) = opts.listen.as_deref().filter(|s| !s.trim().is_empty()) {
+            cmd.args(["--listen", listen.trim()]);
+        }
+        if let Some(tf) = &opts.token_file {
+            cmd.arg("--token-file").arg(tf);
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        let _ = cmd.spawn();
+    }
+
+    Ok(PathBuf::from(format!("TaskScheduler:\\{WIN_TASK_NAME}")))
+}
+
+#[cfg(windows)]
+pub fn uninstall_service() -> io::Result<()> {
+    let _ = std::process::Command::new("schtasks.exe")
+        .args(["/Delete", "/TN", WIN_TASK_NAME, "/F"])
+        .status();
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub fn install_service_with_options(_socket: &Path, _opts: &ServiceOptions) -> io::Result<PathBuf> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "service installation on this OS is planned for Milestone 4",
+        "service installation is unsupported on this OS",
     ))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn uninstall_service() -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "service removal on this OS is planned for Milestone 4",
+        "service removal is unsupported on this OS",
     ))
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn service_templates_render_with_and_without_tcp_listen() {
+        let opts = ServiceOptions {
+            listen: Some("tailscale".into()),
+            token_file: Some(PathBuf::from("/var/lib/tachyon/token")),
+        };
+
+        let plist = render_launchd_plist(
+            Path::new("/Users/me/.local/bin/tachyon"),
+            Path::new("/Users/me/.local/state/tachyon/server.sock"),
+            Path::new("/Users/me"),
+            &opts,
+        );
+        assert!(plist.contains("<string>--listen</string>"));
+        assert!(plist.contains("<string>tailscale</string>"));
+        assert!(plist.contains("<string>--token-file</string>"));
+        assert!(plist.contains("<string>/var/lib/tachyon/token</string>"));
+
+        let unit = render_systemd_unit(
+            Path::new("/home/me/.local/bin/tachyon"),
+            Path::new("/run/user/1000/tachyon/server.sock"),
+            &opts,
+        );
+        assert!(unit.contains("ExecStart=/home/me/.local/bin/tachyon server run --socket /run/user/1000/tachyon/server.sock --listen tailscale --token-file /var/lib/tachyon/token"));
+        assert!(unit.contains("KillMode=process"));
+        assert!(unit.contains("Environment=\"PATH=%h/.local/bin"));
+
+        let win = render_windows_task_command(
+            Path::new(r"C:\Users\me\.local\bin\tachyon.exe"),
+            Path::new(r"\\.\pipe\tachyon-server-me"),
+            &opts,
+        );
+        assert!(win.contains(r#""C:\Users\me\.local\bin\tachyon.exe" server run --socket "\\.\pipe\tachyon-server-me""#));
+        assert!(win.contains(r#"--listen "tailscale""#));
+        assert!(win.contains(r#"--token-file "/var/lib/tachyon/token""#));
+    }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use crate::mux::client::{MuxClient, StreamChunk};
@@ -478,6 +1043,94 @@ mod tests {
         drop(restored_stream);
         c2.kill_session(&sess.id).unwrap();
         c2.shutdown_server().unwrap();
+        let _ = handle.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tcp_listener_enforces_bearer_token_and_shares_state_with_local_socket() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-tcp-test-{}-{}",
+            std::process::id(),
+            crate::mux::mono_now_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("server.sock");
+        let tok_file = dir.join("server.token");
+
+        let (tx, rx) = mpsc::channel();
+        let sock_srv = sock.clone();
+        let tok_srv = tok_file.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = run_with_ready(
+                &sock_srv,
+                RunOptions {
+                    listen: Some("127.0.0.1:0".into()),
+                    auth_token: None,
+                    token_file: Some(tok_srv),
+                },
+                |info| {
+                    let _ = tx.send(info.clone());
+                },
+            );
+        });
+
+        let bound = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let addr = bound.tcp_addr.expect("tcp addr bound").to_string();
+        let token = bound.token.expect("bearer token generated");
+        assert!(bound.token_created);
+        assert!(tok_file.is_file());
+
+        // 1. TCP without token must be rejected.
+        let no_tok = Target::Tcp { alias: "tcp-none".into(), addr: addr.clone(), token: None };
+        let err = MuxClient::connect(&no_tok, false, "cli", "unauth").err().unwrap();
+        assert!(
+            err.to_string().contains("unauthorized"),
+            "expected unauthorized error, got: {err}"
+        );
+
+        // 2. TCP with wrong token must be rejected.
+        let bad_tok = Target::Tcp {
+            alias: "tcp-bad".into(),
+            addr: addr.clone(),
+            token: Some("0000000000000000".into()),
+        };
+        let err = MuxClient::connect(&bad_tok, false, "cli", "wrong").err().unwrap();
+        assert!(
+            err.to_string().contains("unauthorized"),
+            "expected unauthorized error, got: {err}"
+        );
+
+        // 3. TCP with valid bearer token connects, creates a session & captures output.
+        let good_tok = Target::Tcp {
+            alias: "tcp-ok".into(),
+            addr: addr.clone(),
+            token: Some(token),
+        };
+        let tcp_client = MuxClient::connect(&good_tok, false, "gui", "tcp-client").unwrap();
+        let rtt = tcp_client.ping(Duration::from_secs(2)).unwrap();
+        assert!(rtt < Duration::from_secs(1));
+
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "echo TCP_HELLO; sleep 10".into()];
+        let (sess, _win, blk) = tcp_client
+            .create_session(Some("tailscale-work"), None, Some(&cmd), None, 80, 24)
+            .unwrap();
+        let stream = tcp_client.attach(&blk.id, true, true).unwrap();
+        let out = drain_until(&stream, "TCP_HELLO");
+        assert!(out.contains("TCP_HELLO"), "out: {out:?}");
+
+        // 4. Simultaneous local Unix-socket client sees the exact same session & block!
+        let local_client =
+            MuxClient::connect(&Target::Local { socket: sock.clone() }, false, "cli", "local").unwrap();
+        let snap = local_client.state().unwrap();
+        assert_eq!(snap.sessions.len(), 1);
+        assert_eq!(snap.sessions[0].name, "tailscale-work");
+        let cap = local_client.capture(&blk.id, Some(10), false).unwrap();
+        assert!(cap.contains("TCP_HELLO"), "cap: {cap:?}");
+
+        drop(stream);
+        local_client.kill_session(&sess.id).unwrap();
+        local_client.shutdown_server().unwrap();
         let _ = handle.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
