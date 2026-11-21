@@ -44,6 +44,7 @@ pub enum SheetAction {
     SplitRight,
     SplitDown,
     ZoomPane,
+    ToggleBroadcast,
     Neutrino,
     Monitor,
     Fairy,
@@ -89,6 +90,7 @@ pub const ENTRIES: &[SheetEntry] = &[
     SheetEntry { category: "Panes & Splits", keys: "⌘⇧D", title: "Split down", detail: "Stacked split below focused pane", action: Some(SheetAction::SplitDown) },
     SheetEntry { category: "Panes & Splits", keys: "⌘⌥←→↑↓", title: "Focus adjacent pane", detail: "Move keyboard focus across splits", action: None },
     SheetEntry { category: "Panes & Splits", keys: "⌘⇧↩", title: "Zoom / restore pane", detail: "Temporarily fill window with focused pane", action: Some(SheetAction::ZoomPane) },
+    SheetEntry { category: "Panes & Splits", keys: "⌘⇧I", title: "Broadcast input", detail: "Toggle typing & pasting into all split panes at once", action: Some(SheetAction::ToggleBroadcast) },
     SheetEntry { category: "Panes & Splits", keys: "Drag divider", title: "Resize split", detail: "Drag any pane border or sidebar right edge", action: None },
 
     // Cards & Tools
@@ -120,6 +122,7 @@ pub const ENTRIES: &[SheetEntry] = &[
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon -S kagutsuchi new work", detail: "Start persistent session on Mac mini host", action: Some(SheetAction::CopyCli("tachyon -S kagutsuchi new work")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon run --wait --capture -- CMD", detail: "Run command in a managed pane & collect output", action: Some(SheetAction::CopyCli("tachyon run --wait --capture -- ")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon split --right", detail: "Split current pane from CLI or coding agent", action: Some(SheetAction::CopyCli("tachyon split --right")) },
+    SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon send --all --enter \"CMD\"", detail: "Broadcast input to every split pane in a window", action: Some(SheetAction::CopyCli("tachyon send --all --enter ")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon skill setup", detail: "Install Claude Code, Antigravity, Codex, OpenCode & Pi hooks", action: Some(SheetAction::CopyCli("tachyon skill setup")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon agents --all-hosts", detail: "List active & blocked coding agents across every host", action: Some(SheetAction::CopyCli("tachyon agents --all-hosts")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon status --state working --tty", detail: "Emit OSC 7501 status pill & notification", action: Some(SheetAction::CopyCli("tachyon status --state working --app agent --msg \"Working\" --tty")) },
@@ -622,6 +625,7 @@ fn execute_action(win_id: u64, action: SheetAction) {
         SheetAction::SplitRight => super::split_pane(win_id, panes::Dir::Right),
         SheetAction::SplitDown => super::split_pane(win_id, panes::Dir::Down),
         SheetAction::ZoomPane => with_window(win_id, |w| w.toggle_zoom()),
+        SheetAction::ToggleBroadcast => with_window(win_id, |w| w.toggle_broadcast()),
         SheetAction::Neutrino => with_window(win_id, |w| w.toggle_neutrino()),
         SheetAction::Monitor => with_window(win_id, |w| w.toggle_monitor()),
         SheetAction::Fairy => with_window(win_id, |w| w.toggle_fairy()),

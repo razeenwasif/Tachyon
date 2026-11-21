@@ -147,6 +147,7 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 | ⌘B | Toggle the multi-host sidebar (local + remote servers) |
 | ⌘⇧P | Command Palette (commands, workspaces, agents, cheatsheet, live hosts & sessions) |
 | ⌘⇧A | Agent Mission Control (floating cross-host coding-agent inbox, also via footer `✦` icon) |
+| ⌘⇧I | Broadcast input (keystrokes & paste) to every split pane in the focused tab |
 | ⌘/ | Floating Keyboard & CLI Cheatsheet (also via footer icon or Command Palette) |
 | ⌘, | Settings window (Server, Remote Hosts, Integrations, Interface, Notifications, Workspaces) |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
@@ -544,6 +545,16 @@ OSC 7501 coding agents across **This Mac** and remote hosts — sorted by urgenc
 click/Return jump directly to the exact host, window, and split pane. Click the
 sidebar's `✦` icon to filter the sidebar tree down to agent windows, or query
 from any script with `tachyon agents --all-hosts [--state attention] [--json]`.
+
+**Broadcast Input (`⌘⇧I` & `tachyon send --all`).** Press **⌘⇧I** (or Window →
+**Broadcast Input to All Panes**, or `⌘⇧P`) in any split tab to send every
+keystroke, dead-key composition, inline suggestion, and paste (respecting each
+pane's own bracketed-paste and cursor-key modes) to all split panes
+simultaneously. While active, every split pane un-dims with an active cursor,
+dividers and the top edge glow amber, and the bottom band displays a **`◉
+BROADCAST · N panes`** badge; zooming a pane or closing down to one pane
+automatically turns broadcast off for safety. From scripts, broadcast to every
+pane in a window with `tachyon send --all [-w WID] --enter "CMD"`.
 
 **Command Palette (`⌘⇧P`), Floating Cheatsheet (`⌘/`), & Settings (`⌘,`).**
 Press **⌘⇧P** (or click `⌘` in the sidebar toolbar) to fuzzy-search every
