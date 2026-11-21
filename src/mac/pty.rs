@@ -8,18 +8,60 @@
 //! prepared *before* `fork`. Between `fork` and `exec` the child only calls
 //! async-signal-safe functions: `chdir`, `execve` and `_exit`.
 
+use std::collections::VecDeque;
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::ptr;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use crate::mux::client::{AttachedStream, MuxClient, StreamChunk};
+
+/// Identity of a Mux v2 server-owned block backing a pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MuxMeta {
+    pub host: String,
+    pub session_id: String,
+    pub window_id: String,
+    pub block_id: String,
+}
+
+/// One read result from a `Pty`.
+pub enum ReadChunk {
+    /// Complete VT restore snapshot (`Term::to_vt()`) from a Mux v2 server.
+    Snapshot(Vec<u8>),
+    /// Live PTY bytes written into the caller's buffer (`n` bytes).
+    Data(usize),
+    /// The shell or remote stream ended cleanly.
+    Eof,
+}
+
+struct MuxPty {
+    stream: AttachedStream,
+    client: Arc<MuxClient>,
+    meta: MuxMeta,
+    pid: libc::pid_t,
+    /// Leftover bytes when an incoming `StreamChunk::Output` was larger than
+    /// the caller's read buffer.
+    pending: Mutex<VecDeque<u8>>,
+}
+
+enum PtyKind {
+    Local {
+        master: OwnedFd,
+        pid: libc::pid_t,
+        /// A shell the legacy local session host runs: its output comes on this
+        /// stream rather than from the PTY, and the host reaps it.
+        output: Option<OwnedFd>,
+    },
+    Mux(MuxPty),
+}
 
 pub struct Pty {
-    master: OwnedFd,
-    pid: libc::pid_t,
-    /// A shell the session host runs: its output comes on this stream rather
-    /// than from the PTY, and the host, not this process, reaps it.
-    output: Option<OwnedFd>,
+    kind: PtyKind,
 }
 
 impl Pty {
@@ -89,100 +131,243 @@ impl Pty {
         unsafe {
             libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        Ok(Pty { master, pid, output: None })
+        Ok(Pty { kind: PtyKind::Local { master, pid, output: None } })
     }
 
-    /// A shell the session host runs: its PTY (for keys, resizes and
+    /// A shell the legacy session host runs: its PTY (for keys, resizes and
     /// terminal state) and the stream its output comes on.
     pub fn remote(master: OwnedFd, pid: libc::pid_t, output: OwnedFd) -> Pty {
-        Pty { master, pid, output: Some(output) }
+        Pty { kind: PtyKind::Local { master, pid, output: Some(output) } }
+    }
+
+    /// A block hosted by a local or remote Tachyon Mux v2 server (`kagutsuchi`,
+    /// `local`, etc.). Dropping detaches cleanly without killing the server PTY.
+    pub fn mux(stream: AttachedStream, client: Arc<MuxClient>, meta: MuxMeta, pid: u32) -> Pty {
+        Pty {
+            kind: PtyKind::Mux(MuxPty {
+                stream,
+                client,
+                meta,
+                pid: pid as libc::pid_t,
+                pending: Mutex::new(VecDeque::new()),
+            }),
+        }
     }
 
     pub fn is_remote(&self) -> bool {
-        self.output.is_some()
+        match &self.kind {
+            PtyKind::Local { output, .. } => output.is_some(),
+            PtyKind::Mux(_) => true,
+        }
+    }
+
+    pub fn is_mux(&self) -> bool {
+        matches!(self.kind, PtyKind::Mux(_))
+    }
+
+    pub fn mux_meta(&self) -> Option<&MuxMeta> {
+        match &self.kind {
+            PtyKind::Mux(m) => Some(&m.meta),
+            PtyKind::Local { .. } => None,
+        }
+    }
+
+    pub fn mux_client(&self) -> Option<&Arc<MuxClient>> {
+        match &self.kind {
+            PtyKind::Mux(m) => Some(&m.client),
+            PtyKind::Local { .. } => None,
+        }
+    }
+
+    /// Explicitly detach a Mux stream (used when switching windows or quitting).
+    pub fn detach(&self) {
+        if let PtyKind::Mux(m) = &self.kind {
+            m.stream.detach();
+        }
     }
 
     /// The size the PTY was last given, as (columns, rows).
     pub fn size(&self) -> (u16, u16) {
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws);
+        match &self.kind {
+            PtyKind::Local { master, .. } => {
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws);
+                }
+                (ws.ws_col, ws.ws_row)
+            }
+            PtyKind::Mux(m) => (m.stream.cols, m.stream.rows),
         }
-        (ws.ws_col, ws.ws_row)
+    }
+
+    /// Blocking read for the reader thread: returns either a complete VT
+    /// snapshot (`ReadChunk::Snapshot`), raw live bytes (`ReadChunk::Data(n)`),
+    /// or `ReadChunk::Eof`.
+    pub fn read_chunk(&self, buf: &mut [u8]) -> io::Result<ReadChunk> {
+        match &self.kind {
+            PtyKind::Local { .. } => match self.read(buf)? {
+                0 => Ok(ReadChunk::Eof),
+                n => Ok(ReadChunk::Data(n)),
+            },
+            PtyKind::Mux(m) => {
+                {
+                    let mut pending = m.pending.lock();
+                    if !pending.is_empty() {
+                        let n = pending.len().min(buf.len());
+                        for dst in &mut buf[..n] {
+                            *dst = pending.pop_front().unwrap();
+                        }
+                        return Ok(ReadChunk::Data(n));
+                    }
+                }
+                match m.stream.recv() {
+                    Ok(StreamChunk::Snapshot(vt)) => Ok(ReadChunk::Snapshot(vt)),
+                    Ok(StreamChunk::Output(bytes)) => {
+                        if bytes.len() <= buf.len() {
+                            buf[..bytes.len()].copy_from_slice(&bytes);
+                            Ok(ReadChunk::Data(bytes.len()))
+                        } else {
+                            let n = buf.len();
+                            buf.copy_from_slice(&bytes[..n]);
+                            m.pending.lock().extend(&bytes[n..]);
+                            Ok(ReadChunk::Data(n))
+                        }
+                    }
+                    Err(_) => Ok(ReadChunk::Eof),
+                }
+            }
+        }
     }
 
     /// Blocking read. `Ok(0)` means the child is gone: macOS reports a closed
     /// PTY as `EIO` rather than end-of-file, and both mean the same here.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let fd = self.output.as_ref().unwrap_or(&self.master).as_raw_fd();
-        loop {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n >= 0 {
-                return Ok(n as usize);
-            }
-            let err = io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EIO) => return Ok(0),
-                _ => return Err(err),
-            }
-        }
-    }
-
-    /// Write all of `data`. The PTY's input buffer is small, so a large paste
-    /// blocks until the shell catches up; the reader thread keeps draining its
-    /// output meanwhile, so this cannot deadlock.
-    pub fn write(&self, mut data: &[u8]) -> io::Result<()> {
-        while !data.is_empty() {
-            let n = unsafe { libc::write(self.master.as_raw_fd(), data.as_ptr().cast(), data.len()) };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
+        match &self.kind {
+            PtyKind::Local { master, output, .. } => {
+                let fd = output.as_ref().unwrap_or(master).as_raw_fd();
+                loop {
+                    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n >= 0 {
+                        return Ok(n as usize);
+                    }
+                    let err = io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        Some(libc::EIO) => return Ok(0),
+                        _ => return Err(err),
+                    }
                 }
-                return Err(err);
             }
-            data = &data[n as usize..];
+            PtyKind::Mux(_) => match self.read_chunk(buf)? {
+                ReadChunk::Data(n) => Ok(n),
+                ReadChunk::Snapshot(vt) => {
+                    let n = vt.len().min(buf.len());
+                    buf[..n].copy_from_slice(&vt[..n]);
+                    if vt.len() > n {
+                        if let PtyKind::Mux(m) = &self.kind {
+                            m.pending.lock().extend(&vt[n..]);
+                        }
+                    }
+                    Ok(n)
+                }
+                ReadChunk::Eof => Ok(0),
+            },
         }
-        Ok(())
     }
 
-    /// Tell the child its window changed size, in cells and pixels (`cell`
-    /// is one cell's, which image tools size what they draw by). The kernel
-    /// delivers SIGWINCH.
+    /// Write all of `data`.
+    pub fn write(&self, mut data: &[u8]) -> io::Result<()> {
+        match &self.kind {
+            PtyKind::Local { master, .. } => {
+                while !data.is_empty() {
+                    let n = unsafe { libc::write(master.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+                    if n < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    data = &data[n as usize..];
+                }
+                Ok(())
+            }
+            PtyKind::Mux(m) => m.stream.write(data),
+        }
+    }
+
+    /// Tell the child its window changed size, in cells and pixels.
     pub fn resize(&self, cols: u16, rows: u16, cell: (u32, u32)) {
-        let ws = libc::winsize {
-            ws_row: rows.max(1),
-            ws_col: cols.max(1),
-            ws_xpixel: (cols as u32 * cell.0).min(u16::MAX as u32) as u16,
-            ws_ypixel: (rows as u32 * cell.1).min(u16::MAX as u32) as u16,
-        };
-        unsafe {
-            libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+        match &self.kind {
+            PtyKind::Local { master, .. } => {
+                let ws = libc::winsize {
+                    ws_row: rows.max(1),
+                    ws_col: cols.max(1),
+                    ws_xpixel: (cols as u32 * cell.0).min(u16::MAX as u32) as u16,
+                    ws_ypixel: (rows as u32 * cell.1).min(u16::MAX as u32) as u16,
+                };
+                unsafe {
+                    libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+                }
+            }
+            PtyKind::Mux(m) => {
+                let _ = m.stream.resize(cols, rows, cell.0.min(u16::MAX as u32) as u16, cell.1.min(u16::MAX as u32) as u16);
+            }
         }
     }
-}
 
-impl Pty {
-    /// Hang up on the session, the way closing a real terminal does. The shell
-    /// exits, its side of the PTY closes, and the reader thread's blocked
-    /// `read` returns -- which is what finally drops the last reference.
+    /// Hang up / terminate the backing process or remote Mux block.
     pub fn hangup(&self) {
-        unsafe {
-            libc::kill(self.pid, libc::SIGHUP);
+        match &self.kind {
+            PtyKind::Local { pid, .. } => unsafe {
+                libc::kill(*pid, libc::SIGHUP);
+            },
+            PtyKind::Mux(m) => {
+                let client = Arc::clone(&m.client);
+                let block_id = m.meta.block_id.clone();
+                m.stream.detach();
+                let _ = std::thread::Builder::new()
+                    .name("tachyon-mux-kill".into())
+                    .spawn(move || {
+                        let _ = client.kill_block(&block_id);
+                    });
+            }
+        }
+    }
+
+    pub fn pid(&self) -> libc::pid_t {
+        match &self.kind {
+            PtyKind::Local { pid, .. } => *pid,
+            PtyKind::Mux(m) => {
+                // Only report a local PID when hosted on `local`; remote PIDs
+                // belong to another machine and must not be sampled locally.
+                if m.meta.host == "local" {
+                    m.pid
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    pub fn master_fd(&self) -> libc::c_int {
+        match &self.kind {
+            PtyKind::Local { master, .. } => master.as_raw_fd(),
+            PtyKind::Mux(_) => -1,
         }
     }
 }
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // The host's shells are the host's to reap.
-        if self.output.is_some() {
+        let PtyKind::Local { pid, output, .. } = &self.kind else {
+            // Mux streams detach cleanly on drop, leaving the server PTY alive.
+            return;
+        };
+        if output.is_some() {
             return;
         }
-        // Reap the child so it does not linger as a zombie. Usually it has
-        // already exited; if not, hang up and wait for it off this thread.
-        let pid = self.pid;
+        let pid = *pid;
         let mut status = 0;
         if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == 0 {
             unsafe {
@@ -195,16 +380,6 @@ impl Drop for Pty {
                     libc::waitpid(pid, &mut status, 0);
                 });
         }
-    }
-}
-
-impl Pty {
-    pub fn pid(&self) -> libc::pid_t {
-        self.pid
-    }
-
-    pub fn master_fd(&self) -> libc::c_int {
-        self.master.as_raw_fd()
     }
 }
 

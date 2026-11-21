@@ -42,12 +42,22 @@ pub struct AttachedStream {
     pub cols: u16,
     pub rows: u16,
     pub alive: bool,
-    pub rx: Receiver<StreamChunk>,
+    rx: Mutex<Receiver<StreamChunk>>,
     client: Arc<MuxClient>,
     detached: AtomicBool,
 }
 
 impl AttachedStream {
+    /// Block until the next `StreamChunk` arrives (or the stream closes).
+    pub fn recv(&self) -> Result<StreamChunk, mpsc::RecvError> {
+        self.rx.lock().recv()
+    }
+
+    /// Wait up to `timeout` for the next `StreamChunk`.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<StreamChunk, mpsc::RecvTimeoutError> {
+        self.rx.lock().recv_timeout(timeout)
+    }
+
     /// Send raw bytes (keystrokes, paste, terminal replies) to the block's PTY.
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() {
@@ -485,7 +495,7 @@ impl MuxClient {
             cols: data.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16,
             rows: data.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16,
             alive: data.get("alive").and_then(Value::as_bool).unwrap_or(true),
-            rx,
+            rx: Mutex::new(rx),
             client: Arc::clone(self),
             detached: AtomicBool::new(false),
         })

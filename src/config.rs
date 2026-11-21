@@ -98,6 +98,17 @@ impl Default for FontConfig {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PaneHeaders {
+    /// Always show a compact header bar over each pane (Rex style).
+    #[default]
+    Always,
+    /// Show headers only when split or attached to a remote host.
+    Auto,
+    /// Never show per-pane header bars.
+    Never,
+}
+
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
     pub cols: usize,
@@ -124,6 +135,12 @@ pub struct WindowConfig {
     pub notch_full_screen: bool,
     /// macOS: a band along the bottom with shortcut hints.
     pub hints: bool,
+    /// macOS: collapsible multi-host left sidebar (Rex style). Toggle with ⌘B.
+    pub sidebar: bool,
+    /// macOS: default width of the left sidebar in points (180..=360).
+    pub sidebar_width: f32,
+    /// macOS: per-pane header bars (`always`, `auto`, `never`).
+    pub pane_headers: PaneHeaders,
     /// Whether the user set `window.opacity` explicitly. Enabling a backdrop
     /// picks a sensible translucency by default, but must not override a value
     /// the user asked for.
@@ -148,6 +165,9 @@ impl Default for WindowConfig {
             title_bar: false,
             notch_full_screen: false,
             hints: true,
+            sidebar: cfg!(target_os = "macos"),
+            sidebar_width: 240.0,
+            pane_headers: if cfg!(target_os = "macos") { PaneHeaders::Always } else { PaneHeaders::Never },
             opacity_explicit: false,
         }
     }
@@ -638,6 +658,16 @@ impl Config {
             "shell.persist" => self.shell.persist = parse_bool(value)?,
             "shell.suggestions" => self.shell.suggestions = parse_bool(value)?,
             "window.hints" => self.window.hints = parse_bool(value)?,
+            "window.sidebar" => self.window.sidebar = parse_bool(value)?,
+            "window.sidebar_width" => self.window.sidebar_width = parse_f32(value, 180.0, 360.0)?,
+            "window.pane_headers" => {
+                self.window.pane_headers = match value.to_ascii_lowercase().as_str() {
+                    "always" | "on" | "true" => PaneHeaders::Always,
+                    "auto" => PaneHeaders::Auto,
+                    "never" | "off" | "false" => PaneHeaders::Never,
+                    _ => return Err(format!("window.pane_headers: expected always, auto or never, got `{value}`")),
+                }
+            }
             "fairy.enabled" => self.macos.fairy = parse_bool(value)?,
             "fairy.socket" => self.macos.fairy_socket = value.to_string(),
             "editor" => self.macos.editor = value.to_string(),
@@ -921,5 +951,33 @@ mod contrast_tests {
         c.set("theme.contrast", "high").unwrap();
         assert_eq!(c.contrast, Contrast::High);
         assert!(c.set("theme.contrast", "loud").is_err());
+    }
+
+    #[test]
+    fn sidebar_and_pane_headers_are_settings() {
+        let mut c = Config::default();
+        if cfg!(target_os = "macos") {
+            assert!(c.window.sidebar);
+            assert_eq!(c.window.pane_headers, PaneHeaders::Always);
+        }
+        assert_eq!(c.window.sidebar_width, 240.0);
+
+        c.set("window.sidebar", "false").unwrap();
+        assert!(!c.window.sidebar);
+        c.set("window.sidebar", "on").unwrap();
+        assert!(c.window.sidebar);
+
+        c.set("window.sidebar_width", "280").unwrap();
+        assert_eq!(c.window.sidebar_width, 280.0);
+        assert!(c.set("window.sidebar_width", "120").is_err());
+        assert!(c.set("window.sidebar_width", "500").is_err());
+
+        c.set("window.pane_headers", "auto").unwrap();
+        assert_eq!(c.window.pane_headers, PaneHeaders::Auto);
+        c.set("window.pane_headers", "never").unwrap();
+        assert_eq!(c.window.pane_headers, PaneHeaders::Never);
+        c.set("window.pane_headers", "always").unwrap();
+        assert_eq!(c.window.pane_headers, PaneHeaders::Always);
+        assert!(c.set("window.pane_headers", "sometimes").is_err());
     }
 }
