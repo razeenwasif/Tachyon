@@ -837,21 +837,51 @@ pub fn install_service_with_options(socket: &Path, opts: &ServiceOptions) -> io:
         ));
     }
 
-    // Also launch the server immediately in the background if not already running.
+    // Launch via Task Scheduler so the daemon runs outside any caller Job Object
+    // (critical when invoked over Windows OpenSSH, whose Job Object otherwise
+    // kills child processes on SSH disconnect). Fall back to detached spawn if
+    // `schtasks /Run` does not bring the pipe up.
     if crate::mux::transport::win_pipe::connect_named_pipe(&pipe).is_err() {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["server", "run", "--socket"]).arg(&pipe);
-        if let Some(listen) = opts.listen.as_deref().filter(|s| !s.trim().is_empty()) {
-            cmd.args(["--listen", listen.trim()]);
-        }
-        if let Some(tf) = &opts.token_file {
-            cmd.arg("--token-file").arg(tf);
-        }
-        cmd.stdin(std::process::Stdio::null())
+        let _ = std::process::Command::new("schtasks.exe")
+            .args(["/Run", "/TN", WIN_TASK_NAME])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        let _ = cmd.spawn();
+            .status();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut up = false;
+        while std::time::Instant::now() < deadline {
+            if crate::mux::transport::win_pipe::connect_named_pipe(&pipe).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if !up {
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["server", "run", "--socket"]).arg(&pipe);
+            if let Some(listen) = opts.listen.as_deref().filter(|s| !s.trim().is_empty()) {
+                cmd.args(["--listen", listen.trim()]);
+            }
+            if let Some(tf) = &opts.token_file {
+                cmd.arg("--token-file").arg(tf);
+            }
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(
+                    DETACHED_PROCESS
+                        | CREATE_NEW_PROCESS_GROUP
+                        | CREATE_NO_WINDOW
+                        | CREATE_BREAKAWAY_FROM_JOB,
+                );
+            if cmd.spawn().is_err() {
+                cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+                let _ = cmd.spawn();
+            }
+        }
     }
 
     Ok(PathBuf::from(format!("TaskScheduler:\\{WIN_TASK_NAME}")))

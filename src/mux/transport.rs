@@ -224,6 +224,22 @@ pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    // Prefer launching the installed Scheduled Task when using the default pipe
+    // so the server outlives Windows OpenSSH's per-session Job Object.
+    if socket == crate::mux::default_socket_path() {
+        let ok = Command::new("schtasks.exe")
+            .args(["/Run", "/TN", "Tachyon Server"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            return Ok(());
+        }
+    }
 
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -232,8 +248,16 @@ pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    let _child = cmd.spawn()?;
+        .creation_flags(
+            DETACHED_PROCESS
+                | CREATE_NEW_PROCESS_GROUP
+                | CREATE_NO_WINDOW
+                | CREATE_BREAKAWAY_FROM_JOB,
+        );
+    if cmd.spawn().is_err() {
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        let _child = cmd.spawn()?;
+    }
     Ok(())
 }
 
@@ -500,8 +524,8 @@ pub mod win_pipe {
 
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
-        ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING,
@@ -532,6 +556,7 @@ pub mod win_pipe {
     impl Drop for WinPipeReader {
         fn drop(&mut self) {
             unsafe {
+                let _ = CancelIoEx(self.pipe.0, None);
                 let _ = CloseHandle(self.event);
             }
         }
@@ -546,6 +571,7 @@ pub mod win_pipe {
     impl Drop for WinPipeWriter {
         fn drop(&mut self) {
             unsafe {
+                let _ = CancelIoEx(self.pipe.0, None);
                 let _ = CloseHandle(self.event);
             }
         }
@@ -574,7 +600,9 @@ pub mod win_pipe {
 
     fn is_eof_error(err: &windows::core::Error) -> bool {
         let code = err.code();
-        code == ERROR_BROKEN_PIPE.to_hresult() || code == ERROR_PIPE_NOT_CONNECTED.to_hresult()
+        code == ERROR_BROKEN_PIPE.to_hresult()
+            || code == ERROR_PIPE_NOT_CONNECTED.to_hresult()
+            || code == ERROR_OPERATION_ABORTED.to_hresult()
     }
 
     impl Read for WinPipeReader {

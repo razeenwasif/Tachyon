@@ -711,6 +711,21 @@ impl ServerState {
             .spawn(move || read_block_loop(state_reader, block_reader))
             .map_err(|e| format!("spawn reader thread: {e}"))?;
 
+        // On Windows ConPTY, `conhost.exe` keeps the output pipe open even after
+        // the child process exits until `ClosePseudoConsole` is called. Watch the
+        // child handle and close the pseudoconsole cleanly once it exits.
+        #[cfg(windows)]
+        {
+            let exit_block = Arc::clone(&block);
+            let _ = std::thread::Builder::new()
+                .name(format!("tachyon-srv-exit-{block_id}"))
+                .spawn(move || {
+                    let _ = exit_block.pty.wait_exit();
+                    std::thread::sleep(Duration::from_millis(30));
+                    exit_block.pty.hangup();
+                });
+        }
+
         let state_parser = Arc::clone(self);
         let block_parser = Arc::clone(&block);
         std::thread::Builder::new()
