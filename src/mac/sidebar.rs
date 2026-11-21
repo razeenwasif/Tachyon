@@ -1,12 +1,21 @@
-//! Rex-style collapsible Liquid Glass left sidebar (`Sidebar`).
+//! Herdr-inspired collapsible two-zone left sidebar (`Sidebar`).
 //!
-//! Displays every managed host (`This Mac`, `kagutsuchi`, …) with its
-//! persistent `Session -> Window` tree, live connection/RTT indicators,
-//! inline `Filter` search box, resizable right edge, and a Remote Hosts menu
-//! seeded from `~/.config/Tachyon/hosts.json` and `~/.ssh/config`.
+//! Vertical zones:
+//! - Top toolbar: Sidebar toggle, Hosts menu, Command Palette (`⌘⇧P`), New Session (`+`).
+//! - Compact search filter + `✦` Live Agents quick filter.
+//! - Zone 1 (Spaces & Hosts): `Host -> Session -> Space/Window` rows with
+//!   `18×18` monogram avatars, right-aligned git branch & amber blocked badges.
+//! - Zone 2 (Live Agents): hairline-separated, project-grouped live coding
+//!   agents with animated spinner (`Working`), blocked status, and elapsed timer.
+//! - Clean 2-row utility footer: **Settings** (`⌘,`) with server health dot
+//!   and **Shortcuts** (`⌘/`).
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -14,28 +23,50 @@ use objc2_app_kit::{
     NSAttributedStringNSStringDrawing, NSBezierPath, NSButton, NSColor, NSControl,
     NSControlTextEditingDelegate, NSCursor, NSEvent, NSFont, NSFontAttributeName,
     NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold,
-    NSForegroundColorAttributeName, NSImage, NSLineBreakMode, NSMenu, NSMenuItem,
-    NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSResponder, NSSearchField,
+    NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration, NSLineBreakMode, NSMenu,
+    NSMenuItem, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSResponder, NSSearchField,
     NSSearchFieldDelegate, NSTextAlignment, NSTextFieldDelegate, NSTrackingArea,
     NSTrackingAreaOptions, NSView,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{
     NSAttributedString, NSAttributedStringKey, NSDictionary, NSNotification, NSObject,
-    NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer,
 };
 
 use super::host_mgr::{HostStatus, HostView};
 use super::renderer::chrome_tokens;
-use super::{machines, pane_bar, with_window};
+use super::{machines, with_window};
 use crate::config::ChromeStyle;
+use crate::mux::model::{
+    format_elapsed, git_branch_for_dir, group_agents_by_project, space_monogram, AgentCounts,
+    AgentEntry, AgentFilter, HostColor,
+};
 use crate::term::{ProgramState, ProgramStatus};
 
 pub const MIN_WIDTH: f64 = 180.0;
 pub const MAX_WIDTH: f64 = 360.0;
 const TOP_BAR_H: f64 = 38.0;
-const FOOTER_H: f64 = 38.0;
+const FILTER_BAR_H: f64 = 32.0;
+const UTILITY_FOOTER_H: f64 = 58.0;
+const AGENTS_HEADER_H: f64 = 26.0;
+const EMPTY_AGENTS_H: f64 = 50.0;
 const RESIZE_GRIP_W: f64 = 6.0;
+
+const BRAILLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Pure vertical split calculation between Zone 1 (Spaces) and Zone 2 (Live Agents).
+fn compute_agents_zone_height(mid_h: f64, agents_content_h: f64, has_agents: bool) -> f64 {
+    if mid_h < 96.0 {
+        return 0.0;
+    }
+    if !has_agents {
+        return EMPTY_AGENTS_H.min(mid_h * 0.35);
+    }
+    let desired = (AGENTS_HEADER_H + agents_content_h + 6.0).max(62.0);
+    let max_h = (mid_h * 0.44).max(96.0).min((mid_h - 60.0).max(50.0));
+    desired.min(max_h)
+}
 
 #[derive(Clone, Debug)]
 enum TreeRow {
@@ -45,7 +76,7 @@ enum TreeRow {
         is_local: bool,
         os: Option<String>,
         color_spec: Option<String>,
-        color: Option<crate::mux::model::HostColor>,
+        color: Option<HostColor>,
         connected: bool,
         connecting: bool,
         rtt_ms: Option<f64>,
@@ -65,6 +96,10 @@ enum TreeRow {
         running: bool,
         active: bool,
         status: Option<ProgramStatus>,
+        host_color: Option<HostColor>,
+        git_branch: Option<String>,
+        blocked_count: usize,
+        error_count: usize,
     },
     Note {
         host: String,
@@ -77,8 +112,8 @@ impl TreeRow {
     fn height(&self) -> f64 {
         match self {
             Self::Host { top_pad, .. } => 26.0 + *top_pad,
-            Self::Session { .. } => 22.0,
-            Self::Window { .. } => 28.0,
+            Self::Session { .. } => 20.0,
+            Self::Window { .. } => 30.0,
             Self::Note { .. } => 22.0,
         }
     }
@@ -99,6 +134,7 @@ struct TreeState {
     agents_only: Cell<bool>,
     active_target: RefCell<Option<(String, String)>>, // (host, window_id)
     rows: RefCell<Vec<(f64, f64, TreeRow)>>,          // (y_top, height, row) in flipped coords
+    branch_cache: RefCell<HashMap<String, (Instant, Option<String>)>>,
     content_h: Cell<f64>,
     scroll_y: Cell<f64>,
     hover: Cell<Option<(usize, RowAction)>>,
@@ -107,7 +143,7 @@ struct TreeState {
 }
 
 define_class!(
-    /// Custom-drawn scrollable Host -> Session -> Window tree inside the sidebar.
+    /// Zone 1: Custom-drawn scrollable Host -> Session -> Space tree inside the sidebar.
     #[unsafe(super(NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "TachyonSidebarTreeView"]
@@ -159,8 +195,7 @@ define_class!(
         fn mouse_moved(&self, event: &NSEvent) {
             let p = self.convertPoint_fromView(event.locationInWindow(), None);
             if self.in_resize_grip(p.x) {
-                NSCursor::columnResizeCursorInDirections(objc2_app_kit::NSHorizontalDirections::All)
-                    .set();
+                set_resize_cursor();
                 if self.ivars().hover.get().is_some() {
                     self.ivars().hover.set(None);
                     self.setNeedsDisplay(true);
@@ -236,9 +271,7 @@ define_class!(
             if !self.ivars().dragging_resize.get() {
                 return;
             }
-            let x = event.locationInWindow().x.clamp(MIN_WIDTH, MAX_WIDTH);
-            let win_id = self.ivars().window.get();
-            with_window(win_id, |w| w.set_sidebar_width(x));
+            drag_sidebar_width(self.ivars().window.get(), event);
         }
 
         #[unsafe(method(mouseUp:))]
@@ -322,25 +355,29 @@ impl SidebarTreeView {
         let this = Self::alloc(mtm).set_ivars(state);
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
         view.setClipsToBounds(true);
-        let tracking = unsafe {
-            NSTrackingArea::initWithRect_options_owner_userInfo(
-                NSTrackingArea::alloc(),
-                NSRect::ZERO,
-                NSTrackingAreaOptions::MouseMoved
-                    | NSTrackingAreaOptions::MouseEnteredAndExited
-                    | NSTrackingAreaOptions::ActiveAlways
-                    | NSTrackingAreaOptions::InVisibleRect,
-                Some(&view),
-                None,
-            )
-        };
-        view.addTrackingArea(&tracking);
+        install_tracking_area(&view);
         view
     }
 
     fn in_resize_grip(&self, x: f64) -> bool {
         let w = self.bounds().size.width;
         x >= (w - RESIZE_GRIP_W).max(0.0)
+    }
+
+    fn resolve_local_branch(&self, cwd: &str) -> Option<String> {
+        let now = Instant::now();
+        let mut cache = self.ivars().branch_cache.borrow_mut();
+        if let Some((ts, cached)) = cache.get(cwd) {
+            if now.duration_since(*ts) < Duration::from_secs(3) {
+                return cached.clone();
+            }
+        }
+        let branch = git_branch_for_dir(Path::new(cwd));
+        if cache.len() > 64 {
+            cache.retain(|_, (ts, _)| now.duration_since(*ts) < Duration::from_secs(30));
+        }
+        cache.insert(cwd.to_string(), (now, branch.clone()));
+        branch
     }
 
     fn rebuild_rows(&self) {
@@ -417,6 +454,18 @@ impl SidebarTreeView {
                                 .filter(|b| leaves.contains(&b.id))
                                 .filter_map(|b| b.status.as_ref()),
                         );
+                        let blocked_count = snap
+                            .blocks
+                            .iter()
+                            .filter(|b| leaves.contains(&b.id))
+                            .filter(|b| b.status.as_ref().is_some_and(|s| s.state == ProgramState::Blocked))
+                            .count();
+                        let error_count = snap
+                            .blocks
+                            .iter()
+                            .filter(|b| leaves.contains(&b.id))
+                            .filter(|b| b.status.as_ref().is_some_and(|s| s.state == ProgramState::Error))
+                            .count();
                         let has_agent = status.is_some()
                             || snap.blocks.iter().any(|b| {
                                 leaves.contains(&b.id)
@@ -426,7 +475,31 @@ impl SidebarTreeView {
                             continue;
                         }
 
-                        if !sess_matches && !title.to_ascii_lowercase().contains(&filter) {
+                        let git_branch = if h.is_local {
+                            let cwd = focused
+                                .and_then(|b| b.cwd.as_deref())
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| {
+                                    leaves.iter().find_map(|bid| {
+                                        snap.blocks
+                                            .iter()
+                                            .find(|b| &b.id == bid)
+                                            .and_then(|b| b.cwd.as_deref())
+                                            .filter(|s| !s.is_empty())
+                                    })
+                                });
+                            cwd.and_then(|dir| self.resolve_local_branch(dir))
+                        } else {
+                            None
+                        };
+
+                        let branch_matches = git_branch
+                            .as_deref()
+                            .is_some_and(|br| br.to_ascii_lowercase().contains(&filter));
+                        if !sess_matches
+                            && !title.to_ascii_lowercase().contains(&filter)
+                            && !branch_matches
+                        {
                             continue;
                         }
                         let is_active = active
@@ -441,6 +514,10 @@ impl SidebarTreeView {
                             running,
                             active: is_active,
                             status,
+                            host_color: resolved_color,
+                            git_branch,
+                            blocked_count,
+                            error_count,
                         });
                     }
 
@@ -595,7 +672,6 @@ impl SidebarTreeView {
                         ));
                     }
 
-                    // OS-aware host icon (SF Symbol), tinted with host accent/danger colour.
                     let sym = if *is_local {
                         "laptopcomputer"
                     } else {
@@ -624,7 +700,6 @@ impl SidebarTreeView {
                     };
                     draw_symbol(sym, NSRect::new(NSPoint::new(12.0, y0 + 5.0), NSSize::new(14.0, 14.0)), &icon_color);
 
-                    // Status dot beside host name.
                     let dot_color = if *connected {
                         if minimal { srgb_alpha([0x4C, 0xC4, 0x8C], 1.0) } else { NSColor::systemGreenColor() }
                     } else if *connecting {
@@ -635,23 +710,23 @@ impl SidebarTreeView {
                         NSColor::tertiaryLabelColor()
                     };
                     dot_color.setFill();
-                    let dot = NSRect::new(NSPoint::new(w - 36.0, y0 + 10.0), NSSize::new(6.0, 6.0));
-                    NSBezierPath::bezierPathWithOvalInRect(dot).fill();
+                    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                        NSPoint::new(w - 36.0, y0 + 10.0),
+                        NSSize::new(6.0, 6.0),
+                    ))
+                    .fill();
 
-                    // `+` new session button on right.
                     if hovered_act == Some(RowAction::Add) {
                         let hov = if minimal {
                             srgb_alpha([255, 255, 255], 0.08)
                         } else {
                             NSColor::labelColor().colorWithAlphaComponent(0.12)
                         };
-                        hov.setFill();
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                        fill_rounded_rect(
                             NSRect::new(NSPoint::new(w - 26.0, y0 + 4.0), NSSize::new(18.0, 18.0)),
                             4.0,
-                            4.0,
-                        )
-                        .fill();
+                            &hov,
+                        );
                     }
                     let plus_col = if hovered_act == Some(RowAction::Add) {
                         if minimal { srgb_alpha([0xEE, 0xEE, 0xEF], 1.0) } else { NSColor::labelColor() }
@@ -668,7 +743,6 @@ impl SidebarTreeView {
                         NSRect::new(NSPoint::new(w - 26.0, y0 + 3.0), NSSize::new(18.0, 18.0)),
                     );
 
-                    // Host title + danger marker + optional RTT suffix for remote hosts.
                     let prefix = if color.is_some_and(|c| c.danger) { "▲ " } else { "" };
                     let label = match (is_local, rtt_ms) {
                         (false, Some(ms)) => format!("{prefix}{display_name}  {ms:.0}ms"),
@@ -697,17 +771,19 @@ impl SidebarTreeView {
                     let right_margin = if hovered { 46.0 } else { 14.0 };
                     draw_text_left(
                         name,
-                        11.5,
+                        11.0,
                         FontWeight::Medium,
                         &fg,
                         NSRect::new(
-                            NSPoint::new(14.0, y + 4.0),
-                            NSSize::new((w - 14.0 - right_margin).max(0.0), 15.0),
+                            NSPoint::new(14.0, y + 3.0),
+                            NSSize::new((w - 14.0 - right_margin).max(0.0), 14.0),
                         ),
                     );
                     if hovered {
                         let add_col = if hovered_act == Some(RowAction::Add) {
-                            NSColor::labelColor()
+                            if minimal { srgb_alpha([0xEE, 0xEE, 0xEF], 1.0) } else { NSColor::labelColor() }
+                        } else if minimal {
+                            srgb_alpha([0x98, 0x99, 0x9B], 1.0)
                         } else {
                             NSColor::secondaryLabelColor()
                         };
@@ -716,10 +792,12 @@ impl SidebarTreeView {
                             12.5,
                             true,
                             &add_col,
-                            NSRect::new(NSPoint::new(w - 40.0, y + 2.0), NSSize::new(16.0, 16.0)),
+                            NSRect::new(NSPoint::new(w - 40.0, y + 1.0), NSSize::new(16.0, 16.0)),
                         );
                         let close_col = if hovered_act == Some(RowAction::Close) {
                             NSColor::systemRedColor()
+                        } else if minimal {
+                            srgb_alpha([0x98, 0x99, 0x9B], 1.0)
                         } else {
                             NSColor::secondaryLabelColor()
                         };
@@ -728,7 +806,7 @@ impl SidebarTreeView {
                             12.5,
                             false,
                             &close_col,
-                            NSRect::new(NSPoint::new(w - 23.0, y + 2.0), NSSize::new(16.0, 16.0)),
+                            NSRect::new(NSPoint::new(w - 23.0, y + 1.0), NSSize::new(16.0, 16.0)),
                         );
                     }
                 }
@@ -739,58 +817,81 @@ impl SidebarTreeView {
                     running,
                     active,
                     status,
+                    host_color,
+                    git_branch,
+                    blocked_count,
+                    error_count,
                     ..
                 } => {
                     let pill = NSRect::new(
                         NSPoint::new(8.0, y + 1.0),
                         NSSize::new((w - 16.0).max(0.0), *rh - 2.0),
                     );
-                    let radius = if minimal { 8.0 } else { 13.0 };
+                    let radius = if minimal { 8.0 } else { 10.0 };
                     if *active {
                         let sel = if minimal {
                             srgb_alpha([255, 255, 255], 0.09)
                         } else {
                             NSColor::labelColor().colorWithAlphaComponent(0.14)
                         };
-                        sel.setFill();
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, radius, radius).fill();
+                        fill_rounded_rect(pill, radius, &sel);
+                        if minimal {
+                            stroke_rounded_rect(pill, radius, &srgb_alpha([255, 255, 255], 0.06), 1.0);
+                        }
                     } else if hovered {
                         let hov = if minimal {
                             srgb_alpha([255, 255, 255], 0.055)
                         } else {
                             NSColor::labelColor().colorWithAlphaComponent(0.07)
                         };
-                        hov.setFill();
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, radius, radius).fill();
+                        fill_rounded_rect(pill, radius, &hov);
                     }
 
-                    // Agent or terminal glyph badge on left.
-                    let badge = NSRect::new(NSPoint::new(14.0, y + 6.0), NSSize::new(16.0, 16.0));
-                    let (glyph, glyph_col) = pane_bar::app_badge(
-                        status.as_ref().and_then(|s| s.app.as_deref()),
-                        status.as_ref().map(|s| s.state),
-                        *running,
-                        *active,
-                    );
-                    let badge_bg = if status.is_some() || *running {
-                        glyph_col.colorWithAlphaComponent(0.20)
-                    } else {
-                        NSColor::labelColor().colorWithAlphaComponent(0.09)
+                    // Left 18×18 monogram avatar.
+                    let avatar = NSRect::new(NSPoint::new(13.0, y + 6.0), NSSize::new(18.0, 18.0));
+                    let (av_bg, av_border, av_fg) = match host_color {
+                        Some(hc) => (
+                            srgb_alpha(hc.rgb, 0.18),
+                            srgb_alpha(hc.rgb, 0.32),
+                            srgb_alpha(hc.rgb, 0.95),
+                        ),
+                        None if minimal => (
+                            srgb_alpha([0x24, 0x26, 0x2B], 1.0),
+                            if *blocked_count > 0 {
+                                srgb_alpha([0xF2, 0xA3, 0x3C], 0.45)
+                            } else {
+                                srgb_alpha([255, 255, 255], 0.08)
+                            },
+                            srgb_alpha([0xD2, 0xD4, 0xD9], 0.95),
+                        ),
+                        None => (
+                            NSColor::labelColor().colorWithAlphaComponent(0.10),
+                            if *blocked_count > 0 {
+                                NSColor::systemOrangeColor().colorWithAlphaComponent(0.50)
+                            } else {
+                                NSColor::labelColor().colorWithAlphaComponent(0.12)
+                            },
+                            NSColor::labelColor().colorWithAlphaComponent(0.85),
+                        ),
                     };
-                    badge_bg.setFill();
-                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(badge, 4.0, 4.0).fill();
+                    fill_rounded_rect(avatar, 5.0, &av_bg);
+                    stroke_rounded_rect(avatar, 5.0, &av_border, 1.0);
+                    let mono = space_monogram(title);
                     draw_text_centered(
-                        glyph,
-                        if glyph == ">_" { 9.5 } else { 11.0 },
+                        &mono,
+                        10.5,
                         true,
-                        &glyph_col,
-                        badge,
+                        &av_fg,
+                        NSRect::new(NSPoint::new(13.0, y + 6.5), NSSize::new(18.0, 16.0)),
                     );
 
-                    let mut right_x = w - 14.0;
+                    // Right-aligned close button / status badge + optional git branch.
+                    let mut right_x = w - 12.0;
                     if hovered {
                         let x_col = if hovered_act == Some(RowAction::Close) {
                             NSColor::systemRedColor()
+                        } else if minimal {
+                            srgb_alpha([0x98, 0x99, 0x9B], 1.0)
                         } else {
                             NSColor::secondaryLabelColor()
                         };
@@ -799,46 +900,73 @@ impl SidebarTreeView {
                             12.0,
                             false,
                             &x_col,
-                            NSRect::new(NSPoint::new(w - 25.0, y + 5.0), NSSize::new(16.0, 16.0)),
+                            NSRect::new(NSPoint::new(w - 25.0, y + 6.0), NSSize::new(16.0, 16.0)),
                         );
                         right_x = w - 28.0;
-                    } else if let Some(st) = status {
-                        let (sym, col) = pane_bar::status_style(st.state);
-                        if st.state == ProgramState::Blocked {
-                            let b_rect = NSRect::new(NSPoint::new(w - 30.0, y + 7.0), NSSize::new(16.0, 14.0));
-                            col.colorWithAlphaComponent(0.22).setFill();
-                            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(b_rect, 7.0, 7.0).fill();
-                            draw_text_centered(sym, 9.5, true, &col, b_rect);
-                            right_x = w - 34.0;
-                        } else {
-                            col.setFill();
-                            NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                                NSPoint::new(w - 22.0, y + 11.0),
-                                NSSize::new(6.0, 6.0),
-                            ))
-                            .fill();
-                            right_x = w - 26.0;
-                        }
+                    } else if *blocked_count > 0 {
+                        let text = blocked_count.to_string();
+                        let bw = ((text.len() as f64) * 6.5 + 10.0).max(16.0);
+                        let b_rect = NSRect::new(NSPoint::new(right_x - bw - 2.0, y + 7.5), NSSize::new(bw, 15.0));
+                        let amber = if minimal { srgb_alpha([0xF2, 0xA3, 0x3C], 1.0) } else { NSColor::systemOrangeColor() };
+                        fill_rounded_rect(b_rect, 7.5, &amber.colorWithAlphaComponent(0.22));
+                        stroke_rounded_rect(b_rect, 7.5, &amber.colorWithAlphaComponent(0.48), 1.0);
+                        draw_text_centered(&text, 10.0, true, &amber, b_rect);
+                        right_x -= bw + 6.0;
+                    } else if *error_count > 0 {
+                        let text = error_count.to_string();
+                        let bw = ((text.len() as f64) * 6.5 + 10.0).max(16.0);
+                        let b_rect = NSRect::new(NSPoint::new(right_x - bw - 2.0, y + 7.5), NSSize::new(bw, 15.0));
+                        let red = if minimal { srgb_alpha([0xE5, 0x6B, 0x6F], 1.0) } else { NSColor::systemRedColor() };
+                        fill_rounded_rect(b_rect, 7.5, &red.colorWithAlphaComponent(0.22));
+                        draw_text_centered(&text, 10.0, true, &red, b_rect);
+                        right_x -= bw + 6.0;
                     } else if *pane_count > 1 {
-                        let badge_rect = NSRect::new(NSPoint::new(w - 30.0, y + 7.0), NSSize::new(16.0, 14.0));
-                        NSColor::labelColor().colorWithAlphaComponent(0.10).setFill();
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(badge_rect, 7.0, 7.0).fill();
-                        draw_text_centered(
-                            &pane_count.to_string(),
-                            10.0,
-                            true,
-                            &NSColor::secondaryLabelColor(),
-                            badge_rect,
-                        );
-                        right_x = w - 34.0;
-                    } else if *running {
-                        NSColor::controlAccentColor().setFill();
+                        let text = pane_count.to_string();
+                        let b_rect = NSRect::new(NSPoint::new(right_x - 18.0, y + 8.0), NSSize::new(16.0, 14.0));
+                        let bg = if minimal { srgb_alpha([255, 255, 255], 0.08) } else { NSColor::labelColor().colorWithAlphaComponent(0.10) };
+                        let fg = if minimal { srgb_alpha([0x98, 0x99, 0x9B], 1.0) } else { NSColor::secondaryLabelColor() };
+                        fill_rounded_rect(b_rect, 7.0, &bg);
+                        draw_text_centered(&text, 9.5, true, &fg, b_rect);
+                        right_x -= 22.0;
+                    } else if status.as_ref().is_some_and(|s| s.state == ProgramState::Working) || *running {
+                        let dot = if minimal { srgb_alpha([0x76, 0xA8, 0xFF], 1.0) } else { NSColor::controlAccentColor() };
+                        dot.setFill();
                         NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                            NSPoint::new(w - 22.0, y + 11.0),
-                            NSSize::new(6.0, 6.0),
+                            NSPoint::new(right_x - 8.0, y + 12.5),
+                            NSSize::new(5.0, 5.0),
                         ))
                         .fill();
-                        right_x = w - 26.0;
+                        right_x -= 13.0;
+                    } else if status.as_ref().is_some_and(|s| s.state == ProgramState::Done) {
+                        let dot = if minimal { srgb_alpha([0x4C, 0xC4, 0x8C], 1.0) } else { NSColor::systemGreenColor() };
+                        dot.setFill();
+                        NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                            NSPoint::new(right_x - 8.0, y + 12.5),
+                            NSSize::new(5.0, 5.0),
+                        ))
+                        .fill();
+                        right_x -= 13.0;
+                    }
+
+                    if let Some(branch) = git_branch {
+                        if right_x - 38.0 >= 112.0 {
+                            let bw = ((branch.chars().count() as f64) * 5.8 + 4.0)
+                                .min((right_x - 38.0) * 0.42)
+                                .min(82.0);
+                            let br_col = if minimal {
+                                srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
+                            } else {
+                                NSColor::secondaryLabelColor().colorWithAlphaComponent(0.75)
+                            };
+                            draw_text_right(
+                                branch,
+                                10.5,
+                                FontWeight::Regular,
+                                &br_col,
+                                NSRect::new(NSPoint::new(right_x - bw, y + 8.0), NSSize::new(bw, 14.0)),
+                            );
+                            right_x -= bw + 6.0;
+                        }
                     }
 
                     let fg = if minimal {
@@ -854,20 +982,24 @@ impl SidebarTreeView {
                         if *active { FontWeight::Medium } else { FontWeight::Regular },
                         &fg,
                         NSRect::new(
-                            NSPoint::new(36.0, y + 6.0),
-                            NSSize::new((right_x - 36.0).max(0.0), 16.0),
+                            NSPoint::new(37.0, y + 7.0),
+                            NSSize::new((right_x - 41.0).max(0.0), 16.0),
                         ),
                     );
                 }
 
                 TreeRow::Note { text, .. } => {
-                    let fg = NSColor::tertiaryLabelColor();
+                    let fg = if minimal {
+                        srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
+                    } else {
+                        NSColor::tertiaryLabelColor()
+                    };
                     draw_text_left(
                         text,
                         11.0,
                         FontWeight::Regular,
                         &fg,
-                        NSRect::new(NSPoint::new(18.0, y + 3.0), NSSize::new((w - 28.0).max(0.0), 15.0)),
+                        NSRect::new(NSPoint::new(16.0, y + 3.0), NSSize::new((w - 26.0).max(0.0), 15.0)),
                     );
                 }
             }
@@ -952,8 +1084,824 @@ impl SidebarTreeView {
     }
 }
 
+#[derive(Clone, Debug)]
+enum AgentZoneRow {
+    ProjectHeader {
+        project: String,
+        host: String,
+        host_display: String,
+        host_color: Option<HostColor>,
+    },
+    Agent {
+        entry: AgentEntry,
+        active: bool,
+    },
+}
+
+impl AgentZoneRow {
+    fn height(&self) -> f64 {
+        match self {
+            Self::ProjectHeader { .. } => 20.0,
+            Self::Agent { .. } => 26.0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AgentsZoneState {
+    window: Cell<u64>,
+    chrome: Cell<ChromeStyle>,
+    rows: RefCell<Vec<(f64, f64, AgentZoneRow)>>,
+    counts: Cell<AgentCounts>,
+    content_h: Cell<f64>,
+    scroll_y: Cell<f64>,
+    hover: Cell<Option<usize>>,
+    header_hover: Cell<bool>,
+    state_since: RefCell<HashMap<(String, String), (ProgramState, Instant)>>,
+    active_target: RefCell<Option<(String, String)>>,
+    active_block: RefCell<Option<String>>,
+    spinner_tick: Cell<usize>,
+    dragging_resize: Cell<bool>,
+}
+
 define_class!(
-    /// Container view for the sidebar (subtle background tint + right hairline)
+    /// Zone 2: Hairline-separated, always-visible Live Agents pane grouped by project.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TachyonSidebarAgentsView"]
+    #[ivars = AgentsZoneState]
+    struct SidebarAgentsView;
+
+    impl SidebarAgentsView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(isOpaque))]
+        fn is_opaque(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDownCanMoveWindow))]
+        fn mouse_down_can_move_window(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            self.draw();
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            let dy = if event.hasPreciseScrollingDeltas() {
+                event.scrollingDeltaY()
+            } else {
+                event.scrollingDeltaY() * 14.0
+            };
+            let scrollable_h = (self.bounds().size.height - AGENTS_HEADER_H).max(0.0);
+            let max_scroll = (self.ivars().content_h.get() - scrollable_h).max(0.0);
+            let next = (self.ivars().scroll_y.get() - dy).clamp(0.0, max_scroll);
+            if (next - self.ivars().scroll_y.get()).abs() > 0.1 {
+                self.ivars().scroll_y.set(next);
+                self.setNeedsDisplay(true);
+            }
+        }
+
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, event: &NSEvent) {
+            let p = self.convertPoint_fromView(event.locationInWindow(), None);
+            if self.in_resize_grip(p.x) {
+                set_resize_cursor();
+                self.clear_hover();
+                return;
+            }
+            NSCursor::arrowCursor().set();
+            let header_hit = p.y >= 0.0 && p.y < AGENTS_HEADER_H;
+            let row_hit = if header_hit { None } else { self.hit_agent_row(p) };
+            if self.ivars().header_hover.get() != header_hit || self.ivars().hover.get() != row_hit {
+                self.ivars().header_hover.set(header_hit);
+                self.ivars().hover.set(row_hit);
+                self.setNeedsDisplay(true);
+            }
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            NSCursor::arrowCursor().set();
+            self.clear_hover();
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let p = self.convertPoint_fromView(event.locationInWindow(), None);
+            if self.in_resize_grip(p.x) {
+                self.ivars().dragging_resize.set(true);
+                return;
+            }
+            let win_id = self.ivars().window.get();
+            if p.y >= 0.0 && p.y < AGENTS_HEADER_H {
+                with_window(win_id, |w| w.toggle_agents_card());
+                return;
+            }
+            let Some(idx) = self.hit_agent_row(p) else { return };
+            let entry = {
+                let rows = self.ivars().rows.borrow();
+                match rows.get(idx) {
+                    Some((_, _, AgentZoneRow::Agent { entry, .. })) => Some(entry.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(e) = entry {
+                super::mux_select_window_and_block(
+                    win_id,
+                    &e.host,
+                    &e.window_id,
+                    Some(&e.block_id),
+                );
+            }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            if !self.ivars().dragging_resize.get() {
+                return;
+            }
+            drag_sidebar_width(self.ivars().window.get(), event);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            self.ivars().dragging_resize.set(false);
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            let p = self.convertPoint_fromView(event.locationInWindow(), None);
+            let Some(idx) = self.hit_agent_row(p) else { return };
+            let entry = {
+                let rows = self.ivars().rows.borrow();
+                match rows.get(idx) {
+                    Some((_, _, AgentZoneRow::Agent { entry, .. })) => Some(entry.clone()),
+                    _ => None,
+                }
+            };
+            let Some(e) = entry else { return };
+            let Some(mtm) = MainThreadMarker::new() else { return };
+
+            let menu = NSMenu::new(mtm);
+            let target: &AnyObject = self.as_ref();
+            let rep = format!("{}\u{1F}{}\u{1F}{}", e.host, e.window_id, e.block_id);
+            let focus_item = unsafe {
+                menu.addItemWithTitle_action_keyEquivalent(
+                    &NSString::from_str("Focus Agent Pane"),
+                    Some(sel!(ctxFocusAgent:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe {
+                focus_item.setTarget(Some(target));
+                focus_item.setRepresentedObject(Some(NSString::from_str(&rep).as_ref()));
+            }
+            let mc_item = unsafe {
+                menu.addItemWithTitle_action_keyEquivalent(
+                    &NSString::from_str("Open Mission Control (⌘⇧A)"),
+                    Some(sel!(ctxOpenMissionControl:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { mc_item.setTarget(Some(target)) };
+            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+        }
+
+        #[unsafe(method(ctxFocusAgent:))]
+        fn ctx_focus_agent(&self, sender: Option<&AnyObject>) {
+            let Some(s) = rep_string(sender) else { return };
+            let mut parts = s.splitn(3, '\u{1F}');
+            let (Some(host), Some(wid), Some(bid)) = (parts.next(), parts.next(), parts.next()) else {
+                return;
+            };
+            super::mux_select_window_and_block(self.ivars().window.get(), host, wid, Some(bid));
+        }
+
+        #[unsafe(method(ctxOpenMissionControl:))]
+        fn ctx_open_mission_control(&self, _sender: Option<&AnyObject>) {
+            with_window(self.ivars().window.get(), |w| w.toggle_agents_card());
+        }
+    }
+);
+
+impl SidebarAgentsView {
+    fn new(mtm: MainThreadMarker, window: u64) -> Retained<Self> {
+        let state = AgentsZoneState::default();
+        state.window.set(window);
+        let view: Retained<Self> =
+            unsafe { msg_send![super(Self::alloc(mtm).set_ivars(state)), initWithFrame: NSRect::ZERO] };
+        view.setClipsToBounds(true);
+        install_tracking_area(&view);
+        view
+    }
+
+    fn in_resize_grip(&self, x: f64) -> bool {
+        let w = self.bounds().size.width;
+        x >= (w - RESIZE_GRIP_W).max(0.0)
+    }
+
+    fn clear_hover(&self) {
+        if self.ivars().header_hover.get() || self.ivars().hover.get().is_some() {
+            self.ivars().header_hover.set(false);
+            self.ivars().hover.set(None);
+            self.setNeedsDisplay(true);
+        }
+    }
+
+    fn set_agents(
+        &self,
+        hosts: &[HostView],
+        filter: &str,
+        active_target: Option<&(String, String)>,
+        active_block: Option<&str>,
+    ) {
+        *self.ivars().active_target.borrow_mut() = active_target.cloned();
+        *self.ivars().active_block.borrow_mut() = active_block.map(str::to_string);
+
+        let all_entries = super::agents::collect_from_host_views(hosts, &[]);
+        self.ivars().counts.set(AgentCounts::from_entries(&all_entries));
+
+        // Maintain state transition timestamps and clean vanished agent keys.
+        let now_inst = Instant::now();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        {
+            let mut since = self.ivars().state_since.borrow_mut();
+            let mut live_keys = HashSet::with_capacity(all_entries.len());
+            for e in &all_entries {
+                let key = (e.host.clone(), e.block_id.clone());
+                live_keys.insert(key.clone());
+                match since.get(&key) {
+                    Some((prev, _)) if *prev == e.state => {}
+                    Some(_) => {
+                        since.insert(key, (e.state, now_inst));
+                    }
+                    None => {
+                        let start = if e.created_at > 0
+                            && now_unix > e.created_at
+                            && (now_unix - e.created_at) < 86_400
+                        {
+                            now_inst
+                                .checked_sub(Duration::from_secs(now_unix - e.created_at))
+                                .unwrap_or(now_inst)
+                        } else {
+                            now_inst
+                        };
+                        since.insert(key, (e.state, start));
+                    }
+                }
+            }
+            since.retain(|k, _| live_keys.contains(k));
+        }
+
+        let filtered = super::agents::filter_entries(&all_entries, AgentFilter::All, filter);
+        let groups = group_agents_by_project(&filtered);
+
+        let mut rows = Vec::new();
+        let mut y = 2.0;
+        for g in groups {
+            let hrow = AgentZoneRow::ProjectHeader {
+                project: g.project,
+                host: g.host,
+                host_display: g.host_display,
+                host_color: g.host_color,
+            };
+            let hh = hrow.height();
+            rows.push((y, hh, hrow));
+            y += hh;
+
+            for e in g.entries {
+                let is_active = active_target.is_some_and(|(ah, aw)| {
+                    *ah == e.host
+                        && *aw == e.window_id
+                        && active_block.is_none_or(|ab| ab == e.block_id)
+                });
+                let arow = AgentZoneRow::Agent { entry: e, active: is_active };
+                let ah = arow.height();
+                rows.push((y, ah, arow));
+                y += ah;
+            }
+        }
+
+        let content_h = if rows.is_empty() { 0.0 } else { y + 4.0 };
+        *self.ivars().rows.borrow_mut() = rows;
+        self.ivars().content_h.set(content_h);
+        let scrollable_h = (self.bounds().size.height - AGENTS_HEADER_H).max(0.0);
+        let max_scroll = (content_h - scrollable_h).max(0.0);
+        if self.ivars().scroll_y.get() > max_scroll {
+            self.ivars().scroll_y.set(max_scroll);
+        }
+        self.setNeedsDisplay(true);
+    }
+
+    fn refilter(&self, hosts: &[HostView], filter: &str) {
+        let active_target = self.ivars().active_target.borrow().clone();
+        let active_block = self.ivars().active_block.borrow().clone();
+        self.set_agents(hosts, filter, active_target.as_ref(), active_block.as_deref());
+    }
+
+    fn content_height(&self) -> f64 {
+        self.ivars().content_h.get()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ivars().rows.borrow().is_empty()
+    }
+
+    fn counts(&self) -> AgentCounts {
+        self.ivars().counts.get()
+    }
+
+    fn tick(&self) {
+        let next = self.ivars().spinner_tick.get().wrapping_add(1);
+        self.ivars().spinner_tick.set(next);
+        self.setNeedsDisplay(true);
+    }
+
+    fn hit_agent_row(&self, p: NSPoint) -> Option<usize> {
+        if p.y < AGENTS_HEADER_H {
+            return None;
+        }
+        let y = (p.y - AGENTS_HEADER_H) + self.ivars().scroll_y.get();
+        let rows = self.ivars().rows.borrow();
+        for (idx, (ry, rh, row)) in rows.iter().enumerate() {
+            if y >= *ry && y < *ry + *rh && matches!(row, AgentZoneRow::Agent { .. }) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn draw(&self) {
+        let b = self.bounds();
+        if b.size.height < AGENTS_HEADER_H {
+            return;
+        }
+        NSBezierPath::clipRect(b);
+        let w = b.size.width;
+        let style = self.ivars().chrome.get();
+        let minimal = style.is_minimal();
+        let counts = self.ivars().counts.get();
+
+        // Pinned Zone 2 header (`LIVE AGENTS` + blocked/count pill; clicks open Mission Control).
+        if self.ivars().header_hover.get() {
+            let hov = if minimal {
+                srgb_alpha([255, 255, 255], 0.04)
+            } else {
+                NSColor::labelColor().colorWithAlphaComponent(0.05)
+            };
+            fill_rounded_rect(
+                NSRect::new(NSPoint::new(8.0, 2.0), NSSize::new((w - 16.0).max(0.0), AGENTS_HEADER_H - 4.0)),
+                6.0,
+                &hov,
+            );
+        }
+        let hdr_col = if minimal {
+            srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
+        } else {
+            NSColor::secondaryLabelColor().colorWithAlphaComponent(0.8)
+        };
+        draw_text_left(
+            "LIVE AGENTS",
+            10.5,
+            FontWeight::Semibold,
+            &hdr_col,
+            NSRect::new(NSPoint::new(12.0, 6.0), NSSize::new((w - 110.0).max(0.0), 15.0)),
+        );
+
+        if counts.blocked > 0 {
+            let badge = format!("{} blocked", counts.blocked);
+            let bw = ((badge.len() as f64) * 5.8 + 12.0).clamp(52.0, 96.0);
+            let b_rect = NSRect::new(NSPoint::new(w - bw - 10.0, 5.5), NSSize::new(bw, 15.0));
+            let amber = if minimal { srgb_alpha([0xF2, 0xA3, 0x3C], 1.0) } else { NSColor::systemOrangeColor() };
+            fill_rounded_rect(b_rect, 7.5, &amber.colorWithAlphaComponent(0.20));
+            stroke_rounded_rect(b_rect, 7.5, &amber.colorWithAlphaComponent(0.45), 1.0);
+            draw_text_centered(&badge, 10.0, true, &amber, b_rect);
+        } else if counts.total > 0 {
+            let badge = counts.total.to_string();
+            let bw = ((badge.len() as f64) * 6.0 + 10.0).max(16.0);
+            let b_rect = NSRect::new(NSPoint::new(w - bw - 10.0, 5.5), NSSize::new(bw, 15.0));
+            let bg = if minimal { srgb_alpha([255, 255, 255], 0.08) } else { NSColor::labelColor().colorWithAlphaComponent(0.10) };
+            let fg = if minimal { srgb_alpha([0x98, 0x99, 0x9B], 1.0) } else { NSColor::secondaryLabelColor() };
+            fill_rounded_rect(b_rect, 7.5, &bg);
+            draw_text_centered(&badge, 10.0, true, &fg, b_rect);
+        }
+
+        // Clip scrollable agent body below header.
+        let body_rect = NSRect::new(
+            NSPoint::new(0.0, AGENTS_HEADER_H),
+            NSSize::new(w, (b.size.height - AGENTS_HEADER_H).max(0.0)),
+        );
+        NSBezierPath::clipRect(body_rect);
+
+        let rows = self.ivars().rows.borrow();
+        if rows.is_empty() {
+            let empty_col = if minimal {
+                srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
+            } else {
+                NSColor::tertiaryLabelColor()
+            };
+            draw_text_left(
+                "No active agents",
+                11.0,
+                FontWeight::Regular,
+                &empty_col,
+                NSRect::new(NSPoint::new(14.0, AGENTS_HEADER_H + 2.0), NSSize::new((w - 28.0).max(0.0), 16.0)),
+            );
+            return;
+        }
+
+        let scroll = self.ivars().scroll_y.get();
+        let hover = self.ivars().hover.get();
+        let tick = self.ivars().spinner_tick.get();
+        let since_map = self.ivars().state_since.borrow();
+
+        for (idx, (ry, rh, row)) in rows.iter().enumerate() {
+            let y = AGENTS_HEADER_H + *ry - scroll;
+            if y + *rh < AGENTS_HEADER_H || y > b.size.height {
+                continue;
+            }
+            match row {
+                AgentZoneRow::ProjectHeader { project, host, host_display, host_color } => {
+                    let dot_col = match host_color {
+                        Some(hc) => srgb_alpha(hc.rgb, 0.9),
+                        None if minimal => srgb_alpha([0x69, 0x6A, 0x6D], 1.0),
+                        None => NSColor::tertiaryLabelColor(),
+                    };
+                    dot_col.setFill();
+                    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                        NSPoint::new(13.0, y + 7.5),
+                        NSSize::new(5.0, 5.0),
+                    ))
+                    .fill();
+
+                    let mut text_right = w - 12.0;
+                    if host != "local" {
+                        let hw = ((host_display.chars().count() as f64) * 5.6 + 4.0)
+                            .min((w - 40.0) * 0.4)
+                            .min(74.0);
+                        let hcol = match host_color {
+                            Some(hc) => srgb_alpha(hc.rgb, 0.85),
+                            None if minimal => srgb_alpha([0x69, 0x6A, 0x6D], 1.0),
+                            None => NSColor::tertiaryLabelColor(),
+                        };
+                        draw_text_right(
+                            host_display,
+                            10.0,
+                            FontWeight::Medium,
+                            &hcol,
+                            NSRect::new(NSPoint::new(text_right - hw, y + 3.5), NSSize::new(hw, 14.0)),
+                        );
+                        text_right -= hw + 6.0;
+                    }
+
+                    let pcol = if minimal {
+                        srgb_alpha([0x98, 0x99, 0x9B], 1.0)
+                    } else {
+                        NSColor::secondaryLabelColor().colorWithAlphaComponent(0.9)
+                    };
+                    draw_text_left(
+                        project,
+                        11.0,
+                        FontWeight::Medium,
+                        &pcol,
+                        NSRect::new(
+                            NSPoint::new(24.0, y + 3.0),
+                            NSSize::new((text_right - 24.0).max(0.0), 15.0),
+                        ),
+                    );
+                }
+
+                AgentZoneRow::Agent { entry, active } => {
+                    let hovered = hover == Some(idx);
+                    if *active || hovered {
+                        let bg = if minimal {
+                            srgb_alpha([255, 255, 255], if *active { 0.08 } else { 0.055 })
+                        } else {
+                            NSColor::labelColor().colorWithAlphaComponent(if *active { 0.12 } else { 0.07 })
+                        };
+                        fill_rounded_rect(
+                            NSRect::new(NSPoint::new(8.0, y + 1.0), NSSize::new((w - 16.0).max(0.0), *rh - 2.0)),
+                            8.0,
+                            &bg,
+                        );
+                    }
+
+                    let (ind, ind_col) = match entry.state {
+                        ProgramState::Working => (
+                            BRAILLE_SPINNER[tick % BRAILLE_SPINNER.len()],
+                            if minimal { srgb_alpha([0x76, 0xA8, 0xFF], 1.0) } else { NSColor::controlAccentColor() },
+                        ),
+                        ProgramState::Blocked => (
+                            "●",
+                            if minimal { srgb_alpha([0xF2, 0xA3, 0x3C], 1.0) } else { NSColor::systemOrangeColor() },
+                        ),
+                        ProgramState::Error => (
+                            "✕",
+                            if minimal { srgb_alpha([0xE5, 0x6B, 0x6F], 1.0) } else { NSColor::systemRedColor() },
+                        ),
+                        ProgramState::Done => (
+                            "✓",
+                            if minimal { srgb_alpha([0x4C, 0xC4, 0x8C], 1.0) } else { NSColor::systemGreenColor() },
+                        ),
+                        ProgramState::Idle => (
+                            "○",
+                            if minimal { srgb_alpha([0x69, 0x6A, 0x6D], 1.0) } else { NSColor::tertiaryLabelColor() },
+                        ),
+                    };
+                    draw_text_centered(
+                        ind,
+                        11.5,
+                        true,
+                        &ind_col,
+                        NSRect::new(NSPoint::new(12.0, y + 5.0), NSSize::new(14.0, 16.0)),
+                    );
+
+                    // Monospaced elapsed timer on right.
+                    let secs = since_map
+                        .get(&(entry.host.clone(), entry.block_id.clone()))
+                        .map(|(_, ts)| ts.elapsed().as_secs())
+                        .unwrap_or(0);
+                    let dur = format_elapsed(secs);
+                    let dur_col = if entry.state == ProgramState::Blocked {
+                        if minimal { srgb_alpha([0xF2, 0xA3, 0x3C], 1.0) } else { NSColor::systemOrangeColor() }
+                    } else if minimal {
+                        srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
+                    } else {
+                        NSColor::tertiaryLabelColor()
+                    };
+                    draw_text_aligned(
+                        &dur,
+                        10.5,
+                        FontWeight::Regular,
+                        true,
+                        &dur_col,
+                        NSTextAlignment::Right,
+                        NSRect::new(NSPoint::new(w - 58.0, y + 5.5), NSSize::new(44.0, 15.0)),
+                    );
+
+                    let label = match entry
+                        .message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case(&entry.agent_name))
+                    {
+                        Some(msg) => format!("{} · {msg}", entry.agent_name),
+                        None => entry.agent_name.clone(),
+                    };
+                    let fg = if minimal {
+                        if *active { srgb_alpha([0xEE, 0xEE, 0xEF], 1.0) } else { srgb_alpha([0xD2, 0xD4, 0xD9], 0.92) }
+                    } else if *active {
+                        NSColor::labelColor()
+                    } else {
+                        NSColor::labelColor().colorWithAlphaComponent(0.82)
+                    };
+                    draw_text_left(
+                        &label,
+                        11.5,
+                        if *active || entry.state == ProgramState::Blocked {
+                            FontWeight::Medium
+                        } else {
+                            FontWeight::Regular
+                        },
+                        &fg,
+                        NSRect::new(NSPoint::new(28.0, y + 5.0), NSSize::new((w - 90.0).max(0.0), 16.0)),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct FooterState {
+    window: Cell<u64>,
+    chrome: Cell<ChromeStyle>,
+    hover_row: Cell<Option<usize>>,
+    server_health: Cell<u8>, // 0=offline, 1=connecting, 2=connected
+    server_tip: RefCell<String>,
+    dragging_resize: Cell<bool>,
+}
+
+define_class!(
+    /// Clean 2-row utility footer (`Settings` with server health dot + `Shortcuts`).
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TachyonSidebarFooterView"]
+    #[ivars = FooterState]
+    struct SidebarFooterView;
+
+    impl SidebarFooterView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(isOpaque))]
+        fn is_opaque(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDownCanMoveWindow))]
+        fn mouse_down_can_move_window(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            self.draw();
+        }
+
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, event: &NSEvent) {
+            let p = self.convertPoint_fromView(event.locationInWindow(), None);
+            if self.in_resize_grip(p.x) {
+                set_resize_cursor();
+                if self.ivars().hover_row.get().is_some() {
+                    self.ivars().hover_row.set(None);
+                    self.setNeedsDisplay(true);
+                }
+                return;
+            }
+            NSCursor::arrowCursor().set();
+            let hit = Self::hit_row(p.y);
+            if self.ivars().hover_row.get() != hit {
+                self.ivars().hover_row.set(hit);
+                self.setNeedsDisplay(true);
+            }
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            NSCursor::arrowCursor().set();
+            if self.ivars().hover_row.get().is_some() {
+                self.ivars().hover_row.set(None);
+                self.setNeedsDisplay(true);
+            }
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let p = self.convertPoint_fromView(event.locationInWindow(), None);
+            if self.in_resize_grip(p.x) {
+                self.ivars().dragging_resize.set(true);
+                return;
+            }
+            match Self::hit_row(p.y) {
+                Some(0) => super::open_settings(),
+                Some(1) => with_window(self.ivars().window.get(), |w| w.toggle_cheatsheet()),
+                _ => {}
+            }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            if !self.ivars().dragging_resize.get() {
+                return;
+            }
+            drag_sidebar_width(self.ivars().window.get(), event);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            self.ivars().dragging_resize.set(false);
+        }
+    }
+);
+
+impl SidebarFooterView {
+    fn new(mtm: MainThreadMarker, window: u64) -> Retained<Self> {
+        let state = FooterState::default();
+        state.window.set(window);
+        let view: Retained<Self> =
+            unsafe { msg_send![super(Self::alloc(mtm).set_ivars(state)), initWithFrame: NSRect::ZERO] };
+        view.setClipsToBounds(true);
+        install_tracking_area(&view);
+        view
+    }
+
+    fn in_resize_grip(&self, x: f64) -> bool {
+        let w = self.bounds().size.width;
+        x >= (w - RESIZE_GRIP_W).max(0.0)
+    }
+
+    fn hit_row(y: f64) -> Option<usize> {
+        if (3.0..29.0).contains(&y) {
+            Some(0)
+        } else if (29.0..55.0).contains(&y) {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    fn set_server_health(&self, health: u8, tip: String) {
+        self.ivars().server_health.set(health);
+        *self.ivars().server_tip.borrow_mut() = tip.clone();
+        self.setToolTip(Some(&NSString::from_str(&tip)));
+        self.setNeedsDisplay(true);
+    }
+
+    fn draw(&self) {
+        let b = self.bounds();
+        NSBezierPath::clipRect(b);
+        let w = b.size.width;
+        let minimal = self.ivars().chrome.get().is_minimal();
+        let hover_row = self.ivars().hover_row.get();
+        let health = self.ivars().server_health.get();
+
+        let rows = [
+            (0usize, 3.0, "gearshape", "Settings", "⌘,"),
+            (1usize, 29.0, "keyboard", "Shortcuts", "⌘/"),
+        ];
+
+        for (idx, ry, sym, label, shortcut) in rows {
+            let hovered = hover_row == Some(idx);
+            if hovered {
+                let bg = if minimal {
+                    srgb_alpha([255, 255, 255], 0.055)
+                } else {
+                    NSColor::labelColor().colorWithAlphaComponent(0.07)
+                };
+                fill_rounded_rect(
+                    NSRect::new(NSPoint::new(8.0, ry + 1.0), NSSize::new((w - 16.0).max(0.0), 24.0)),
+                    8.0,
+                    &bg,
+                );
+            }
+
+            let fg = if minimal {
+                if hovered { srgb_alpha([0xEE, 0xEE, 0xEF], 1.0) } else { srgb_alpha([0x98, 0x99, 0x9B], 1.0) }
+            } else if hovered {
+                NSColor::labelColor()
+            } else {
+                NSColor::labelColor().colorWithAlphaComponent(0.80)
+            };
+            draw_symbol(
+                sym,
+                NSRect::new(NSPoint::new(14.0, ry + 6.5), NSSize::new(13.0, 13.0)),
+                &fg,
+            );
+            draw_text_left(
+                label,
+                12.0,
+                if hovered { FontWeight::Medium } else { FontWeight::Regular },
+                &fg,
+                NSRect::new(NSPoint::new(34.0, ry + 5.0), NSSize::new((w - 82.0).max(0.0), 16.0)),
+            );
+
+            if idx == 0 {
+                let dot_col = match health {
+                    2 => if minimal { srgb_alpha([0x4C, 0xC4, 0x8C], 1.0) } else { NSColor::systemGreenColor() },
+                    1 => if minimal { srgb_alpha([0xF2, 0xA3, 0x3C], 1.0) } else { NSColor::systemOrangeColor() },
+                    _ => if minimal { srgb_alpha([0xE5, 0x6B, 0x6F], 1.0) } else { NSColor::systemRedColor() },
+                };
+                dot_col.setFill();
+                NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                    NSPoint::new(w - 42.0, ry + 10.5),
+                    NSSize::new(5.0, 5.0),
+                ))
+                .fill();
+            }
+
+            let sc_col = if minimal {
+                srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
+            } else {
+                NSColor::tertiaryLabelColor()
+            };
+            draw_text_right(
+                shortcut,
+                11.0,
+                FontWeight::Regular,
+                &sc_col,
+                NSRect::new(NSPoint::new(w - 34.0, ry + 5.5), NSSize::new(22.0, 15.0)),
+            );
+        }
+    }
+}
+
+define_class!(
+    /// Container view for the sidebar (surface tint + zone hairlines)
     /// and target for toolbar buttons, filter search field, and host menus.
     #[unsafe(super(NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -971,43 +1919,42 @@ define_class!(
         fn draw_rect(&self, _dirty: NSRect) {
             let b = self.bounds();
             let style = self.ivars().chrome.get();
-            if style.is_minimal() {
+            let minimal = style.is_minimal();
+            let agents_h = self.ivars().agents_h.get();
+
+            if minimal {
                 let tok = chrome_tokens(style, [0x17, 0x19, 0x1D]);
                 srgb_alpha(tok.chrome_bg, 1.0).setFill();
                 NSBezierPath::fillRect(b);
-
                 srgb_alpha(tok.hairline_rgb, tok.hairline_alpha as f64).setFill();
-                NSBezierPath::fillRect(NSRect::new(
-                    NSPoint::new(0.0, b.size.height - TOP_BAR_H),
-                    NSSize::new(b.size.width, 1.0),
-                ));
-                NSBezierPath::fillRect(NSRect::new(
-                    NSPoint::new(0.0, FOOTER_H),
-                    NSSize::new(b.size.width, 1.0),
-                ));
-                NSBezierPath::fillRect(NSRect::new(
-                    NSPoint::new(b.size.width - 1.0, 0.0),
-                    NSSize::new(1.0, b.size.height),
-                ));
-                return;
+            } else {
+                NSColor::blackColor().colorWithAlphaComponent(0.16).setFill();
+                NSBezierPath::fillRect(b);
+                NSColor::separatorColor().colorWithAlphaComponent(0.28).setFill();
             }
-            // Subtle darker glass tint separating the sidebar from the terminal.
-            NSColor::blackColor().colorWithAlphaComponent(0.16).setFill();
-            NSBezierPath::fillRect(b);
 
-            // Top bar hairline.
-            NSColor::separatorColor().colorWithAlphaComponent(0.25).setFill();
+            // 1. Hairline below top toolbar + filter bar.
+            let header_bottom = (b.size.height - TOP_BAR_H - FILTER_BAR_H).max(0.0);
             NSBezierPath::fillRect(NSRect::new(
-                NSPoint::new(0.0, b.size.height - TOP_BAR_H),
+                NSPoint::new(0.0, header_bottom),
                 NSSize::new(b.size.width, 1.0),
             ));
-            // Footer hairline.
+            // 2. Hairline between Zone 1 (Spaces) and Zone 2 (Live Agents).
+            if agents_h >= 1.0 {
+                NSBezierPath::fillRect(NSRect::new(
+                    NSPoint::new(0.0, UTILITY_FOOTER_H + agents_h),
+                    NSSize::new(b.size.width, 1.0),
+                ));
+            }
+            // 3. Hairline above 2-row utility footer.
             NSBezierPath::fillRect(NSRect::new(
-                NSPoint::new(0.0, FOOTER_H),
+                NSPoint::new(0.0, UTILITY_FOOTER_H),
                 NSSize::new(b.size.width, 1.0),
             ));
-            // Right edge vertical divider hairline.
-            NSColor::separatorColor().colorWithAlphaComponent(0.40).setFill();
+            // 4. Right edge vertical divider hairline.
+            if !minimal {
+                NSColor::separatorColor().colorWithAlphaComponent(0.40).setFill();
+            }
             NSBezierPath::fillRect(NSRect::new(
                 NSPoint::new(b.size.width - 1.0, 0.0),
                 NSSize::new(1.0, b.size.height),
@@ -1036,11 +1983,6 @@ define_class!(
             with_window(self.ivars().window.get(), |w| w.toggle_palette());
         }
 
-        #[unsafe(method(sidebarSettings:))]
-        fn sidebar_settings(&self, _sender: Option<&AnyObject>) {
-            super::open_settings();
-        }
-
         #[unsafe(method(sidebarAgentsFilter:))]
         fn sidebar_agents_filter(&self, _sender: Option<&AnyObject>) {
             with_window(self.ivars().window.get(), |w| w.toggle_sidebar_agents_filter());
@@ -1052,6 +1994,16 @@ define_class!(
             let menu = NSMenu::new(mtm);
             let target: &AnyObject = self.as_ref();
             let hosts = super::mux_host_views();
+
+            let refresh_item = unsafe {
+                menu.addItemWithTitle_action_keyEquivalent(
+                    &NSString::from_str("↻ Refresh All Hosts"),
+                    Some(sel!(sidebarRefresh:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { refresh_item.setTarget(Some(target)) };
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
 
             let header = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -1088,7 +2040,6 @@ define_class!(
                 }
             }
 
-            // Discovered SSH hosts from ~/.ssh/config not yet in hosts.json.
             let ssh_hosts: Vec<_> = machines::all()
                 .iter()
                 .filter(|m| !hosts.iter().any(|h| h.alias == m.name))
@@ -1188,22 +2139,33 @@ struct RootState {
     window: Cell<u64>,
     active_host: RefCell<String>,
     chrome: Cell<ChromeStyle>,
+    agents_h: Cell<f64>,
 }
 
-/// Complete collapsible sidebar mounted beside `TachyonView`.
+/// Complete collapsible two-zone sidebar mounted beside `TachyonView`.
 pub struct Sidebar {
     pub root: Retained<NSView>,
+    window_id: u64,
+    visible: Cell<bool>,
     root_view: Retained<SidebarRootView>,
     tree: Retained<SidebarTreeView>,
+    agents_view: Retained<SidebarAgentsView>,
+    footer: Retained<SidebarFooterView>,
     toggle_btn: Retained<NSButton>,
+    hosts_btn: Retained<NSButton>,
     palette_btn: Retained<NSButton>,
-    refresh_btn: Retained<NSButton>,
     new_btn: Retained<NSButton>,
     filter: Retained<NSSearchField>,
     agents_btn: Retained<NSButton>,
-    settings_btn: Retained<NSButton>,
-    hosts_btn: Retained<NSButton>,
-    server_btn: Retained<NSButton>,
+    agent_timer: RefCell<Option<(f64, Retained<NSTimer>)>>,
+}
+
+impl Drop for Sidebar {
+    fn drop(&mut self) {
+        if let Some((_, timer)) = self.agent_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+    }
 }
 
 impl Sidebar {
@@ -1215,12 +2177,16 @@ impl Sidebar {
             unsafe { msg_send![super(SidebarRootView::alloc(mtm).set_ivars(state)), initWithFrame: NSRect::ZERO] };
 
         let tree = SidebarTreeView::new(mtm, window);
+        let agents_view = SidebarAgentsView::new(mtm, window);
+        let footer = SidebarFooterView::new(mtm, window);
         root_view.addSubview(&tree);
+        root_view.addSubview(&agents_view);
+        root_view.addSubview(&footer);
 
         let target: &AnyObject = root_view.as_ref();
         let toggle_btn = symbol_button(mtm, "sidebar.left", "Toggle Sidebar (⌘B)", target, sel!(sidebarToggle:));
+        let hosts_btn = symbol_button(mtm, "globe", "Hosts & Refresh", target, sel!(sidebarHostsMenu:));
         let palette_btn = symbol_button(mtm, "command", "Command Palette (⌘⇧P)", target, sel!(sidebarPalette:));
-        let refresh_btn = symbol_button(mtm, "arrow.clockwise", "Refresh Hosts", target, sel!(sidebarRefresh:));
         let new_btn = symbol_button(mtm, "plus", "New Session", target, sel!(sidebarNewSession:));
         let agents_btn = symbol_button(
             mtm,
@@ -1229,41 +2195,37 @@ impl Sidebar {
             target,
             sel!(sidebarAgentsFilter:),
         );
-        let settings_btn = symbol_button(mtm, "gearshape", "Settings (⌘,)", target, sel!(sidebarSettings:));
-        let hosts_btn = symbol_button(mtm, "globe", "Remote Hosts", target, sel!(sidebarHostsMenu:));
-        let server_btn = symbol_button(mtm, "server.rack", "Server Status", target, sel!(sidebarSettings:));
 
         let filter = NSSearchField::initWithFrame(NSSearchField::alloc(mtm), NSRect::ZERO);
-        filter.setPlaceholderString(Some(&NSString::from_str("Filter")));
+        filter.setPlaceholderString(Some(&NSString::from_str("Filter spaces & agents…")));
         unsafe { filter.setDelegate(Some(ProtocolObject::from_ref(&*root_view))) };
         filter.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
 
         root_view.addSubview(&toggle_btn);
+        root_view.addSubview(&hosts_btn);
         root_view.addSubview(&palette_btn);
-        root_view.addSubview(&refresh_btn);
         root_view.addSubview(&new_btn);
         root_view.addSubview(&filter);
         root_view.addSubview(&agents_btn);
-        root_view.addSubview(&settings_btn);
-        root_view.addSubview(&hosts_btn);
-        root_view.addSubview(&server_btn);
 
         let root: Retained<NSView> = Retained::into_super(root_view.clone());
         parent.addSubview(&root);
 
         Self {
             root,
+            window_id: window,
+            visible: Cell::new(false),
             root_view,
             tree,
+            agents_view,
+            footer,
             toggle_btn,
+            hosts_btn,
             palette_btn,
-            refresh_btn,
             new_btn,
             filter,
             agents_btn,
-            settings_btn,
-            hosts_btn,
-            server_btn,
+            agent_timer: RefCell::new(None),
         }
     }
 
@@ -1276,40 +2238,121 @@ impl Sidebar {
         // Top toolbar buttons (clear of traffic lights on the left).
         let btn_y = top_y + (TOP_BAR_H - 22.0) / 2.0;
         self.toggle_btn.setFrame(NSRect::new(NSPoint::new(76.0, btn_y), NSSize::new(24.0, 22.0)));
-        self.new_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
+        self.hosts_btn.setFrame(NSRect::new(NSPoint::new((w - 76.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
         self.palette_btn.setFrame(NSRect::new(NSPoint::new((w - 52.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
-        self.refresh_btn.setFrame(NSRect::new(NSPoint::new((w - 76.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
+        self.new_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
 
-        // Middle tree area.
-        let tree_h = (h - TOP_BAR_H - FOOTER_H).max(0.0);
-        self.tree.setFrame(NSRect::new(NSPoint::new(0.0, FOOTER_H), NSSize::new(w, tree_h)));
+        // Filter row directly beneath the top toolbar.
+        let filter_y = (h - TOP_BAR_H - FILTER_BAR_H + (FILTER_BAR_H - 22.0) / 2.0).max(UTILITY_FOOTER_H);
+        let filter_w = (w - 40.0).max(40.0);
+        self.filter.setFrame(NSRect::new(NSPoint::new(8.0, filter_y), NSSize::new(filter_w, 22.0)));
+        self.agents_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(52.0), filter_y), NSSize::new(22.0, 22.0)));
 
-        // Bottom footer: Filter box + agents filter, settings, server & hosts buttons.
-        let fy = (FOOTER_H - 22.0) / 2.0;
-        let filter_w = (w - 116.0).max(52.0);
-        self.filter.setFrame(NSRect::new(NSPoint::new(8.0, fy), NSSize::new(filter_w, 22.0)));
-        self.agents_btn.setFrame(NSRect::new(NSPoint::new((w - 100.0).max(64.0), fy), NSSize::new(22.0, 22.0)));
-        self.settings_btn.setFrame(NSRect::new(NSPoint::new((w - 76.0).max(86.0), fy), NSSize::new(22.0, 22.0)));
-        self.server_btn.setFrame(NSRect::new(NSPoint::new((w - 52.0).max(108.0), fy), NSSize::new(22.0, 22.0)));
-        self.hosts_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(130.0), fy), NSSize::new(22.0, 22.0)));
+        // Bottom 2-row utility footer.
+        self.footer.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, UTILITY_FOOTER_H)));
 
         self.tree.rebuild_rows();
+        self.relayout_zones();
+    }
+
+    fn relayout_zones(&self) {
+        let size = self.root.bounds().size;
+        let w = size.width;
+        let h = size.height;
+        let mid_h = (h - TOP_BAR_H - FILTER_BAR_H - UTILITY_FOOTER_H).max(0.0);
+        let agents_h = compute_agents_zone_height(
+            mid_h,
+            self.agents_view.content_height(),
+            !self.agents_view.is_empty(),
+        );
+        self.root_view.ivars().agents_h.set(agents_h);
+
+        if agents_h < 1.0 {
+            self.agents_view.setHidden(true);
+            self.agents_view.setFrame(NSRect::ZERO);
+        } else {
+            self.agents_view.setHidden(false);
+            self.agents_view.setFrame(NSRect::new(
+                NSPoint::new(0.0, UTILITY_FOOTER_H),
+                NSSize::new(w, agents_h),
+            ));
+        }
+
+        let spaces_y = UTILITY_FOOTER_H + agents_h;
+        let spaces_h = (mid_h - agents_h).max(0.0);
+        self.tree.setFrame(NSRect::new(NSPoint::new(0.0, spaces_y), NSSize::new(w, spaces_h)));
+        self.root_view.setNeedsDisplay(true);
     }
 
     pub fn set_chrome(&self, style: ChromeStyle) {
         self.root_view.ivars().chrome.set(style);
         self.tree.ivars().chrome.set(style);
+        self.agents_view.ivars().chrome.set(style);
+        self.footer.ivars().chrome.set(style);
         self.root_view.setNeedsDisplay(true);
         self.tree.setNeedsDisplay(true);
+        self.agents_view.setNeedsDisplay(true);
+        self.footer.setNeedsDisplay(true);
     }
 
-    pub fn set_hosts(&self, hosts: Vec<HostView>, active: Option<(String, String)>) {
+    pub fn set_visible(&self, visible: bool) {
+        if self.visible.get() != visible {
+            self.visible.set(visible);
+            self.sync_agent_timer();
+        }
+    }
+
+    pub fn tick_agents(&self) {
+        self.agents_view.tick();
+    }
+
+    fn sync_agent_timer(&self) {
+        let counts = self.agents_view.counts();
+        let desired = if !self.visible.get() {
+            None
+        } else if counts.working > 0 {
+            Some(0.25)
+        } else if counts.blocked + counts.error > 0 {
+            Some(1.0)
+        } else {
+            None
+        };
+
+        let same = self
+            .agent_timer
+            .borrow()
+            .as_ref()
+            .is_some_and(|(cur, _)| Some(*cur) == desired);
+        if same {
+            return;
+        }
+        if let Some((_, old)) = self.agent_timer.borrow_mut().take() {
+            old.invalidate();
+        }
+        if let Some(interval) = desired {
+            let win_id = self.window_id;
+            let block = RcBlock::new(move |_t: std::ptr::NonNull<NSTimer>| {
+                with_window(win_id, |w| w.tick_sidebar_agents());
+            });
+            let timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_repeats_block(interval, true, &block)
+            };
+            *self.agent_timer.borrow_mut() = Some((interval, timer));
+        }
+    }
+
+    pub fn set_hosts(
+        &self,
+        hosts: Vec<HostView>,
+        active: Option<(String, String)>,
+        active_block: Option<String>,
+    ) {
         if let Some((ref h, _)) = active {
             *self.root_view.ivars().active_host.borrow_mut() = h.clone();
         }
-        // Update local server button tint & tooltip.
+
         if let Some(local) = hosts.iter().find(|h| h.is_local) {
-            let (color, tip) = match &local.status {
+            let (health, tip) = match &local.status {
                 HostStatus::Connected { info, .. } => {
                     let (s, b) = local
                         .snapshot
@@ -1317,15 +2360,14 @@ impl Sidebar {
                         .map(|sn| (sn.sessions.len(), sn.blocks.len()))
                         .unwrap_or((0, 0));
                     (
-                        NSColor::systemGreenColor(),
+                        2u8,
                         format!("Local server running (pid {}, {} sessions, {} blocks)", info.pid, s, b),
                     )
                 }
-                HostStatus::Connecting => (NSColor::systemOrangeColor(), "Local server starting…".into()),
-                HostStatus::Disconnected { error } => (NSColor::systemRedColor(), format!("Local server offline: {error}")),
+                HostStatus::Connecting => (1u8, "Local server starting…".into()),
+                HostStatus::Disconnected { error } => (0u8, format!("Local server offline: {error}")),
             };
-            self.server_btn.setContentTintColor(Some(&color));
-            self.server_btn.setToolTip(Some(&NSString::from_str(&tip)));
+            self.footer.set_server_health(health, tip);
         }
 
         let remote_connected = hosts
@@ -1339,10 +2381,19 @@ impl Sidebar {
         };
         self.hosts_btn.setContentTintColor(Some(&hosts_color));
 
+        let filter = self.tree.ivars().filter.borrow().clone();
+        self.agents_view.set_agents(
+            &hosts,
+            &filter,
+            active.as_ref(),
+            active_block.as_deref(),
+        );
         *self.tree.ivars().hosts.borrow_mut() = hosts;
         *self.tree.ivars().active_target.borrow_mut() = active;
         self.update_agents_filter_button();
         self.tree.rebuild_rows();
+        self.relayout_zones();
+        self.sync_agent_timer();
     }
 
     pub fn toggle_agents_only(&self) {
@@ -1353,11 +2404,24 @@ impl Sidebar {
         self.tree.rebuild_rows();
     }
 
+    pub fn set_filter(&self, query: String) {
+        *self.tree.ivars().filter.borrow_mut() = query.clone();
+        self.tree.ivars().scroll_y.set(0.0);
+        self.agents_view.ivars().scroll_y.set(0.0);
+        self.tree.rebuild_rows();
+        {
+            let hosts = self.tree.ivars().hosts.borrow();
+            self.agents_view.refilter(&hosts, &query);
+        }
+        self.relayout_zones();
+        self.sync_agent_timer();
+    }
+
     fn update_agents_filter_button(&self) {
         let on = self.tree.ivars().agents_only.get();
         let hosts = self.tree.ivars().hosts.borrow();
         let entries = super::agents::collect_from_host_views(&hosts, &[]);
-        let counts = crate::mux::model::AgentCounts::from_entries(&entries);
+        let counts = AgentCounts::from_entries(&entries);
         let color = if counts.blocked > 0 {
             NSColor::systemOrangeColor()
         } else if counts.error > 0 {
@@ -1377,12 +2441,43 @@ impl Sidebar {
         );
         self.agents_btn.setToolTip(Some(&NSString::from_str(&tip)));
     }
+}
 
-    pub fn set_filter(&self, query: String) {
-        *self.tree.ivars().filter.borrow_mut() = query;
-        self.tree.ivars().scroll_y.set(0.0);
-        self.tree.rebuild_rows();
-    }
+fn install_tracking_area(view: &NSView) {
+    let tracking = unsafe {
+        NSTrackingArea::initWithRect_options_owner_userInfo(
+            NSTrackingArea::alloc(),
+            NSRect::ZERO,
+            NSTrackingAreaOptions::MouseMoved
+                | NSTrackingAreaOptions::MouseEnteredAndExited
+                | NSTrackingAreaOptions::ActiveAlways
+                | NSTrackingAreaOptions::InVisibleRect,
+            Some(view),
+            None,
+        )
+    };
+    view.addTrackingArea(&tracking);
+}
+
+fn set_resize_cursor() {
+    NSCursor::columnResizeCursorInDirections(objc2_app_kit::NSHorizontalDirections::All).set();
+}
+
+fn drag_sidebar_width(win_id: u64, event: &NSEvent) {
+    let x = event.locationInWindow().x.clamp(MIN_WIDTH, MAX_WIDTH);
+    with_window(win_id, |w| w.set_sidebar_width(x));
+}
+
+fn fill_rounded_rect(rect: NSRect, radius: f64, color: &NSColor) {
+    color.setFill();
+    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius).fill();
+}
+
+fn stroke_rounded_rect(rect: NSRect, radius: f64, color: &NSColor, width: f64) {
+    color.setStroke();
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius);
+    path.setLineWidth(width);
+    path.stroke();
 }
 
 fn srgb_alpha(rgb: [u8; 3], alpha: f64) -> Retained<NSColor> {
@@ -1449,8 +2544,17 @@ enum FontWeight {
     Semibold,
 }
 
-fn draw_text_left(text: &str, size: f64, weight: FontWeight, color: &NSColor, rect: NSRect) {
+fn draw_text_aligned(
+    text: &str,
+    size: f64,
+    weight: FontWeight,
+    mono_digits: bool,
+    color: &NSColor,
+    align: NSTextAlignment,
+    rect: NSRect,
+) {
     let para = NSMutableParagraphStyle::new();
+    para.setAlignment(align);
     para.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
     let w = unsafe {
         match weight {
@@ -1459,7 +2563,11 @@ fn draw_text_left(text: &str, size: f64, weight: FontWeight, color: &NSColor, re
             FontWeight::Semibold => NSFontWeightSemibold,
         }
     };
-    let font = NSFont::systemFontOfSize_weight(size as CGFloat, w);
+    let font = if mono_digits {
+        NSFont::monospacedDigitSystemFontOfSize_weight(size as CGFloat, w)
+    } else {
+        NSFont::systemFontOfSize_weight(size as CGFloat, w)
+    };
     let keys: [&NSAttributedStringKey; 3] =
         unsafe { [NSFontAttributeName, NSForegroundColorAttributeName, NSParagraphStyleAttributeName] };
     let values: [&AnyObject; 3] = [font.as_ref(), color.as_ref(), para.as_ref()];
@@ -1474,24 +2582,17 @@ fn draw_text_left(text: &str, size: f64, weight: FontWeight, color: &NSColor, re
     s.drawInRect(rect);
 }
 
+fn draw_text_left(text: &str, size: f64, weight: FontWeight, color: &NSColor, rect: NSRect) {
+    draw_text_aligned(text, size, weight, false, color, NSTextAlignment::Left, rect);
+}
+
+fn draw_text_right(text: &str, size: f64, weight: FontWeight, color: &NSColor, rect: NSRect) {
+    draw_text_aligned(text, size, weight, false, color, NSTextAlignment::Right, rect);
+}
+
 fn draw_text_centered(text: &str, size: f64, medium: bool, color: &NSColor, rect: NSRect) {
-    let para = NSMutableParagraphStyle::new();
-    para.setAlignment(NSTextAlignment::Center);
-    para.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-    let weight = unsafe { if medium { NSFontWeightMedium } else { NSFontWeightRegular } };
-    let font = NSFont::systemFontOfSize_weight(size as CGFloat, weight);
-    let keys: [&NSAttributedStringKey; 3] =
-        unsafe { [NSFontAttributeName, NSForegroundColorAttributeName, NSParagraphStyleAttributeName] };
-    let values: [&AnyObject; 3] = [font.as_ref(), color.as_ref(), para.as_ref()];
-    let attrs = NSDictionary::from_slices(&keys, &values);
-    let s = unsafe {
-        NSAttributedString::initWithString_attributes(
-            NSAttributedString::alloc(),
-            &NSString::from_str(text),
-            Some(&attrs),
-        )
-    };
-    s.drawInRect(rect);
+    let w = if medium { FontWeight::Medium } else { FontWeight::Regular };
+    draw_text_aligned(text, size, w, false, color, NSTextAlignment::Center, rect);
 }
 
 fn draw_symbol(name: &str, rect: NSRect, color: &NSColor) {
@@ -1502,7 +2603,7 @@ fn draw_symbol(name: &str, rect: NSRect, color: &NSColor) {
         return;
     };
     let tinted = img.imageWithSymbolConfiguration(
-        &objc2_app_kit::NSImageSymbolConfiguration::configurationWithHierarchicalColor(color),
+        &NSImageSymbolConfiguration::configurationWithHierarchicalColor(color),
     );
     let draw_img = tinted.as_deref().unwrap_or(&img);
     unsafe {
@@ -1514,5 +2615,30 @@ fn draw_symbol(name: &str, rect: NSRect, color: &NSColor) {
             true,
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_zone_layout_heights_clamp_cleanly() {
+        // Too short mid section collapses Live Agents completely.
+        assert_eq!(compute_agents_zone_height(80.0, 120.0, true), 0.0);
+
+        // Empty Live Agents reserves a compact placeholder strip.
+        assert_eq!(compute_agents_zone_height(600.0, 0.0, false), EMPTY_AGENTS_H);
+
+        // Small number of agents size to content + header + breathing room.
+        assert_eq!(compute_agents_zone_height(600.0, 46.0, true), AGENTS_HEADER_H + 46.0 + 6.0);
+
+        // Many agents cap at 44% so Spaces retain the majority of sidebar height.
+        let capped = compute_agents_zone_height(600.0, 500.0, true);
+        assert!((capped - 264.0).abs() < 0.01);
+        assert!(600.0 - capped >= 336.0);
+
+        // Tight vertical height preserves at least 60pt for Spaces.
+        assert_eq!(compute_agents_zone_height(110.0, 200.0, true), 50.0);
     }
 }

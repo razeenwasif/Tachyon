@@ -946,6 +946,7 @@ mod tests {
                 message: Some("Approve migration".into()),
                 cwd: Some("/srv/app".into()),
                 command: Some("claude".into()),
+                created_at: 0,
                 inferred: false,
             },
             AgentEntry {
@@ -964,6 +965,7 @@ mod tests {
                 message: Some("Building shaders".into()),
                 cwd: Some("/Users/dev/Tachyon".into()),
                 command: None,
+                created_at: 0,
                 inferred: false,
             },
         ];

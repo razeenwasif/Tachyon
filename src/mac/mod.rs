@@ -4556,6 +4556,7 @@ impl TermWindow {
         let show = self.sidebar_shown();
         if let Some(sb) = &self.sidebar {
             sb.root.setHidden(!show);
+            sb.set_visible(show);
             if show {
                 let sw = self
                     .sidebar_width
@@ -4602,13 +4603,24 @@ impl TermWindow {
         }
     }
 
+    fn tick_sidebar_agents(&self) {
+        if self.sidebar_shown() {
+            if let Some(sb) = &self.sidebar {
+                sb.tick_agents();
+            }
+        }
+    }
+
     fn sync_sidebar(&self) {
         if let Some(sb) = &self.sidebar {
-            let active = self
-                .tabs
-                .get(self.active)
-                .and_then(|t| t.mux_target.as_ref().map(|(h, _, w)| (h.clone(), w.clone())));
-            sb.set_hosts(mux_host_views(), active);
+            let tab = self.tabs.get(self.active);
+            let active = tab.and_then(|t| t.mux_target.as_ref().map(|(h, _, w)| (h.clone(), w.clone())));
+            let active_block = tab.and_then(|t| {
+                t.panes
+                    .get(t.focus)
+                    .and_then(|p| p.pty.mux_meta().map(|m| m.block_id.clone()))
+            });
+            sb.set_hosts(mux_host_views(), active, active_block);
         }
     }
 
