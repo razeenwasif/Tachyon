@@ -145,7 +145,8 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
 | ⌘B | Toggle the multi-host sidebar (local + remote servers) |
-| ⌘⇧P | Command Palette (commands, workspaces, cheatsheet, live hosts & sessions) |
+| ⌘⇧P | Command Palette (commands, workspaces, agents, cheatsheet, live hosts & sessions) |
+| ⌘⇧A | Agent Mission Control (floating cross-host coding-agent inbox, also via footer `✦` icon) |
 | ⌘/ | Floating Keyboard & CLI Cheatsheet (also via footer icon or Command Palette) |
 | ⌘, | Settings window (Server, Remote Hosts, Integrations, Interface, Notifications, Workspaces) |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
@@ -534,6 +535,15 @@ Launch idempotently from `⌘⇧P` (**Workspace: Up …**), `⌘,` **Settings �
 Workspaces**, or the CLI (`tachyon workspace up <name>`, `down`, `init`, `ls`,
 `show`, `rm`), or snapshot your live layout at any time with
 `tachyon workspace save <name> --all-hosts`.
+
+**Agent Mission Control (`⌘⇧A` & `tachyon agents`).** Press **⌘⇧A** (or click
+the `✦` sparkles icon in the bottom-right footer, which tints orange/red when an
+agent blocks or errors) to open a floating Liquid Glass inbox aggregating all
+OSC 7501 coding agents across **This Mac** and remote hosts — sorted by urgency
+(`blocked`, `error`, `working`, `done`), filterable by tab or text, with
+click/Return jump directly to the exact host, window, and split pane. Click the
+sidebar's `✦` icon to filter the sidebar tree down to agent windows, or query
+from any script with `tachyon agents --all-hosts [--state attention] [--json]`.
 
 **Command Palette (`⌘⇧P`), Floating Cheatsheet (`⌘/`), & Settings (`⌘,`).**
 Press **⌘⇧P** (or click `⌘` in the sidebar toolbar) to fuzzy-search every

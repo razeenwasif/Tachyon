@@ -652,6 +652,280 @@ impl HostEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-host Coding Agent Mission Control model
+// ---------------------------------------------------------------------------
+
+/// Urgency filter for Agent Mission Control (GUI card & `tachyon agents` CLI).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AgentFilter {
+    #[default]
+    All,
+    Attention,
+    Working,
+    Done,
+}
+
+impl AgentFilter {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "*" => Some(Self::All),
+            "attention" | "blocked" | "urgent" | "needs-attention" | "error" => Some(Self::Attention),
+            "working" | "running" | "active" | "busy" => Some(Self::Working),
+            "done" | "finished" | "complete" | "idle" => Some(Self::Done),
+            _ => None,
+        }
+    }
+
+    pub fn matches(self, state: ProgramState) -> bool {
+        match self {
+            Self::All => true,
+            Self::Attention => matches!(state, ProgramState::Blocked | ProgramState::Error),
+            Self::Working => matches!(state, ProgramState::Working),
+            Self::Done => matches!(state, ProgramState::Done | ProgramState::Idle),
+        }
+    }
+}
+
+/// Summary counts of coding agents across all connected hosts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentCounts {
+    pub total: usize,
+    pub blocked: usize,
+    pub error: usize,
+    pub working: usize,
+    pub done: usize,
+    pub idle: usize,
+}
+
+impl AgentCounts {
+    pub fn attention(self) -> usize {
+        self.blocked + self.error
+    }
+
+    pub fn from_entries(entries: &[AgentEntry]) -> Self {
+        let mut c = Self::default();
+        for e in entries {
+            c.total += 1;
+            match e.state {
+                ProgramState::Blocked => c.blocked += 1,
+                ProgramState::Error => c.error += 1,
+                ProgramState::Working => c.working += 1,
+                ProgramState::Done => c.done += 1,
+                ProgramState::Idle => c.idle += 1,
+            }
+        }
+        c
+    }
+}
+
+/// One active or recently reported coding-agent pane across any host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEntry {
+    pub host: String,
+    pub host_display: String,
+    pub host_color: Option<HostColor>,
+    pub session_id: String,
+    pub session_name: String,
+    pub window_id: String,
+    pub window_name: String,
+    pub block_id: String,
+    pub app_id: String,
+    pub agent_name: String,
+    pub glyph: &'static str,
+    pub state: ProgramState,
+    pub message: Option<String>,
+    pub cwd: Option<String>,
+    pub command: Option<String>,
+    pub inferred: bool,
+}
+
+impl AgentEntry {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "host": self.host,
+            "host_display": self.host_display,
+            "session_id": self.session_id,
+            "session_name": self.session_name,
+            "window_id": self.window_id,
+            "window_name": self.window_name,
+            "block_id": self.block_id,
+            "app": self.app_id,
+            "agent": self.agent_name,
+            "state": self.state.as_str(),
+            "message": self.message,
+            "cwd": self.cwd,
+            "command": self.command,
+            "inferred": self.inferred,
+        })
+    }
+}
+
+/// Priority rank for sorting Mission Control inbox entries (highest urgency first).
+pub fn agent_state_priority(state: ProgramState) -> u8 {
+    match state {
+        ProgramState::Blocked => 5,
+        ProgramState::Error => 4,
+        ProgramState::Working => 3,
+        ProgramState::Done => 2,
+        ProgramState::Idle => 1,
+    }
+}
+
+/// Human-friendly agent name & glyph from an OSC 7501 `app` or inferred process name.
+pub fn agent_identity(raw: &str) -> (String, String, &'static str) {
+    let low = raw.trim().to_ascii_lowercase();
+    if low.contains("claude") {
+        ("claude".into(), "Claude Code".into(), "✳")
+    } else if low.contains("antigravity") || low == "agy" {
+        ("antigravity".into(), "Antigravity".into(), "✦")
+    } else if low.contains("codex") {
+        ("codex".into(), "Codex".into(), "◎")
+    } else if low.contains("opencode") {
+        ("opencode".into(), "OpenCode".into(), "◈")
+    } else if low == "pi" || low.starts_with("pi-") || low.ends_with("-pi") {
+        ("pi".into(), "Pi".into(), "π")
+    } else if low.is_empty() {
+        ("agent".into(), "Agent".into(), "●")
+    } else {
+        let mut chars = raw.trim().chars();
+        let cap = match chars.next() {
+            Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+            None => "Agent".into(),
+        };
+        (low, cap, "●")
+    }
+}
+
+/// Infer whether a block without explicit OSC 7501 status is running a known coding agent.
+pub fn infer_agent_from_block(b: &BlockInfo) -> Option<&'static str> {
+    if !b.alive {
+        return None;
+    }
+    let check = |text: &str| -> Option<&'static str> {
+        let low = text.trim().to_ascii_lowercase();
+        let first_word = low
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .rsplit('\\')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".exe");
+        match first_word {
+            "claude" | "claude-code" => Some("claude"),
+            "antigravity" | "agy" => Some("antigravity"),
+            "codex" => Some("codex"),
+            "opencode" => Some("opencode"),
+            "pi" => Some("pi"),
+            _ => {
+                if low.contains("claude code") {
+                    Some("claude")
+                } else if low.contains("antigravity") {
+                    Some("antigravity")
+                } else if low.contains("opencode") {
+                    Some("opencode")
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    b.command
+        .as_deref()
+        .and_then(check)
+        .or_else(|| b.title.as_deref().and_then(check))
+        .or_else(|| b.label.as_deref().and_then(check))
+}
+
+/// Collect and urgency-sort coding-agent entries across one or more host snapshots.
+///
+/// Each tuple is `(host_alias, host_display, host_color, snapshot)`.
+pub fn collect_agent_entries(
+    hosts: &[(String, String, Option<HostColor>, &ServerSnapshot)],
+) -> Vec<AgentEntry> {
+    let mut out: Vec<(usize, AgentEntry)> = Vec::new();
+    for (host_idx, (alias, display, color, snap)) in hosts.iter().enumerate() {
+        for blk in &snap.blocks {
+            if !blk.alive && blk.status.is_none() {
+                continue;
+            }
+            let (state, app_raw, msg, inferred) = if let Some(st) = &blk.status {
+                let raw = st
+                    .app
+                    .as_deref()
+                    .or(st.kind.as_deref())
+                    .or_else(|| infer_agent_from_block(blk))
+                    .unwrap_or("agent");
+                let msg = st
+                    .msg
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| st.label.clone().filter(|s| !s.is_empty()));
+                (st.state, raw, msg, false)
+            } else if let Some(inferred_app) = infer_agent_from_block(blk) {
+                (
+                    ProgramState::Working,
+                    inferred_app,
+                    blk.command.clone().or_else(|| blk.title.clone()),
+                    true,
+                )
+            } else {
+                continue;
+            };
+
+            let sess_name = snap
+                .sessions
+                .iter()
+                .find(|s| s.id == blk.session_id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| blk.session_id.clone());
+            let win_name = snap
+                .windows
+                .iter()
+                .find(|w| w.id == blk.window_id)
+                .and_then(|w| w.name.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| blk.display_name());
+            let (app_id, agent_name, glyph) = agent_identity(app_raw);
+
+            out.push((
+                host_idx,
+                AgentEntry {
+                    host: alias.clone(),
+                    host_display: display.clone(),
+                    host_color: *color,
+                    session_id: blk.session_id.clone(),
+                    session_name: sess_name,
+                    window_id: blk.window_id.clone(),
+                    window_name: win_name,
+                    block_id: blk.id.clone(),
+                    app_id,
+                    agent_name,
+                    glyph,
+                    state,
+                    message: msg,
+                    cwd: blk.cwd.clone(),
+                    command: blk.command.clone(),
+                    inferred,
+                },
+            ));
+        }
+    }
+    out.sort_by(|(ha, a), (hb, b)| {
+        agent_state_priority(b.state)
+            .cmp(&agent_state_priority(a.state))
+            .then_with(|| ha.cmp(hb))
+            .then_with(|| a.session_name.cmp(&b.session_name))
+            .then_with(|| a.window_name.cmp(&b.window_name))
+            .then_with(|| a.block_id.cmp(&b.block_id))
+    });
+    out.into_iter().map(|(_, e)| e).collect()
+}
+
 /// Shorten a home-rooted path for display (`/Users/me/foo` -> `~/foo`,
 /// `C:\Users\me\foo` -> `~\foo`).
 pub fn short_path(path: &str) -> String {
@@ -769,5 +1043,106 @@ mod tests {
             resolve_host_color("amaterasu", Some("windows"), None, &rules),
             default_os_host_color("windows")
         );
+    }
+
+    #[test]
+    fn collect_agent_entries_ranks_blocked_and_error_first_and_infers_running() {
+        let make_block = |id: &str, cmd: Option<&str>, status: Option<ProgramStatus>| BlockInfo {
+            id: id.into(),
+            session_id: "s1".into(),
+            window_id: "w1".into(),
+            label: None,
+            title: None,
+            cwd: Some("/repo".into()),
+            command_running: cmd.is_some(),
+            command: cmd.map(str::to_string),
+            pid: 1,
+            cols: 80,
+            rows: 24,
+            alive: true,
+            exit_code: None,
+            awake: false,
+            attached_clients: 0,
+            created_at: 0,
+            status,
+        };
+        let snap = ServerSnapshot {
+            host: HostInfo {
+                hostname: "kagutsuchi".into(),
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                version: "0.1.0".into(),
+                protocol: 2,
+                pid: 10,
+            },
+            sessions: vec![SessionInfo {
+                id: "s1".into(),
+                name: "dev".into(),
+                windows: vec!["w1".into()],
+                active_window: Some("w1".into()),
+                created_at: 0,
+            }],
+            windows: vec![WindowInfo {
+                id: "w1".into(),
+                session_id: "s1".into(),
+                name: Some("agents".into()),
+                layout: LayoutNode::Leaf("b1".into()),
+                focused_block: "b1".into(),
+                zoomed: false,
+                created_at: 0,
+            }],
+            blocks: vec![
+                make_block(
+                    "b1",
+                    Some("claude"),
+                    Some(ProgramStatus {
+                        state: ProgramState::Done,
+                        app: Some("claude".into()),
+                        kind: None,
+                        msg: Some("Tests pass".into()),
+                        label: None,
+                    }),
+                ),
+                make_block("b2", Some("/opt/homebrew/bin/codex --yolo"), None),
+                make_block(
+                    "b3",
+                    Some("antigravity"),
+                    Some(ProgramStatus {
+                        state: ProgramState::Blocked,
+                        app: Some("antigravity".into()),
+                        kind: None,
+                        msg: Some("Approve deploy".into()),
+                        label: None,
+                    }),
+                ),
+                make_block("b4", Some("cargo test"), None),
+            ],
+            clients: Vec::new(),
+        };
+
+        let entries = collect_agent_entries(&[(
+            "kagutsuchi".into(),
+            "kagutsuchi".into(),
+            default_os_host_color("macos"),
+            &snap,
+        )]);
+        assert_eq!(entries.len(), 3); // plain `cargo test` excluded
+        assert_eq!(entries[0].block_id, "b3");
+        assert_eq!(entries[0].state, ProgramState::Blocked);
+        assert_eq!(entries[0].agent_name, "Antigravity");
+        assert_eq!(entries[0].glyph, "✦");
+        assert_eq!(entries[1].block_id, "b2");
+        assert_eq!(entries[1].state, ProgramState::Working);
+        assert!(entries[1].inferred);
+        assert_eq!(entries[1].agent_name, "Codex");
+        assert_eq!(entries[2].block_id, "b1");
+        assert_eq!(entries[2].state, ProgramState::Done);
+
+        let counts = AgentCounts::from_entries(&entries);
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.working, 1);
+        assert_eq!(counts.done, 1);
+        assert_eq!(counts.attention(), 1);
     }
 }

@@ -58,6 +58,7 @@ pub enum SheetAction {
     LatencyLedger,
     Find,
     ResetFont,
+    AgentMissionControl,
     CopyCli(&'static str),
 }
 
@@ -74,6 +75,7 @@ pub const ENTRIES: &[SheetEntry] = &[
     // Workspace & Multi-Host
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘B", title: "Toggle multi-host sidebar", detail: "Show or hide This Mac + remote servers", action: Some(SheetAction::ToggleSidebar) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘⇧P", title: "Command Palette", detail: "Jump to any action, host, or session", action: Some(SheetAction::CommandPalette) },
+    SheetEntry { category: "Workspace & Multi-Host", keys: "⌘⇧A", title: "Agent Mission Control", detail: "Cross-host coding-agent inbox (blocked, working & done)", action: Some(SheetAction::AgentMissionControl) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘,", title: "Settings", detail: "Server, Remote Hosts, Agent Integrations & Interface", action: Some(SheetAction::OpenSettings) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘/", title: "Keyboard Cheatsheet", detail: "Show or hide this floating cheatsheet", action: None },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘T", title: "New tab / window", detail: "Open a new persistent shell in the current host", action: Some(SheetAction::NewTab) },
@@ -119,6 +121,7 @@ pub const ENTRIES: &[SheetEntry] = &[
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon run --wait --capture -- CMD", detail: "Run command in a managed pane & collect output", action: Some(SheetAction::CopyCli("tachyon run --wait --capture -- ")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon split --right", detail: "Split current pane from CLI or coding agent", action: Some(SheetAction::CopyCli("tachyon split --right")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon skill setup", detail: "Install Claude Code, Antigravity, Codex, OpenCode & Pi hooks", action: Some(SheetAction::CopyCli("tachyon skill setup")) },
+    SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon agents --all-hosts", detail: "List active & blocked coding agents across every host", action: Some(SheetAction::CopyCli("tachyon agents --all-hosts")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon status --state working --tty", detail: "Emit OSC 7501 status pill & notification", action: Some(SheetAction::CopyCli("tachyon status --state working --app agent --msg \"Working\" --tty")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon server install-service --listen tailscale", detail: "Install persistent host service + Tailscale TCP (port 7501)", action: Some(SheetAction::CopyCli("tachyon server install-service --listen tailscale")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon hosts add pc tcp://<ip>:7501 --token <tok>", detail: "Connect a Linux or Windows PC directly over Tailscale TCP", action: Some(SheetAction::CopyCli("tachyon hosts add pc tcp://<tailscale-ip>:7501 --token ")) },
@@ -633,6 +636,10 @@ fn execute_action(win_id: u64, action: SheetAction) {
         SheetAction::LatencyLedger => with_window(win_id, |w| w.toggle_ledger()),
         SheetAction::Find => with_window(win_id, |w| w.open_find()),
         SheetAction::ResetFont => with_window(win_id, |w| w.zoom_font(0.0)),
+        SheetAction::AgentMissionControl => {
+            with_window(win_id, |w| w.open_agents_card());
+            return;
+        }
         SheetAction::CopyCli(_) => {}
     }
     with_window(win_id, |w| w.focus_terminal());
