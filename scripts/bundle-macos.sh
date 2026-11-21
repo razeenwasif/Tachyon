@@ -74,5 +74,7 @@ if [[ ${1:-} == --install ]]; then
     dest=/Applications/Tachyon.app
     rm -rf "$dest"
     ditto "$app" "$dest"
-    echo "installed $dest"
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$dest/Contents/MacOS/tachyon" "$HOME/.local/bin/tachyon"
+    echo "installed $dest and linked ~/.local/bin/tachyon"
 fi

@@ -18,6 +18,26 @@ path = "src/lib.rs"
 name = "tachyon"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+# Native desktop UI (AppKit + Metal on macOS, D3D11 + DirectWrite on Windows).
+# Build with `--no-default-features` for a lightweight headless server/CLI binary
+# on macOS (Mac mini), Linux, or Windows hosts.
+gui = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-app-kit",
+    "dep:objc2-metal",
+    "dep:objc2-quartz-core",
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-graphics",
+    "dep:objc2-core-text",
+    "dep:dispatch2",
+    "dep:objc2-user-notifications",
+    "dep:objc2-quick-look-ui",
+    "dep:block2",
+]
+
 [dependencies]
 # Alacritty's battle-tested VT state machine. We put a SIMD fast path in front
 # of it (see src/term/parser.rs) so it only ever sees escape sequences.
@@ -72,23 +92,26 @@ features = [
     "Win32_System_Ole",
 ]
 
-# macOS backend: AppKit window, Metal renderer, Core Text glyphs, Unix PTY.
+# Unix PTY & socket primitives shared by macOS and Linux (including headless servers).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# macOS GUI backend: AppKit window, Metal renderer, Core Text glyphs.
 # The objc2 framework crates enable every header by default; that costs some
 # compile time on the first build and nothing at runtime.
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-app-kit = "0.3"
-objc2-metal = "0.3"
-objc2-quartz-core = "0.3"
-objc2-core-foundation = "0.3"
-objc2-core-graphics = "0.3"
-objc2-core-text = "0.3"
-dispatch2 = "0.3"
-objc2-user-notifications = "0.3"
-objc2-quick-look-ui = "0.3"
-block2 = "0.6"
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-app-kit = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+objc2-quartz-core = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true }
+objc2-core-graphics = { version = "0.3", optional = true }
+objc2-core-text = { version = "0.3", optional = true }
+dispatch2 = { version = "0.3", optional = true }
+objc2-user-notifications = { version = "0.3", optional = true }
+objc2-quick-look-ui = { version = "0.3", optional = true }
+block2 = { version = "0.6", optional = true }
 
 [profile.release]
 opt-level = 3

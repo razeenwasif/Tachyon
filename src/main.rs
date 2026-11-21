@@ -3,13 +3,31 @@
 //! `windows_subsystem = "windows"` keeps a console window from flashing up
 //! behind us on launch, which also matters for a clean taskbar experience.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), feature = "gui"), windows_subsystem = "windows")]
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 use tachyon::config::Config;
 
-#[cfg(windows)]
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    let rest = if argv.len() > 1 { &argv[1..] } else { &[][..] };
+
+    // Multiplexer server, SSH bridge, and automation CLI work on every OS
+    // (full GUI builds and headless `--no-default-features` server builds).
+    if tachyon::cli::is_cli_invocation(rest) {
+        tachyon::log::install_panic_hook();
+        std::process::exit(tachyon::cli::run(rest));
+    }
+    if matches!(rest, [a] if a == "--version" || a == "-V") {
+        println!("{} {}", tachyon::APP_NAME, tachyon::APP_VERSION);
+        return;
+    }
+
+    run_gui(argv);
+}
+
+#[cfg(all(windows, feature = "gui"))]
+fn run_gui(_argv: Vec<String>) {
     tachyon::log::install_panic_hook();
     // `--quiet` suppresses the message boxes so the CLI paths can be scripted
     // (and so automated checks do not leave dialogs on someone's desktop).
@@ -98,11 +116,10 @@ fn main() {
     tachyon::log!("--- exit ---");
 }
 
-#[cfg(target_os = "macos")]
-fn main() {
+#[cfg(all(target_os = "macos", feature = "gui"))]
+fn run_gui(argv: Vec<String>) {
     tachyon::log::install_panic_hook();
-    // The session host: see src/mac/host.rs.
-    let argv: Vec<String> = std::env::args().collect();
+    // The legacy local session host: see src/mac/host.rs.
     if argv.get(1).map(String::as_str) == Some("--host") {
         let path = argv.get(2).map(std::path::PathBuf::from).unwrap_or_else(tachyon::mac::host::socket_path);
         if let Err(e) = tachyon::mac::host::run(&path) {
@@ -148,13 +165,12 @@ fn main() {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-fn main() {
-    eprintln!("Tachyon runs on macOS and Windows. Run `cargo test` to exercise the portable core.");
-    std::process::exit(1);
+#[cfg(not(all(any(windows, target_os = "macos"), feature = "gui")))]
+fn run_gui(_argv: Vec<String>) {
+    std::process::exit(tachyon::cli::run(&["help".to_string()]));
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 const HELP: &str = "\
 Tachyon - GPU-accelerated terminal
 
@@ -169,7 +185,7 @@ Tachyon - GPU-accelerated terminal
 ";
 
 /// Show `text` in a dialog, or record it to the log under `--quiet`.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 fn report(quiet: bool, text: &str) {
     tachyon::log::force(text);
     if !quiet {
@@ -177,7 +193,7 @@ fn report(quiet: bool, text: &str) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 fn message_box(text: &str) {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};

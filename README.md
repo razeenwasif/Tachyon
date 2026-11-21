@@ -458,6 +458,33 @@ left out), each with a dot from a short TCP check on port 22 every minute:
 🟢 answered, ⚪️ didn't. Picking one opens a tab running `ssh HOST`. Typing
 `ssh ` at a prompt suggests them inline when history has nothing better.
 
+**Persistent multi-host server & CLI (Mux v2).** `tachyon server` runs a
+portable background multiplexer daemon (`Host → Session → Window → Block`) over
+a 9-byte binary framed protocol (JSON RPC/events, raw PTY streams, LZ4-compressed
+`Term::to_vt()` restore snapshots, bounded per-client backpressure with
+automatic resync). Build a 1.1 MB headless server/CLI binary for macOS, Linux,
+or Windows with `cargo build --release --no-default-features`, or deploy to an
+SSH host with `scripts/deploy-host.sh <host> --service`.
+
+```sh
+tachyon hosts add kagutsuchi ssh://kagutsuchi
+tachyon hosts test kagutsuchi
+tachyon -S kagutsuchi new work
+tachyon -S kagutsuchi ls --json
+tachyon -S kagutsuchi split --right -b b_1
+tachyon -S kagutsuchi run --session work --wait --capture -- make test
+tachyon -S kagutsuchi send -b b_1 --enter "git status"
+tachyon -S kagutsuchi capture -b b_1 --lines 40
+tachyon -S kagutsuchi events --json
+```
+
+Remote hosts connect over one persistent `ssh <host> tachyon bridge` per host
+(zero open ports, using `~/.ssh/config` and Tailscale). Every server-managed
+block automatically receives `TACHYON_SERVER`, `TACHYON_SESSION`,
+`TACHYON_WINDOW`, and `TACHYON_BLOCK`. See
+[docs/REX_ARCHITECTURE.md](docs/REX_ARCHITECTURE.md) for the full design and
+roadmap.
+
 **Shortcut hints.** A band along the bottom lists the shortcuts worth knowing,
 what fits the moment first: Tab when a suggestion shows, ⌥⌘I to ask Fairy
 why a command failed, ⌥⌘K for a long output, then ⌘T, ⌘D, ⌘F, ⌘[, ⌥⌘O,
