@@ -1,11 +1,16 @@
 //! Multiplexer byte-stream transports:
 //! - Local Unix domain socket (macOS & Linux), auto-starting `tachyon server`
 //!   when requested.
-//! - Remote SSH stdio bridge (`ssh -T ... tachyon bridge`), carrying the exact
-//!   same Mux v2 framed stream over one persistent SSH connection per host.
-//! - `run_bridge()`: remote-side stdio <-> local Unix socket splicer.
+//! - Local Windows overlapped full-duplex named pipe (`\\.\pipe\tachyon-server-*`),
+//!   auto-starting `tachyon server` detached when requested.
+//! - Remote SSH stdio bridge (`ssh -T ... tachyon bridge`), supporting macOS,
+//!   Linux, and Windows OpenSSH servers over one persistent SSH connection per host.
+//! - Direct TCP (`tcp://host[:port]`, e.g. over Tailscale) with `TCP_NODELAY`
+//!   and bearer-token authentication in `hello`.
+//! - `run_bridge()`: remote-side stdio <-> local server splicer (Unix & Windows).
 
 use std::io::{self, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -46,14 +51,46 @@ impl Drop for ChildGuard {
 }
 
 /// Connect to `target`. If `auto_start` is true and `target` is local, spawns
-/// `tachyon server run --daemon` automatically when no server is listening.
+/// `tachyon server run` automatically when no server is listening.
 pub fn connect(target: &Target, auto_start: bool) -> io::Result<Transport> {
     match target {
         Target::Local { socket } => connect_local(socket, auto_start),
         Target::Ssh { destination, port, remote_bin, .. } => {
-            connect_ssh(destination, *port, remote_bin.as_deref())
+            connect_ssh_with_mode(destination, *port, remote_bin.as_deref(), false)
+        }
+        Target::Tcp { addr, .. } => connect_tcp(addr),
+    }
+}
+
+/// Connect directly over TCP (`tcp://host:port`, e.g. over Tailscale).
+pub fn connect_tcp(addr: &str) -> io::Result<Transport> {
+    let mut addrs = addr.to_socket_addrs().map_err(|e| {
+        io::Error::new(e.kind(), format!("failed to resolve `{addr}`: {e}"))
+    })?;
+    let mut last_err = None;
+    let mut connected = None;
+    for sock_addr in &mut addrs {
+        match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(10)) {
+            Ok(s) => {
+                connected = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e),
         }
     }
+    let stream = connected.ok_or_else(|| {
+        last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, format!("no addresses for `{addr}`"))
+        })
+    })?;
+    let _ = stream.set_nodelay(true);
+    let writer = stream.try_clone()?;
+    Ok(Transport {
+        reader: Box::new(stream),
+        writer: Box::new(writer),
+        diag: Arc::new(Mutex::new(String::new())),
+        _guard: None,
+    })
 }
 
 #[cfg(unix)]
@@ -90,11 +127,45 @@ pub fn connect_local(socket: &Path, auto_start: bool) -> io::Result<Transport> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn connect_local(socket: &Path, auto_start: bool) -> io::Result<Transport> {
+    let pipe = match win_pipe::connect_named_pipe(socket) {
+        Ok(p) => p,
+        Err(e) if !auto_start => return Err(e),
+        Err(_) => {
+            spawn_local_daemon(socket)?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match win_pipe::connect_named_pipe(socket) {
+                    Ok(p) => break p,
+                    Err(e) if Instant::now() >= deadline => {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!(
+                                "timed out waiting for tachyon server pipe {}: {e}",
+                                socket.display()
+                            ),
+                        ));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(30)),
+                }
+            }
+        }
+    };
+    let (reader, writer) = win_pipe::split_overlapped_pipe(pipe)?;
+    Ok(Transport {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        diag: Arc::new(Mutex::new(String::new())),
+        _guard: None,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn connect_local(_socket: &Path, _auto_start: bool) -> io::Result<Transport> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "local named-pipe server transport for Windows is planned for Milestone 4",
+        "local server transport is unsupported on this OS",
     ))
 }
 
@@ -147,8 +218,117 @@ pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    // Prefer launching the installed Scheduled Task when using the default pipe
+    // so the server outlives Windows OpenSSH's per-session Job Object.
+    if socket == crate::mux::default_socket_path() {
+        let ok = Command::new("schtasks.exe")
+            .args(["/Run", "/TN", "Tachyon Server"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            return Ok(());
+        }
+    }
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.args(["server", "run", "--socket"])
+        .arg(socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(
+            DETACHED_PROCESS
+                | CREATE_NEW_PROCESS_GROUP
+                | CREATE_NO_WINDOW
+                | CREATE_BREAKAWAY_FROM_JOB,
+        );
+    if cmd.spawn().is_err() {
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        let _child = cmd.spawn()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn spawn_local_daemon(_socket: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "detached daemon spawn is unsupported on this OS",
+    ))
+}
+
+/// Build the remote shell command executed over `ssh -T <host>`.
+pub fn build_ssh_remote_command(remote_bin: Option<&str>, windows_shell: bool) -> String {
+    match remote_bin.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(bin) => {
+            if windows_shell || looks_like_windows_path(bin) {
+                format!("{} bridge", windows_quote(bin))
+            } else {
+                format!("exec {} bridge", shell_quote(bin))
+            }
+        }
+        None if windows_shell => "tachyon bridge".to_string(),
+        None => concat!(
+            "PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; ",
+            "if command -v tachyon >/dev/null 2>&1; then exec tachyon bridge; ",
+            "elif [ -x /Applications/Tachyon.app/Contents/MacOS/tachyon ]; then ",
+            "exec /Applications/Tachyon.app/Contents/MacOS/tachyon bridge; ",
+            "else echo 'tachyon not found on remote host (checked PATH and /Applications/Tachyon.app)' >&2; exit 127; fi"
+        )
+        .to_string(),
+    }
+}
+
+fn looks_like_windows_path(bin: &str) -> bool {
+    let lower = bin.to_ascii_lowercase();
+    bin.contains('\\')
+        || lower.ends_with(".exe")
+        || (bin.len() >= 2 && bin.as_bytes()[1] == b':' && bin.as_bytes()[0].is_ascii_alphabetic())
+}
+
+fn windows_quote(s: &str) -> String {
+    if s.contains([' ', '\t']) {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Detect stderr produced when a Windows OpenSSH server (`cmd.exe` or
+/// `powershell.exe`) rejects our default POSIX `PATH=...; if ...` command.
+pub fn looks_like_windows_ssh_shell_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("is not recognized as an internal or external command")
+        || lower.contains("the term 'path=")
+        || lower.contains("the syntax of the command is incorrect")
+        || lower.contains("unexpected token")
+        || lower.contains("was unexpected at this time")
+}
+
 /// Connect to a remote Tachyon server via one persistent `ssh` stdio bridge.
 pub fn connect_ssh(destination: &str, port: Option<u16>, remote_bin: Option<&str>) -> io::Result<Transport> {
+    connect_ssh_with_mode(destination, port, remote_bin, false)
+}
+
+/// Connect over SSH with explicit POSIX vs Windows OpenSSH command mode.
+pub fn connect_ssh_with_mode(
+    destination: &str,
+    port: Option<u16>,
+    remote_bin: Option<&str>,
+    windows_shell: bool,
+) -> io::Result<Transport> {
     let mut cmd = Command::new("ssh");
     cmd.args([
         "-T",
@@ -166,19 +346,7 @@ pub fn connect_ssh(destination: &str, port: Option<u16>, remote_bin: Option<&str
     }
     cmd.arg(destination);
 
-    // Search common user/Homebrew binary locations on the remote host unless an
-    // explicit binary path was configured for this host.
-    let remote_cmd = match remote_bin {
-        Some(bin) if !bin.trim().is_empty() => format!("exec {} bridge", shell_quote(bin.trim())),
-        _ => concat!(
-            "PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; ",
-            "if command -v tachyon >/dev/null 2>&1; then exec tachyon bridge; ",
-            "elif [ -x /Applications/Tachyon.app/Contents/MacOS/tachyon ]; then ",
-            "exec /Applications/Tachyon.app/Contents/MacOS/tachyon bridge; ",
-            "else echo 'tachyon not found on remote host (checked PATH and /Applications/Tachyon.app)' >&2; exit 127; fi"
-        )
-        .to_string(),
-    };
+    let remote_cmd = build_ssh_remote_command(remote_bin, windows_shell);
     cmd.arg(remote_cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -294,10 +462,272 @@ pub fn run_bridge(socket: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Remote-side bridge on Windows (`tachyon.exe bridge`): connects to the local
+/// overlapped named pipe (auto-starting `tachyon server run` if needed) and
+/// splices binary stdin/stdout directly to it.
+#[cfg(windows)]
+pub fn run_bridge(socket: &Path) -> io::Result<()> {
+    let Transport {
+        mut reader,
+        mut writer,
+        ..
+    } = connect_local(socket, true)?;
+
+    let t_in = std::thread::Builder::new()
+        .name("tachyon-bridge-in".into())
+        .spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if writer.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })?;
+
+    let mut stdout = io::stdout().lock();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    drop(t_in);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn run_bridge(_socket: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "Windows bridge transport is planned for Milestone 4",
+        "bridge transport is unsupported on this OS",
     ))
+}
+
+/// Full-duplex overlapped Windows Named Pipe wrappers so independent reader
+/// and writer threads never serialize/deadlock inside the Win32 kernel.
+#[cfg(windows)]
+pub mod win_pipe {
+    use std::io::{self, Read, Write};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows::Win32::System::Pipes::WaitNamedPipeW;
+    use windows::Win32::System::Threading::{CreateEventW, ResetEvent};
+
+    pub struct SharedPipeHandle(pub HANDLE);
+    unsafe impl Send for SharedPipeHandle {}
+    unsafe impl Sync for SharedPipeHandle {}
+
+    impl Drop for SharedPipeHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CancelIoEx(self.0, None);
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub struct WinPipeReader {
+        pipe: Arc<SharedPipeHandle>,
+        event: HANDLE,
+    }
+    unsafe impl Send for WinPipeReader {}
+
+    impl Drop for WinPipeReader {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CancelIoEx(self.pipe.0, None);
+                let _ = CloseHandle(self.event);
+            }
+        }
+    }
+
+    pub struct WinPipeWriter {
+        pipe: Arc<SharedPipeHandle>,
+        event: HANDLE,
+    }
+    unsafe impl Send for WinPipeWriter {}
+
+    impl Drop for WinPipeWriter {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CancelIoEx(self.pipe.0, None);
+                let _ = CloseHandle(self.event);
+            }
+        }
+    }
+
+    /// Split an overlapped named pipe `HANDLE` into full-duplex `Read` + `Write` halves.
+    pub fn split_overlapped_pipe(handle: HANDLE) -> io::Result<(WinPipeReader, WinPipeWriter)> {
+        let read_ev = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+            .map_err(|e| io::Error::other(format!("CreateEventW(read): {e}")))?;
+        let write_ev = match unsafe { CreateEventW(None, true, false, PCWSTR::null()) } {
+            Ok(ev) => ev,
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(read_ev);
+                    let _ = CloseHandle(handle);
+                }
+                return Err(io::Error::other(format!("CreateEventW(write): {e}")));
+            }
+        };
+        let shared = Arc::new(SharedPipeHandle(handle));
+        Ok((
+            WinPipeReader { pipe: Arc::clone(&shared), event: read_ev },
+            WinPipeWriter { pipe: shared, event: write_ev },
+        ))
+    }
+
+    fn is_eof_error(err: &windows::core::Error) -> bool {
+        let code = err.code();
+        code == ERROR_BROKEN_PIPE.to_hresult()
+            || code == ERROR_PIPE_NOT_CONNECTED.to_hresult()
+            || code == ERROR_OPERATION_ABORTED.to_hresult()
+    }
+
+    impl Read for WinPipeReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            unsafe {
+                let _ = ResetEvent(self.event);
+                let mut ov = OVERLAPPED { hEvent: self.event, ..Default::default() };
+                match ReadFile(self.pipe.0, Some(buf), None, Some(&mut ov)) {
+                    Ok(()) => {
+                        let mut n = 0u32;
+                        match GetOverlappedResult(self.pipe.0, &ov, &mut n, true) {
+                            Ok(()) => Ok(n as usize),
+                            Err(e) if is_eof_error(&e) => Ok(0),
+                            Err(e) => Err(io::Error::other(e.to_string())),
+                        }
+                    }
+                    Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
+                        let mut n = 0u32;
+                        match GetOverlappedResult(self.pipe.0, &ov, &mut n, true) {
+                            Ok(()) => Ok(n as usize),
+                            Err(e) if is_eof_error(&e) => Ok(0),
+                            Err(e) => Err(io::Error::other(e.to_string())),
+                        }
+                    }
+                    Err(e) if is_eof_error(&e) => Ok(0),
+                    Err(e) => Err(io::Error::other(e.to_string())),
+                }
+            }
+        }
+    }
+
+    impl Write for WinPipeWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            unsafe {
+                let _ = ResetEvent(self.event);
+                let mut ov = OVERLAPPED { hEvent: self.event, ..Default::default() };
+                match WriteFile(self.pipe.0, Some(buf), None, Some(&mut ov)) {
+                    Ok(()) => {
+                        let mut n = 0u32;
+                        GetOverlappedResult(self.pipe.0, &ov, &mut n, true)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        Ok(n as usize)
+                    }
+                    Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
+                        let mut n = 0u32;
+                        GetOverlappedResult(self.pipe.0, &ov, &mut n, true)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        Ok(n as usize)
+                    }
+                    Err(e) => Err(io::Error::other(e.to_string())),
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Connect as a client to an existing Windows named pipe with `FILE_FLAG_OVERLAPPED`.
+    pub fn connect_named_pipe(pipe_path: &Path) -> io::Result<HANDLE> {
+        let wide = HSTRING::from(pipe_path.as_os_str());
+        for _ in 0..8 {
+            let res = unsafe {
+                CreateFileW(
+                    PCWSTR(wide.as_ptr()),
+                    GENERIC_READ.0 | GENERIC_WRITE.0,
+                    FILE_SHARE_NONE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    None,
+                )
+            };
+            match res {
+                Ok(h) => return Ok(h),
+                Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
+                    let _ = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), 1000) };
+                    continue;
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("open named pipe {}: {e}", pipe_path.display()),
+                    ));
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("named pipe busy: {}", pipe_path.display()),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_remote_command_handles_posix_and_windows_targets() {
+        let posix = build_ssh_remote_command(None, false);
+        assert!(posix.contains("exec tachyon bridge"));
+
+        let win_default = build_ssh_remote_command(None, true);
+        assert_eq!(win_default, "tachyon bridge");
+
+        let win_bin = build_ssh_remote_command(Some(r"C:\Users\razeen\.local\bin\tachyon.exe"), false);
+        assert_eq!(win_bin, r"C:\Users\razeen\.local\bin\tachyon.exe bridge");
+
+        let win_spaced = build_ssh_remote_command(Some(r"C:\Program Files\Tachyon\tachyon.exe"), false);
+        assert_eq!(win_spaced, "\"C:\\Program Files\\Tachyon\\tachyon.exe\" bridge");
+
+        assert!(looks_like_windows_ssh_shell_error(
+            "'PATH' is not recognized as an internal or external command"
+        ));
+        assert!(looks_like_windows_ssh_shell_error(
+            "The term 'PATH=/bin' is not recognized as the name of a cmdlet"
+        ));
+        assert!(!looks_like_windows_ssh_shell_error("Permission denied (publickey)."));
+    }
 }

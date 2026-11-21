@@ -44,6 +44,7 @@ pub struct ClientOutbox {
     pub kind: Mutex<String>,
     pub name: Mutex<String>,
     pub subscribed_events: AtomicBool,
+    pub authenticated: AtomicBool,
     inner: Mutex<OutboxInner>,
     ready: Condvar,
     /// Blocks this client currently holds streams on: `stream_id -> (block_id, interactive)`.
@@ -66,12 +67,13 @@ pub enum OutboxPop {
 }
 
 impl ClientOutbox {
-    pub fn new(id: String) -> Arc<Self> {
+    pub fn new(id: String, authenticated: bool) -> Arc<Self> {
         Arc::new(Self {
             id,
             kind: Mutex::new("cli".into()),
             name: Mutex::new(String::new()),
             subscribed_events: AtomicBool::new(false),
+            authenticated: AtomicBool::new(authenticated),
             inner: Mutex::new(OutboxInner::default()),
             ready: Condvar::new(),
             streams: Mutex::new(HashMap::new()),
@@ -328,8 +330,19 @@ struct StateInner {
     exit_waiters: HashMap<String, Vec<Sender<i32>>>,
 }
 
+/// Control action returned by `ServerState::handle_rpc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpcOutcome {
+    Continue,
+    /// Close this client connection after flushing the `RPC_RES` (e.g. failed auth).
+    CloseClient,
+    /// Shut down the entire server after flushing the `RPC_RES`.
+    ShutdownServer,
+}
+
 pub struct ServerState {
     host_info: HostInfo,
+    auth_token: Option<String>,
     next_id: AtomicU64,
     shutdown: AtomicBool,
     inner: Mutex<StateInner>,
@@ -337,6 +350,10 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new() -> Arc<Self> {
+        Self::with_auth_token(None)
+    }
+
+    pub fn with_auth_token(auth_token: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             host_info: HostInfo {
                 hostname: local_hostname(),
@@ -346,6 +363,7 @@ impl ServerState {
                 protocol: PROTOCOL_VERSION,
                 pid: std::process::id(),
             },
+            auth_token,
             next_id: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
             inner: Mutex::new(StateInner {
@@ -373,8 +391,12 @@ impl ServerState {
     }
 
     pub fn register_client(&self) -> Arc<ClientOutbox> {
+        self.register_client_with_auth(true)
+    }
+
+    pub fn register_client_with_auth(&self, pre_authenticated: bool) -> Arc<ClientOutbox> {
         let id = self.alloc_id("c");
-        let outbox = ClientOutbox::new(id.clone());
+        let outbox = ClientOutbox::new(id.clone(), pre_authenticated);
         self.inner.lock().clients.insert(id, Arc::clone(&outbox));
         outbox
     }
@@ -429,6 +451,9 @@ impl ServerState {
 
     /// Forward raw keystrokes/paste from `PTY_IN` directly to the attached block.
     pub fn handle_pty_in(&self, outbox: &ClientOutbox, stream_id: u32, bytes: &[u8]) {
+        if !outbox.authenticated.load(Ordering::Acquire) {
+            return;
+        }
         let Some((block_id, interactive)) = outbox.stream_block(stream_id) else {
             return;
         };
@@ -443,6 +468,9 @@ impl ServerState {
 
     /// Forward `PTY_RESIZE` from an interactive client to the attached block.
     pub fn handle_pty_resize(&self, outbox: &ClientOutbox, stream_id: u32, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
+        if !outbox.authenticated.load(Ordering::Acquire) {
+            return;
+        }
         let Some((block_id, interactive)) = outbox.stream_block(stream_id) else {
             return;
         };
@@ -473,18 +501,29 @@ impl ServerState {
     }
 
     /// Handle one JSON RPC request and enqueue its `RPC_RES` on `outbox`.
-    /// (Returning `true` requests the server accept loop to shut down.)
     pub fn handle_rpc(
         self: &Arc<Self>,
         outbox: &Arc<ClientOutbox>,
         req_id: u32,
         req: &Value,
-    ) -> bool {
+    ) -> RpcOutcome {
         let op = req.get("op").and_then(Value::as_str).unwrap_or("");
+        let is_authed = outbox.authenticated.load(Ordering::Acquire);
+        if !is_authed && op != "hello" {
+            let body = json!({
+                "ok": false,
+                "error": "unauthorized: authenticate via `hello` with bearer token first",
+            });
+            if let Ok(f) = Frame::rpc_res(req_id, &body) {
+                outbox.push_priority(f);
+            }
+            return RpcOutcome::CloseClient;
+        }
+
         // `block.attach` pushes RPC_RES + PTY_SNAPSHOT atomically under block locks.
         if op == "block.attach" {
             self.rpc_block_attach(outbox, req_id, req);
-            return false;
+            return RpcOutcome::Continue;
         }
         // `block.wait` blocks until process exit; run off the reader thread so
         // the client's connection stays responsive for events/pings/output.
@@ -503,7 +542,7 @@ impl ServerState {
                         out.push_priority(f);
                     }
                 });
-            return false;
+            return RpcOutcome::Continue;
         }
         if op == "server.shutdown" {
             self.shutdown.store(true, Ordering::Release);
@@ -511,7 +550,7 @@ impl ServerState {
             if let Ok(f) = Frame::rpc_res(req_id, &res) {
                 outbox.push_priority(f);
             }
-            return true;
+            return RpcOutcome::ShutdownServer;
         }
 
         let result: Result<Value, String> = match op {
@@ -542,6 +581,7 @@ impl ServerState {
             _ => Err(format!("unknown op `{op}`")),
         };
 
+        let failed_auth = op == "hello" && result.is_err() && !outbox.authenticated.load(Ordering::Acquire);
         let body = match result {
             Ok(data) => json!({ "ok": true, "data": data }),
             Err(err) => json!({ "ok": false, "error": err }),
@@ -549,7 +589,11 @@ impl ServerState {
         if let Ok(f) = Frame::rpc_res(req_id, &body) {
             outbox.push_priority(f);
         }
-        false
+        if failed_auth {
+            RpcOutcome::CloseClient
+        } else {
+            RpcOutcome::Continue
+        }
     }
 
     fn rpc_hello(&self, outbox: &Arc<ClientOutbox>, req: &Value) -> Result<Value, String> {
@@ -558,6 +602,15 @@ impl ServerState {
             return Err(format!(
                 "protocol mismatch: client {proto}, server {PROTOCOL_VERSION}"
             ));
+        }
+        if !outbox.authenticated.load(Ordering::Acquire) {
+            if let Some(expected) = self.auth_token.as_deref() {
+                let supplied = req.get("token").and_then(Value::as_str).unwrap_or("");
+                if !crate::mux::ct_eq(supplied.as_bytes(), expected.as_bytes()) {
+                    return Err("unauthorized: invalid or missing bearer token".into());
+                }
+            }
+            outbox.authenticated.store(true, Ordering::Release);
         }
         if let Some(k) = req.get("client_kind").and_then(Value::as_str) {
             *outbox.kind.lock() = k.to_string();
@@ -593,7 +646,21 @@ impl ServerState {
             ),
             _ => {
                 let shell = default_shell();
-                match find_integration_dir().and_then(|d| integration(&shell, &d, true)) {
+                let int_dir = find_integration_dir();
+                let maybe_int = match int_dir {
+                    Some(ref d) => integration(&shell, d, true),
+                    None => {
+                        #[cfg(windows)]
+                        {
+                            integration(&shell, std::path::Path::new(""), true)
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            None
+                        }
+                    }
+                };
+                match maybe_int {
                     Some(i) => (shell, i.args, i.login, i.env),
                     None => (shell, Vec::new(), true, Vec::new()),
                 }
@@ -643,6 +710,21 @@ impl ServerState {
             .name(format!("tachyon-srv-rd-{block_id}"))
             .spawn(move || read_block_loop(state_reader, block_reader))
             .map_err(|e| format!("spawn reader thread: {e}"))?;
+
+        // On Windows ConPTY, `conhost.exe` keeps the output pipe open even after
+        // the child process exits until `ClosePseudoConsole` is called. Watch the
+        // child handle and close the pseudoconsole cleanly once it exits.
+        #[cfg(windows)]
+        {
+            let exit_block = Arc::clone(&block);
+            let _ = std::thread::Builder::new()
+                .name(format!("tachyon-srv-exit-{block_id}"))
+                .spawn(move || {
+                    let _ = exit_block.pty.wait_exit();
+                    std::thread::sleep(Duration::from_millis(30));
+                    exit_block.pty.hangup();
+                });
+        }
 
         let state_parser = Arc::clone(self);
         let block_parser = Arc::clone(&block);

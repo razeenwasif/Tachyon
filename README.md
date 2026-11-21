@@ -483,9 +483,25 @@ tachyon -S kagutsuchi events --json
 ```
 
 Remote hosts connect over one persistent `ssh <host> tachyon bridge` per host
-(zero open ports, using `~/.ssh/config` and Tailscale). Every server-managed
-block automatically receives `TACHYON_SERVER`, `TACHYON_SESSION`,
-`TACHYON_WINDOW`, and `TACHYON_BLOCK`.
+(zero open ports, using `~/.ssh/config` and Tailscale — supporting macOS, Linux,
+and Windows OpenSSH automatically), or optionally directly over Tailscale TCP
+(`--listen tailscale` on port `7501` with a 256-bit bearer token):
+
+```sh
+# macOS (Mac mini) or Linux PC (auto-detects OS/arch, installs launchd or systemd --user)
+scripts/deploy-host.sh kagutsuchi --service
+scripts/deploy-host.sh amaterasu-linux --service --listen tailscale
+
+# Windows PC (PowerShell: builds headless ConPTY + named-pipe server & OnLogon task)
+.\scripts\deploy-host.ps1 -Service -Listen tailscale
+
+# Connect from MacBook via direct Tailscale TCP (or SSH)
+tachyon hosts add amaterasu tcp://<tailscale-ip>:7501 --token <token-from-host>
+```
+
+Every server-managed block automatically receives `TACHYON_SERVER`,
+`TACHYON_SESSION`, `TACHYON_WINDOW`, and `TACHYON_BLOCK` (on Unix and Windows
+ConPTY).
 
 **Multi-host sidebar & pane headers.** On macOS, a collapsible Liquid Glass left
 sidebar (**⌘B**, View > Toggle Sidebar) lists **This Mac** plus every remote

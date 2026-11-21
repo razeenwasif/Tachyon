@@ -120,6 +120,8 @@ pub const ENTRIES: &[SheetEntry] = &[
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon split --right", detail: "Split current pane from CLI or coding agent", action: Some(SheetAction::CopyCli("tachyon split --right")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon skill setup", detail: "Install Claude Code, Antigravity, Codex, OpenCode & Pi hooks", action: Some(SheetAction::CopyCli("tachyon skill setup")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon status --state working --tty", detail: "Emit OSC 7501 status pill & notification", action: Some(SheetAction::CopyCli("tachyon status --state working --app agent --msg \"Working\" --tty")) },
+    SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon server install-service --listen tailscale", detail: "Install persistent host service + Tailscale TCP (port 7501)", action: Some(SheetAction::CopyCli("tachyon server install-service --listen tailscale")) },
+    SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon hosts add pc tcp://<ip>:7501 --token <tok>", detail: "Connect a Linux or Windows PC directly over Tailscale TCP", action: Some(SheetAction::CopyCli("tachyon hosts add pc tcp://<tailscale-ip>:7501 --token ")) },
 ];
 
 pub fn filter_entries(query: &str) -> Vec<&'static SheetEntry> {

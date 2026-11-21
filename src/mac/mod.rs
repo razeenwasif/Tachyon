@@ -7130,8 +7130,12 @@ fn mux_refresh_all() {
 }
 
 fn mux_add_host(alias: String, uri: String) {
+    mux_add_host_with_token(alias, uri, None);
+}
+
+fn mux_add_host_with_token(alias: String, uri: String, token: Option<String>) {
     if let Some(m) = host_mgr() {
-        if let Err(e) = m.add_host(alias, uri) {
+        if let Err(e) = m.add_host(alias, uri, token) {
             crate::log::force(&format!("could not add host: {e}"));
         }
     }

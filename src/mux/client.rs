@@ -107,14 +107,56 @@ pub struct MuxClient {
 }
 
 impl MuxClient {
-    /// Connect to `target`, negotiate `hello`, and start the demux reader thread.
+    /// Connect to `target`, negotiate `hello` (sending bearer token for TCP
+    /// targets), and start the demux reader thread.
+    ///
+    /// For SSH targets without an explicit `--bin`, automatically retries once
+    /// using Windows OpenSSH syntax (`tachyon bridge`) if the remote shell
+    /// rejects the default POSIX command.
     pub fn connect(target: &Target, auto_start: bool, kind: &str, name: &str) -> io::Result<Arc<Self>> {
+        let token = match target {
+            Target::Tcp { token, .. } => token.as_deref(),
+            _ => None,
+        };
         let transport = transport::connect(target, auto_start)?;
-        Self::from_transport(transport, kind, name)
+        let diag = Arc::clone(&transport.diag);
+        match Self::from_transport_with_token(transport, kind, name, token) {
+            Ok(c) => Ok(c),
+            Err(first_err) => {
+                if let Target::Ssh {
+                    destination,
+                    port,
+                    remote_bin: None,
+                    ..
+                } = target
+                {
+                    let stderr = diag.lock().clone();
+                    if transport::looks_like_windows_ssh_shell_error(&stderr) {
+                        if let Ok(win_t) = transport::connect_ssh_with_mode(destination, *port, None, true) {
+                            if let Ok(c) = Self::from_transport_with_token(win_t, kind, name, None) {
+                                return Ok(c);
+                            }
+                        }
+                    }
+                }
+                Err(first_err)
+            }
+        }
     }
 
     /// Wrap an already-connected transport (also useful for in-process tests).
     pub fn from_transport(transport: Transport, kind: &str, name: &str) -> io::Result<Arc<Self>> {
+        Self::from_transport_with_token(transport, kind, name, None)
+    }
+
+    /// Wrap an already-connected transport and include an optional bearer token
+    /// in the `hello` handshake.
+    pub fn from_transport_with_token(
+        transport: Transport,
+        kind: &str,
+        name: &str,
+        token: Option<&str>,
+    ) -> io::Result<Arc<Self>> {
         let Transport { reader, writer, diag, _guard } = transport;
         let inner = Arc::new(ClientInner {
             writer: Mutex::new(writer),
@@ -148,12 +190,16 @@ impl MuxClient {
             client_id: String::new(),
         };
 
-        let reply = client.rpc(json!({
+        let mut hello = json!({
             "op": "hello",
             "protocol": PROTOCOL_VERSION,
             "client_kind": kind,
             "client_name": name,
-        }))?;
+        });
+        if let Some(tok) = token.filter(|t| !t.is_empty()) {
+            hello["token"] = json!(tok);
+        }
+        let reply = client.rpc(hello)?;
 
         client.host = HostInfo::from_json(reply.get("host").unwrap_or(&Value::Null))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing host info in hello"))?;

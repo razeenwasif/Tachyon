@@ -37,7 +37,7 @@ use crate::mux::default_socket_path;
 use crate::server;
 
 const WIN_W: f64 = 690.0;
-const WIN_H: f64 = 490.0;
+const WIN_H: f64 = 524.0;
 const RAIL_W: f64 = 186.0;
 const NAV_ROW_H: f64 = 32.0;
 
@@ -386,10 +386,10 @@ define_class!(
 
         #[unsafe(method(hostAddCustom:))]
         fn host_add_custom(&self, _sender: Option<&AnyObject>) {
-            let (alias, uri) = SETTINGS.with(|slot| {
+            let (alias, uri, token) = SETTINGS.with(|slot| {
                 let guard = slot.borrow();
                 let Some(win) = guard.as_ref() else {
-                    return (String::new(), String::new());
+                    return (String::new(), String::new(), None);
                 };
                 let a = win
                     .custom_alias
@@ -401,10 +401,15 @@ define_class!(
                     .as_ref()
                     .map(|f| f.stringValue().to_string().trim().to_string())
                     .unwrap_or_default();
-                (a, u)
+                let t = win
+                    .custom_token
+                    .as_ref()
+                    .map(|f| f.stringValue().to_string().trim().to_string())
+                    .filter(|s| !s.is_empty());
+                (a, u, t)
             });
             if alias.is_empty() || uri.is_empty() {
-                self.set_note("Enter both an alias (e.g. linux-box) and ssh://host URI.");
+                self.set_note("Enter both an alias (e.g. win-pc) and an ssh:// or tcp:// URI.");
                 refresh_if_open();
                 return;
             }
@@ -413,7 +418,7 @@ define_class!(
             } else {
                 format!("ssh://{uri}")
             };
-            super::mux_add_host(alias.clone(), normalized);
+            super::mux_add_host_with_token(alias.clone(), normalized, token);
             self.set_note(&format!("Added `{alias}` — connecting…"));
             refresh_if_open();
         }
@@ -560,6 +565,7 @@ struct SettingsWindow {
     active: Cell<usize>,
     custom_alias: Option<Retained<NSTextField>>,
     custom_uri: Option<Retained<NSTextField>>,
+    custom_token: Option<Retained<NSTextField>>,
 }
 
 impl SettingsWindow {
@@ -618,6 +624,7 @@ impl SettingsWindow {
             active: Cell::new(2), // Open directly to Integrations by default unless specified.
             custom_alias: None,
             custom_uri: None,
+            custom_token: None,
         };
         this.rebuild_detail(mtm);
         this
@@ -631,6 +638,7 @@ impl SettingsWindow {
         }
         self.custom_alias = None;
         self.custom_uri = None;
+        self.custom_token = None;
 
         let w = WIN_W - RAIL_W;
         let pad = 22.0;
@@ -754,10 +762,12 @@ impl SettingsWindow {
                 aliases.push(h.alias.clone());
                 let ry = 34.0 + idx as f64 * 34.0;
                 let line = match &h.status {
-                    HostStatus::Connected { rtt_ms: Some(ms), .. } => {
-                        format!("🟢 {}  ({ms:.0} ms) · {}", h.display_name, h.uri)
+                    HostStatus::Connected { info, rtt_ms: Some(ms) } => {
+                        format!("🟢 {} · {}/{} ({ms:.0} ms) · {}", h.display_name, info.os, info.arch, h.uri)
                     }
-                    HostStatus::Connected { .. } => format!("🟢 {} · {}", h.display_name, h.uri),
+                    HostStatus::Connected { info, .. } => {
+                        format!("🟢 {} · {}/{} · {}", h.display_name, info.os, info.arch, h.uri)
+                    }
                     HostStatus::Connecting => format!("🟡 {} (connecting…)", h.display_name),
                     HostStatus::Disconnected { .. } => format!("⚪️ {} (offline) · {}", h.display_name, h.uri),
                 };
@@ -806,30 +816,45 @@ impl SettingsWindow {
             *y += sh + 14.0;
         }
 
-        // Manual Add Host row (Linux / Windows PCs or custom SSH hosts).
-        let acard = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 72.0)));
-        let ahdr = label(mtm, "Add Custom SSH Host (Mac mini, Linux, Windows OpenSSH)", 12.0, true, &NSColor::labelColor());
+        // Manual Add Host row (Mac mini, Linux, Windows OpenSSH, or Tailscale TCP).
+        let acard = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 102.0)));
+        let ahdr = label(
+            mtm,
+            "Add Host (Mac mini, Linux, Windows OpenSSH, or Tailscale TCP)",
+            12.0,
+            true,
+            &NSColor::labelColor(),
+        );
         ahdr.setFrame(NSRect::new(NSPoint::new(14.0, 10.0), NSSize::new(w - 28.0, 16.0)));
         let alias_field = NSTextField::initWithFrame(
             NSTextField::alloc(mtm),
-            NSRect::new(NSPoint::new(14.0, 34.0), NSSize::new(130.0, 24.0)),
+            NSRect::new(NSPoint::new(14.0, 34.0), NSSize::new(124.0, 24.0)),
         );
-        alias_field.setPlaceholderString(Some(&NSString::from_str("alias (e.g. linux)")));
+        alias_field.setPlaceholderString(Some(&NSString::from_str("alias (e.g. win-pc)")));
         let uri_field = NSTextField::initWithFrame(
             NSTextField::alloc(mtm),
-            NSRect::new(NSPoint::new(152.0, 34.0), NSSize::new(w - 246.0, 24.0)),
+            NSRect::new(NSPoint::new(146.0, 34.0), NSSize::new(w - 240.0, 24.0)),
         );
-        uri_field.setPlaceholderString(Some(&NSString::from_str("ssh://user@host")));
+        uri_field.setPlaceholderString(Some(&NSString::from_str("ssh://host or tcp://100.x.y.z:7501")));
         let add_btn = push_button(mtm, "Add", target, sel!(hostAddCustom:));
         add_btn.setFrame(NSRect::new(NSPoint::new(w - 84.0, 33.0), NSSize::new(70.0, 26.0)));
+        let token_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(14.0, 66.0), NSSize::new(w - 28.0, 24.0)),
+        );
+        token_field.setPlaceholderString(Some(&NSString::from_str(
+            "Bearer token (required only for direct tcp:// — run `tachyon server token` on host)",
+        )));
         acard.addSubview(&ahdr);
         acard.addSubview(&alias_field);
         acard.addSubview(&uri_field);
         acard.addSubview(&add_btn);
+        acard.addSubview(&token_field);
         self.custom_alias = Some(alias_field);
         self.custom_uri = Some(uri_field);
+        self.custom_token = Some(token_field);
         self.detail.addSubview(&acard);
-        *y += 86.0;
+        *y += 116.0;
     }
 
     fn build_integrations(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {

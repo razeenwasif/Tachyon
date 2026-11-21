@@ -331,10 +331,16 @@ fn escape(bytes: &[u8]) -> String {
     squeezed
 }
 
+#[cfg(unix)]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 /// A segment on its way to disk: indexed now, written by the writer thread.
@@ -396,15 +402,42 @@ fn read_segment(cold: &Cold) -> Option<Vec<Chunk>> {
     Some(out)
 }
 
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    let pid = pid as libc::pid_t;
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
+#[cfg(windows)]
+fn pid_is_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+        let _ = CloseHandle(h);
+        ok
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Remove the folders of logs whose app has gone without cleaning up (a
 /// crash): each is named `<pid>-<tab>`.
 pub fn remove_stale(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else { return };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(pid) = name.split('-').next().and_then(|p| p.parse::<i32>().ok()) else { continue };
-        let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        if !alive {
+        let Some(pid) = name.split('-').next().and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if !pid_is_alive(pid) {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
