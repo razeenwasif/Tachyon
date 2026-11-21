@@ -35,7 +35,7 @@ use unicode_width::UnicodeWidthChar;
 use super::font::{CellMetrics, FontSet, GlyphBitmap};
 use super::images;
 use super::selection::Range;
-use crate::config::Config;
+use crate::config::{ChromeStyle, Config};
 use crate::term::{Cell, CellFlags, CursorShape, Palette, Term, TermMode, CLUSTER_TAG};
 
 const SHADERS: &str = include_str!("shaders.metal");
@@ -210,6 +210,65 @@ pub struct HostAccent {
     pub danger: bool,
 }
 
+/// Resolved surface, hairline, and divider tokens for each `ChromeStyle`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChromeTokens {
+    pub chrome_bg: [u8; 3],
+    pub pane_bg_override: Option<[u8; 3]>,
+    pub hairline_rgb: [u8; 3],
+    pub hairline_alpha: f32,
+    pub divider_rgb: [u8; 3],
+    pub divider_alpha: f32,
+    pub dashed_dividers: bool,
+    pub opaque_surface: bool,
+}
+
+/// Pure surface palette mapping for `Glass`, `Herdr`, `Terminals`, and `Core`.
+pub fn chrome_tokens(style: ChromeStyle, theme_bg: [u8; 3]) -> ChromeTokens {
+    match style {
+        ChromeStyle::Glass => ChromeTokens {
+            chrome_bg: theme_bg,
+            pane_bg_override: None,
+            hairline_rgb: [255, 255, 255],
+            hairline_alpha: 0.12,
+            divider_rgb: [255, 255, 255],
+            divider_alpha: 0.22,
+            dashed_dividers: false,
+            opaque_surface: false,
+        },
+        ChromeStyle::Herdr => ChromeTokens {
+            chrome_bg: [0x10, 0x11, 0x14],
+            pane_bg_override: None,
+            hairline_rgb: [255, 255, 255],
+            hairline_alpha: 0.094,
+            divider_rgb: [255, 255, 255],
+            divider_alpha: 0.094,
+            dashed_dividers: false,
+            opaque_surface: true,
+        },
+        ChromeStyle::Terminals => ChromeTokens {
+            chrome_bg: [0x0C, 0x0D, 0x0F],
+            pane_bg_override: Some([0x11, 0x12, 0x14]),
+            hairline_rgb: [255, 255, 255],
+            hairline_alpha: 0.094,
+            divider_rgb: [255, 255, 255],
+            divider_alpha: 0.094,
+            dashed_dividers: false,
+            opaque_surface: true,
+        },
+        ChromeStyle::Core => ChromeTokens {
+            chrome_bg: [0x0A, 0x0B, 0x0C],
+            pane_bg_override: Some([0x0A, 0x0B, 0x0C]),
+            hairline_rgb: [0x24, 0x26, 0x2A],
+            hairline_alpha: 1.0,
+            divider_rgb: [0x2A, 0x2C, 0x30],
+            divider_alpha: 1.0,
+            dashed_dividers: true,
+            opaque_surface: true,
+        },
+    }
+}
+
 /// One frame's worth of GPU-visible instance buffers.
 #[derive(Default)]
 struct Slot {
@@ -274,6 +333,7 @@ pub struct Renderer {
     /// A band along the bottom, above any tab strip, for shortcut hints and
     /// Fairy's button.
     hints_band: bool,
+    chrome: ChromeStyle,
 
     bg: Vec<RectInstance>,
     glyphs: Vec<GlyphInstance>,
@@ -308,7 +368,7 @@ impl Renderer {
         // the display scans out the previous frame.
         layer.setMaximumDrawableCount(2);
         layer.setDisplaySyncEnabled(cfg.render.vsync && !cfg.render.low_latency);
-        layer.setOpaque(cfg.window.opacity >= 1.0);
+        layer.setOpaque(cfg.window.chrome.is_minimal() || cfg.window.opacity >= 1.0);
         if let Some(space) = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })) {
             layer.setColorspace(Some(&space));
         }
@@ -331,6 +391,7 @@ impl Renderer {
             strip: false,
             top_inset: 0.0,
             hints_band: false,
+            chrome: cfg.window.chrome,
             strip_band: None,
             bg: Vec::new(),
             glyphs: Vec::new(),
@@ -416,12 +477,21 @@ impl Renderer {
         self.hints_band = on;
     }
 
-    /// The hints band's height in pixels: a row and a bit.
+    pub fn set_chrome(&mut self, style: ChromeStyle) {
+        self.chrome = style;
+        self.layer.setOpaque(style.is_minimal() || self.cfg.window.opacity >= 1.0);
+    }
+
+    /// The hints band's height in pixels: a row and a bit (at least 28pt in minimal chrome).
     pub fn hints_height(&self) -> f32 {
-        if self.hints_band {
-            (self.fonts.metrics.height * 1.3).round()
+        if !self.hints_band {
+            return 0.0;
+        }
+        let base = (self.fonts.metrics.height * 1.3).round();
+        if self.chrome.is_minimal() {
+            base.max((28.0 * self.scale).round())
         } else {
-            0.0
+            base
         }
     }
 
@@ -469,29 +539,52 @@ impl Renderer {
         accent: Option<&HostAccent>,
         broadcast: Option<usize>,
     ) {
-        if !self.hints_band || (hints.is_empty() && accent.is_none() && broadcast.is_none()) {
+        let minimal = self.chrome.is_minimal();
+        if !self.hints_band || (!minimal && hints.is_empty() && accent.is_none() && broadcast.is_none()) {
             return;
         }
         const BROADCAST_RGB: [u8; 3] = [245, 158, 11];
         let m = self.fonts.metrics;
         let (pad_x, _) = self.padding();
         let theme = self.cfg.theme.clone();
+        let tokens = chrome_tokens(self.chrome, theme.background);
         let mix = |t: f32| -> [u8; 3] {
             std::array::from_fn(|i| (theme.background[i] as f32 + (theme.foreground[i] as f32 - theme.background[i] as f32) * t).round() as u8)
         };
         let blend = |a: [u8; 3], b: [u8; 3], t: f32| -> [u8; 3] {
             std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
         };
-        let (key, label) = (mix(0.72), mix(0.46));
-        let line = match (accent, broadcast) {
-            (Some(acc), _) if acc.danger => blend(theme.background, acc.rgb, 0.65),
-            (_, Some(_)) => blend(theme.background, BROADCAST_RGB, 0.65),
-            (Some(acc), None) => blend(theme.background, acc.rgb, 0.38),
-            (None, None) => mix(0.12),
+        let (key, label) = if minimal {
+            ([0x98, 0x99, 0x9B], [0x69, 0x6A, 0x6D])
+        } else {
+            (mix(0.72), mix(0.46))
         };
         let (y0, h) = self.hints_rect();
         let hair = self.scale.round().max(1.0);
-        self.bg.push(RectInstance { rect: [pad_x, y0, (self.size.0 - 2.0 * pad_x).max(0.0), hair], color: srgb(line) });
+        if minimal {
+            self.bg.push(RectInstance {
+                rect: [0.0, y0, self.size.0, h],
+                color: srgb(tokens.chrome_bg),
+            });
+            let hair_col = match (accent, broadcast) {
+                (Some(acc), _) if acc.danger => srgb(blend(tokens.chrome_bg, acc.rgb, 0.7)),
+                (_, Some(_)) => srgb(blend(tokens.chrome_bg, BROADCAST_RGB, 0.7)),
+                _ => {
+                    let mut c = srgb(tokens.hairline_rgb);
+                    c[3] = tokens.hairline_alpha;
+                    c
+                }
+            };
+            self.bg.push(RectInstance { rect: [0.0, y0, self.size.0, hair], color: hair_col });
+        } else {
+            let line = match (accent, broadcast) {
+                (Some(acc), _) if acc.danger => blend(theme.background, acc.rgb, 0.65),
+                (_, Some(_)) => blend(theme.background, BROADCAST_RGB, 0.65),
+                (Some(acc), None) => blend(theme.background, acc.rgb, 0.38),
+                (None, None) => mix(0.12),
+            };
+            self.bg.push(RectInstance { rect: [pad_x, y0, (self.size.0 - 2.0 * pad_x).max(0.0), hair], color: srgb(line) });
+        }
         let text_y = y0 + ((h - m.height) / 2.0).round();
         let width = |s: &str| s.chars().map(|c| c.width().unwrap_or(1)).sum::<usize>() as f32 * m.width;
         let mut x = pad_x;
@@ -724,19 +817,24 @@ impl Renderer {
             }
         }
         if !dividers.is_empty() {
-            let color = if broadcast_panes.is_some() {
+            let tokens = chrome_tokens(self.chrome, self.cfg.theme.background);
+            let (color, dashed) = if broadcast_panes.is_some() {
                 let mut c = srgb([245, 158, 11]);
                 c[3] = 0.88;
-                c
+                (c, false)
+            } else if self.chrome.is_minimal() {
+                let mut c = srgb(tokens.divider_rgb);
+                c[3] = tokens.divider_alpha;
+                (c, tokens.dashed_dividers)
             } else {
                 let theme = &self.cfg.theme;
                 let line: [u8; 3] = std::array::from_fn(|i| {
                     (theme.background[i] as f32 + (theme.foreground[i] as f32 - theme.background[i] as f32) * 0.22).round() as u8
                 });
-                srgb(line)
+                (srgb(line), false)
             };
             for &rect in dividers {
-                self.overlay.push(RectInstance { rect, color });
+                self.push_divider(rect, color, dashed);
             }
         }
         if let Some(strip) = strip.filter(|_| self.strip_band.is_none()) {
@@ -767,7 +865,7 @@ impl Renderer {
         let panel_glyphs = upload(device, &mut slot.panel_glyphs, &self.panel_glyphs);
 
         let theme = &self.cfg.theme;
-        let opacity = self.cfg.window.opacity;
+        let opacity = if self.chrome.is_minimal() { 1.0 } else { self.cfg.window.opacity };
         let lin = |v: u8| -> f64 {
             let c = v as f64 / 255.0;
             if c <= 0.04045 {
@@ -1173,6 +1271,28 @@ impl Renderer {
         }
     }
 
+    fn push_divider(&mut self, rect: [f32; 4], color: [f32; 4], dashed: bool) {
+        if !dashed {
+            self.overlay.push(RectInstance { rect, color });
+            return;
+        }
+        let dash = (6.0 * self.scale).round().max(3.0);
+        let gap = (4.0 * self.scale).round().max(2.0);
+        let horizontal = rect[2] > rect[3];
+        let total = if horizontal { rect[2] } else { rect[3] };
+        let mut off = 0.0;
+        while off < total {
+            let len = dash.min(total - off);
+            let seg = if horizontal {
+                [rect[0] + off, rect[1], len, rect[3]]
+            } else {
+                [rect[0], rect[1] + off, rect[2], len]
+            };
+            self.overlay.push(RectInstance { rect: seg, color });
+            off += dash + gap;
+        }
+    }
+
     /// The tab strip along the bottom edge. The tab in front takes the
     /// terminal's own background, so it reads as the same surface as the text
     /// above it; the others sit on a slightly lighter band under a hairline.
@@ -1180,12 +1300,14 @@ impl Renderer {
         let m = self.fonts.metrics;
         let (pad_x, _) = self.padding();
         let theme = self.cfg.theme.clone();
+        let minimal = self.chrome.is_minimal();
+        let tokens = chrome_tokens(self.chrome, theme.background);
         let mix = |a: [u8; 3], b: [u8; 3], t: f32| -> [u8; 3] {
             std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
         };
-        let band = mix(theme.background, theme.foreground, 0.05);
+        let band = if minimal { tokens.chrome_bg } else { mix(theme.background, theme.foreground, 0.05) };
         let line = mix(theme.background, theme.foreground, 0.14);
-        let dim = mix(theme.foreground, theme.background, 0.45);
+        let dim = if minimal { [0x98, 0x99, 0x9B] } else { mix(theme.foreground, theme.background, 0.45) };
         let hair = self.scale.round().max(1.0);
 
         let n = strip.tabs.len();
@@ -1197,15 +1319,32 @@ impl Renderer {
             v[3] = a;
             v
         };
-        let opacity = self.cfg.window.opacity;
+        let opacity = if minimal { 1.0 } else { self.cfg.window.opacity };
+        let mut hair_col = srgb(tokens.hairline_rgb);
+        hair_col[3] = tokens.hairline_alpha;
+
+        if minimal {
+            self.bg.push(RectInstance { rect: [0.0, y0, self.size.0, h], color: srgb(tokens.chrome_bg) });
+            self.bg.push(RectInstance { rect: [0.0, y0, self.size.0, hair], color: hair_col });
+        }
 
         for (i, (label, unseen)) in strip.tabs.iter().enumerate() {
             let (x0, x1) = self.strip_edges(cols, n, i);
             let active = i == strip.active;
-            // The tab in front is left as the window's own background (the
-            // clear colour), so over glass it's exactly as see-through as the
-            // text area above it. The others get the band, just as see-through.
-            if !active {
+            if minimal {
+                if active {
+                    let inset = (3.0 * self.scale).round();
+                    let rw = (x1 - x0 - 2.0 * inset).max(1.0);
+                    let rh = (h - 2.0 * inset).max(1.0);
+                    self.bg.push(RectInstance {
+                        rect: [x0 + inset, y0 + inset, rw, rh],
+                        color: srgb([0x2C, 0x2E, 0x31]),
+                    });
+                }
+            } else if !active {
+                // The tab in front is left as the window's own background (the
+                // clear colour), so over glass it's exactly as see-through as the
+                // text area above it. The others get the band, just as see-through.
                 self.bg.push(RectInstance { rect: [x0, y0, x1 - x0, h], color: see_through(band, opacity) });
                 self.bg.push(RectInstance { rect: [x0, y0, x1 - x0, hair], color: srgb(line) });
                 // A short divider between two tabs in the background.
@@ -1237,7 +1376,14 @@ impl Renderer {
                 self.push_text("●", x, text_y, color);
                 x += 2.0 * m.width;
             }
-            self.push_text(&text, x, text_y, if active { theme.foreground } else { dim });
+            let text_col = if minimal && active {
+                [0xEE, 0xEE, 0xEF]
+            } else if active {
+                theme.foreground
+            } else {
+                dim
+            };
+            self.push_text(&text, x, text_y, text_col);
         }
     }
 
@@ -1775,5 +1921,37 @@ mod tests {
         assert_eq!(fit("python train.py", 10).chars().count(), 10);
         // Wide characters take two cells each.
         assert_eq!(fit("日本語のファイル", 7), "日本語…");
+    }
+
+    #[test]
+    fn chrome_surface_tokens_match_herdr_spec() {
+        use super::chrome_tokens;
+        use crate::config::ChromeStyle;
+
+        let glass = chrome_tokens(ChromeStyle::Glass, [0x0B, 0x0E, 0x14]);
+        assert!(!glass.opaque_surface);
+        assert_eq!(glass.chrome_bg, [0x0B, 0x0E, 0x14]);
+        assert_eq!(glass.pane_bg_override, None);
+
+        let herdr = chrome_tokens(ChromeStyle::Herdr, [0x17, 0x19, 0x1D]);
+        assert!(herdr.opaque_surface);
+        assert_eq!(herdr.chrome_bg, [0x10, 0x11, 0x14]);
+        assert_eq!(herdr.pane_bg_override, None);
+        assert_eq!(herdr.hairline_rgb, [255, 255, 255]);
+        assert!((herdr.hairline_alpha - 0.094).abs() < 1e-4);
+        assert!(!herdr.dashed_dividers);
+
+        let terminals = chrome_tokens(ChromeStyle::Terminals, [0x17, 0x19, 0x1D]);
+        assert!(terminals.opaque_surface);
+        assert_eq!(terminals.chrome_bg, [0x0C, 0x0D, 0x0F]);
+        assert_eq!(terminals.pane_bg_override, Some([0x11, 0x12, 0x14]));
+        assert!(!terminals.dashed_dividers);
+
+        let core = chrome_tokens(ChromeStyle::Core, [0x17, 0x19, 0x1D]);
+        assert!(core.opaque_surface);
+        assert_eq!(core.chrome_bg, [0x0A, 0x0B, 0x0C]);
+        assert_eq!(core.pane_bg_override, Some([0x0A, 0x0B, 0x0C]));
+        assert_eq!(core.divider_rgb, [0x2A, 0x2C, 0x30]);
+        assert!(core.dashed_dividers);
     }
 }

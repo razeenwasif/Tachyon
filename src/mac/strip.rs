@@ -21,8 +21,9 @@ use objc2_foundation::{
     NSSize, NSString,
 };
 
-use super::renderer::Outcome;
+use super::renderer::{chrome_tokens, Outcome};
 use super::with_window;
+use crate::config::ChromeStyle;
 
 /// Height of the capsule, and of the band reserved for it at the bottom of
 /// the window, in points.
@@ -38,6 +39,7 @@ pub struct StripState {
     window: Cell<u64>,
     tabs: RefCell<Vec<(String, Option<Outcome>)>>,
     active: Cell<usize>,
+    chrome: Cell<ChromeStyle>,
 }
 
 define_class!(
@@ -123,6 +125,8 @@ impl TabStripView {
     fn draw(&self) {
         let tabs = self.ivars().tabs.borrow();
         let active = self.ivars().active.get();
+        let style = self.ivars().chrome.get();
+        let minimal = style.is_minimal();
         let bounds = self.bounds();
         let n = tabs.len();
         if n == 0 {
@@ -130,16 +134,35 @@ impl TabStripView {
         }
         let w = bounds.size.width / n as f64;
         let h = bounds.size.height;
+        if minimal {
+            let tok = chrome_tokens(style, [0x17, 0x19, 0x1D]);
+            let track = if style == ChromeStyle::Core { [0x0A, 0x0B, 0x0C] } else { [0x17, 0x18, 0x1B] };
+            srgb_alpha(track, 1.0).setFill();
+            let outer = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, h / 2.0, h / 2.0);
+            outer.fill();
+            srgb_alpha(tok.hairline_rgb, tok.hairline_alpha as f64).setStroke();
+            outer.setLineWidth(1.0);
+            outer.stroke();
+        }
         for (i, (label, unseen)) in tabs.iter().enumerate() {
             let cell = NSRect::new(NSPoint::new(i as f64 * w, 0.0), NSSize::new(w, h));
             if i == active {
                 // The tab in front: a softer pill inside the capsule.
                 let pill = inset(cell, 3.0, 3.0);
                 let r = pill.size.height / 2.0;
-                NSColor::labelColor().colorWithAlphaComponent(0.13).setFill();
-                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, r, r).fill();
+                if minimal {
+                    srgb_alpha([0x2C, 0x2E, 0x31], 1.0).setFill();
+                    let p = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, r, r);
+                    p.fill();
+                    srgb_alpha([255, 255, 255], 0.094).setStroke();
+                    p.setLineWidth(1.0);
+                    p.stroke();
+                } else {
+                    NSColor::labelColor().colorWithAlphaComponent(0.13).setFill();
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, r, r).fill();
+                }
             }
-            let text = label_text(label, *unseen, i == active);
+            let text = label_text(label, *unseen, i == active, minimal);
             let line = 16.0;
             let rect = NSRect::new(
                 NSPoint::new(cell.origin.x + 10.0, (h - line) / 2.0 - 1.0),
@@ -148,6 +171,15 @@ impl TabStripView {
             text.drawInRect(rect);
         }
     }
+}
+
+fn srgb_alpha(rgb: [u8; 3], alpha: f64) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(
+        rgb[0] as f64 / 255.0,
+        rgb[1] as f64 / 255.0,
+        rgb[2] as f64 / 255.0,
+        alpha,
+    )
 }
 
 fn inset(r: NSRect, dx: f64, dy: f64) -> NSRect {
@@ -159,7 +191,7 @@ fn inset(r: NSRect, dx: f64, dy: f64) -> NSRect {
 
 /// A tab's name in the system font, centred and cut with an ellipsis, after
 /// a green or red dot when a command finished there unseen.
-fn label_text(label: &str, unseen: Option<Outcome>, active: bool) -> Retained<NSAttributedString> {
+fn label_text(label: &str, unseen: Option<Outcome>, active: bool, minimal: bool) -> Retained<NSAttributedString> {
     let para = NSMutableParagraphStyle::new();
     para.setAlignment(NSTextAlignment::Center);
     para.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
@@ -173,7 +205,17 @@ fn label_text(label: &str, unseen: Option<Outcome>, active: bool) -> Retained<NS
     };
     let out = NSMutableAttributedString::new();
     if let Some(outcome) = unseen {
-        let dot = if outcome == Outcome::Failed { NSColor::systemRedColor() } else { NSColor::systemGreenColor() };
+        let dot = if minimal {
+            if outcome == Outcome::Failed {
+                srgb_alpha([0xDC, 0x8C, 0x95], 1.0)
+            } else {
+                srgb_alpha([0x4C, 0xC4, 0x8C], 1.0)
+            }
+        } else if outcome == Outcome::Failed {
+            NSColor::systemRedColor()
+        } else {
+            NSColor::systemGreenColor()
+        };
         // SAFETY: the attributes are a font, a colour and a paragraph style
         // under their AppKit keys.
         let run = unsafe {
@@ -185,7 +227,17 @@ fn label_text(label: &str, unseen: Option<Outcome>, active: bool) -> Retained<NS
         };
         out.appendAttributedString(&run);
     }
-    let color = if active { NSColor::labelColor() } else { NSColor::secondaryLabelColor() };
+    let color = if minimal {
+        if active {
+            srgb_alpha([0xEE, 0xEE, 0xEF], 1.0)
+        } else {
+            srgb_alpha([0x98, 0x99, 0x9B], 1.0)
+        }
+    } else if active {
+        NSColor::labelColor()
+    } else {
+        NSColor::secondaryLabelColor()
+    };
     // SAFETY: as above.
     let run = unsafe {
         NSAttributedString::initWithString_attributes(
@@ -218,6 +270,18 @@ impl Capsule {
     /// Apply an optional host accent/danger tint to the floating tab capsule.
     pub fn set_tint(&self, tint: Option<&NSColor>) {
         self.glass.setTintColor(tint);
+    }
+
+    /// Switch the pill capsule between Liquid Glass and dark minimal chrome.
+    pub fn set_chrome(&self, style: ChromeStyle) {
+        self.view.ivars().chrome.set(style);
+        if style.is_minimal() {
+            let track = if style == ChromeStyle::Core { [0x0A, 0x0B, 0x0C] } else { [0x17, 0x18, 0x1B] };
+            self.glass.setTintColor(Some(&srgb_alpha(track, 1.0)));
+        } else {
+            self.glass.setTintColor(None);
+        }
+        self.view.setNeedsDisplay(true);
     }
 
     /// Centre the capsule along the bottom of a view `width` points wide.

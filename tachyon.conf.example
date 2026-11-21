@@ -73,9 +73,17 @@ window.padding_y = 6.0
 
 # macOS: what full screen means. native is macOS's own (below the notch);
 # notch makes the green button, Ctrl-Cmd-F and View > Enter Full Screen go
-# around the notch (tabs left of it, status right, every row below), and
-# Tachyon opens that way. Option-Cmd-F goes around the notch either way.
-# window.fullscreen = native
+# around the notch (tabs left of it, status right, every row below). Set
+# window.start_fullscreen = true to open in full screen automatically at launch;
+# false (the default) opens in a window. Option-Cmd-F goes around the notch either way.
+# window.fullscreen       = native
+# window.start_fullscreen = false
+
+# macOS: window chrome & surface preset. glass (the default) uses translucent
+# Liquid Glass; herdr (neutral charcoal #101114 chrome / #17191d panes / 28pt
+# status strip), terminals (minimal top pill tabs), and core (zero decorative
+# chrome + dashed 1px dividers) give a crisp opaque dark minimal workspace.
+# window.chrome = glass
 
 # macOS: collapsible Rex-style multi-host sidebar (`⌘B` toggles at runtime)
 # and optional minimal per-pane header strip (`never` by default, or `auto`/`always`).
@@ -124,6 +132,11 @@ render.sync_timeout_ms = 150
 # ---------------------------------------------------------------------------
 # Theme
 # ---------------------------------------------------------------------------
+
+# Built-in dark palette preset: default (Tachyon navy glass) or obsidian/herdr
+# (neutral charcoal #17191d surface + calm desaturated ANSI hues). Explicit
+# theme.* keys set after theme.preset override individual slots.
+# theme.preset     = default
 
 # macOS: which theme to use. auto follows Light and Dark Mode, switching as the
 # system does; dark and light fix one.

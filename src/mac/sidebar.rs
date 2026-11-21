@@ -26,7 +26,9 @@ use objc2_foundation::{
 };
 
 use super::host_mgr::{HostStatus, HostView};
+use super::renderer::chrome_tokens;
 use super::{machines, pane_bar, with_window};
+use crate::config::ChromeStyle;
 use crate::term::{ProgramState, ProgramStatus};
 
 pub const MIN_WIDTH: f64 = 180.0;
@@ -101,6 +103,7 @@ struct TreeState {
     scroll_y: Cell<f64>,
     hover: Cell<Option<(usize, RowAction)>>,
     dragging_resize: Cell<bool>,
+    chrome: Cell<ChromeStyle>,
 }
 
 define_class!(
@@ -553,6 +556,9 @@ impl SidebarTreeView {
         let w = b.size.width;
         let scroll = self.ivars().scroll_y.get();
         let hover = self.ivars().hover.get();
+        let style = self.ivars().chrome.get();
+        let minimal = style.is_minimal();
+        let tok = chrome_tokens(style, [0x17, 0x19, 0x1D]);
         let rows = self.ivars().rows.borrow();
 
         for (idx, (ry, rh, row)) in rows.iter().enumerate() {
@@ -577,7 +583,12 @@ impl SidebarTreeView {
                 } => {
                     let y0 = y + *top_pad;
                     if *top_pad > 0.0 {
-                        NSColor::separatorColor().colorWithAlphaComponent(0.28).setFill();
+                        let sep = if minimal {
+                            srgb_alpha(tok.hairline_rgb, tok.hairline_alpha as f64)
+                        } else {
+                            NSColor::separatorColor().colorWithAlphaComponent(0.28)
+                        };
+                        sep.setFill();
                         NSBezierPath::fillRect(NSRect::new(
                             NSPoint::new(12.0, y + 4.0),
                             NSSize::new((w - 24.0).max(0.0), 1.0),
@@ -596,14 +607,15 @@ impl SidebarTreeView {
                         }
                     };
                     let icon_color = match color {
-                        Some(hc) => NSColor::colorWithSRGBRed_green_blue_alpha(
-                            hc.rgb[0] as f64 / 255.0,
-                            hc.rgb[1] as f64 / 255.0,
-                            hc.rgb[2] as f64 / 255.0,
-                            if *connected { 0.95 } else { 0.55 },
-                        ),
+                        Some(hc) => srgb_alpha(hc.rgb, if *connected { 0.95 } else { 0.55 }),
                         None => {
-                            if *connected {
+                            if minimal {
+                                if *connected {
+                                    srgb_alpha([0xEE, 0xEE, 0xEF], 0.85)
+                                } else {
+                                    srgb_alpha([0x69, 0x6A, 0x6D], 0.85)
+                                }
+                            } else if *connected {
                                 NSColor::labelColor().colorWithAlphaComponent(0.85)
                             } else {
                                 NSColor::secondaryLabelColor().colorWithAlphaComponent(0.6)
@@ -614,9 +626,11 @@ impl SidebarTreeView {
 
                     // Status dot beside host name.
                     let dot_color = if *connected {
-                        NSColor::systemGreenColor()
+                        if minimal { srgb_alpha([0x4C, 0xC4, 0x8C], 1.0) } else { NSColor::systemGreenColor() }
                     } else if *connecting {
-                        NSColor::systemOrangeColor()
+                        if minimal { srgb_alpha([0xF2, 0xA3, 0x3C], 1.0) } else { NSColor::systemOrangeColor() }
+                    } else if minimal {
+                        srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
                     } else {
                         NSColor::tertiaryLabelColor()
                     };
@@ -626,7 +640,12 @@ impl SidebarTreeView {
 
                     // `+` new session button on right.
                     if hovered_act == Some(RowAction::Add) {
-                        NSColor::labelColor().colorWithAlphaComponent(0.12).setFill();
+                        let hov = if minimal {
+                            srgb_alpha([255, 255, 255], 0.08)
+                        } else {
+                            NSColor::labelColor().colorWithAlphaComponent(0.12)
+                        };
+                        hov.setFill();
                         NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
                             NSRect::new(NSPoint::new(w - 26.0, y0 + 4.0), NSSize::new(18.0, 18.0)),
                             4.0,
@@ -635,7 +654,9 @@ impl SidebarTreeView {
                         .fill();
                     }
                     let plus_col = if hovered_act == Some(RowAction::Add) {
-                        NSColor::labelColor()
+                        if minimal { srgb_alpha([0xEE, 0xEE, 0xEF], 1.0) } else { NSColor::labelColor() }
+                    } else if minimal {
+                        srgb_alpha([0x98, 0x99, 0x9B], 0.85)
                     } else {
                         NSColor::secondaryLabelColor().colorWithAlphaComponent(0.75)
                     };
@@ -654,12 +675,8 @@ impl SidebarTreeView {
                         _ => format!("{prefix}{display_name}"),
                     };
                     let fg = match color {
-                        Some(hc) if hc.danger => NSColor::colorWithSRGBRed_green_blue_alpha(
-                            hc.rgb[0] as f64 / 255.0,
-                            hc.rgb[1] as f64 / 255.0,
-                            hc.rgb[2] as f64 / 255.0,
-                            0.95,
-                        ),
+                        Some(hc) if hc.danger => srgb_alpha(hc.rgb, 0.95),
+                        _ if minimal => srgb_alpha([0xEE, 0xEE, 0xEF], 0.92),
                         _ => NSColor::labelColor().colorWithAlphaComponent(0.9),
                     };
                     draw_text_left(
@@ -672,7 +689,11 @@ impl SidebarTreeView {
                 }
 
                 TreeRow::Session { name, .. } => {
-                    let fg = NSColor::secondaryLabelColor().colorWithAlphaComponent(0.78);
+                    let fg = if minimal {
+                        srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
+                    } else {
+                        NSColor::secondaryLabelColor().colorWithAlphaComponent(0.78)
+                    };
                     let right_margin = if hovered { 46.0 } else { 14.0 };
                     draw_text_left(
                         name,
@@ -724,12 +745,23 @@ impl SidebarTreeView {
                         NSPoint::new(8.0, y + 1.0),
                         NSSize::new((w - 16.0).max(0.0), *rh - 2.0),
                     );
+                    let radius = if minimal { 8.0 } else { 13.0 };
                     if *active {
-                        NSColor::labelColor().colorWithAlphaComponent(0.14).setFill();
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, 13.0, 13.0).fill();
+                        let sel = if minimal {
+                            srgb_alpha([255, 255, 255], 0.09)
+                        } else {
+                            NSColor::labelColor().colorWithAlphaComponent(0.14)
+                        };
+                        sel.setFill();
+                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, radius, radius).fill();
                     } else if hovered {
-                        NSColor::labelColor().colorWithAlphaComponent(0.07).setFill();
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, 13.0, 13.0).fill();
+                        let hov = if minimal {
+                            srgb_alpha([255, 255, 255], 0.055)
+                        } else {
+                            NSColor::labelColor().colorWithAlphaComponent(0.07)
+                        };
+                        hov.setFill();
+                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, radius, radius).fill();
                     }
 
                     // Agent or terminal glyph badge on left.
@@ -809,7 +841,9 @@ impl SidebarTreeView {
                         right_x = w - 26.0;
                     }
 
-                    let fg = if *active {
+                    let fg = if minimal {
+                        if *active { srgb_alpha([0xEE, 0xEE, 0xEF], 1.0) } else { srgb_alpha([0x98, 0x99, 0x9B], 1.0) }
+                    } else if *active {
                         NSColor::labelColor()
                     } else {
                         NSColor::labelColor().colorWithAlphaComponent(0.76)
@@ -936,6 +970,27 @@ define_class!(
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             let b = self.bounds();
+            let style = self.ivars().chrome.get();
+            if style.is_minimal() {
+                let tok = chrome_tokens(style, [0x17, 0x19, 0x1D]);
+                srgb_alpha(tok.chrome_bg, 1.0).setFill();
+                NSBezierPath::fillRect(b);
+
+                srgb_alpha(tok.hairline_rgb, tok.hairline_alpha as f64).setFill();
+                NSBezierPath::fillRect(NSRect::new(
+                    NSPoint::new(0.0, b.size.height - TOP_BAR_H),
+                    NSSize::new(b.size.width, 1.0),
+                ));
+                NSBezierPath::fillRect(NSRect::new(
+                    NSPoint::new(0.0, FOOTER_H),
+                    NSSize::new(b.size.width, 1.0),
+                ));
+                NSBezierPath::fillRect(NSRect::new(
+                    NSPoint::new(b.size.width - 1.0, 0.0),
+                    NSSize::new(1.0, b.size.height),
+                ));
+                return;
+            }
             // Subtle darker glass tint separating the sidebar from the terminal.
             NSColor::blackColor().colorWithAlphaComponent(0.16).setFill();
             NSBezierPath::fillRect(b);
@@ -1132,6 +1187,7 @@ define_class!(
 struct RootState {
     window: Cell<u64>,
     active_host: RefCell<String>,
+    chrome: Cell<ChromeStyle>,
 }
 
 /// Complete collapsible sidebar mounted beside `TachyonView`.
@@ -1240,6 +1296,13 @@ impl Sidebar {
         self.tree.rebuild_rows();
     }
 
+    pub fn set_chrome(&self, style: ChromeStyle) {
+        self.root_view.ivars().chrome.set(style);
+        self.tree.ivars().chrome.set(style);
+        self.root_view.setNeedsDisplay(true);
+        self.tree.setNeedsDisplay(true);
+    }
+
     pub fn set_hosts(&self, hosts: Vec<HostView>, active: Option<(String, String)>) {
         if let Some((ref h, _)) = active {
             *self.root_view.ivars().active_host.borrow_mut() = h.clone();
@@ -1320,6 +1383,15 @@ impl Sidebar {
         self.tree.ivars().scroll_y.set(0.0);
         self.tree.rebuild_rows();
     }
+}
+
+fn srgb_alpha(rgb: [u8; 3], alpha: f64) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(
+        rgb[0] as f64 / 255.0,
+        rgb[1] as f64 / 255.0,
+        rgb[2] as f64 / 255.0,
+        alpha,
+    )
 }
 
 fn symbol_button(

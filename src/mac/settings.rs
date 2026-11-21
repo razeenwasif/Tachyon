@@ -31,7 +31,7 @@ use objc2_foundation::{
 
 use super::host_mgr::HostStatus;
 use super::machines;
-use crate::config::{Config, PaneHeaders};
+use crate::config::{ChromeStyle, Config, PaneHeaders, ThemePreset};
 use crate::integrations;
 use crate::mux::default_socket_path;
 use crate::server;
@@ -550,6 +550,51 @@ define_class!(
             let _ = Config::update_default_key("shell.persist", if on { "true" } else { "false" });
             super::apply_settings_config(move |cfg| cfg.shell.persist = on);
             self.set_note("Saved `shell.persist` (applies to new shells).");
+            refresh_if_open();
+        }
+
+        #[unsafe(method(changeThemePreset:))]
+        fn change_theme_preset(&self, sender: Option<&AnyObject>) {
+            let idx = sender
+                .and_then(|s| s.downcast_ref::<NSPopUpButton>())
+                .map(|p| p.indexOfSelectedItem())
+                .unwrap_or(0);
+            let preset = match idx {
+                1 => ThemePreset::Obsidian,
+                _ => ThemePreset::Default,
+            };
+            super::apply_interface_theme_preset(preset);
+            self.set_note(&format!("Saved `theme.preset = {}`.", preset.as_str()));
+            refresh_if_open();
+        }
+
+        #[unsafe(method(changeChromeStyle:))]
+        fn change_chrome_style(&self, sender: Option<&AnyObject>) {
+            let idx = sender
+                .and_then(|s| s.downcast_ref::<NSPopUpButton>())
+                .map(|p| p.indexOfSelectedItem())
+                .unwrap_or(0);
+            let style = match idx {
+                1 => ChromeStyle::Herdr,
+                2 => ChromeStyle::Terminals,
+                3 => ChromeStyle::Core,
+                _ => ChromeStyle::Glass,
+            };
+            super::apply_interface_chrome(style);
+            self.set_note(&format!("Saved `window.chrome = {}`.", style.as_str()));
+            refresh_if_open();
+        }
+
+        #[unsafe(method(toggleStartFullscreen:))]
+        fn toggle_start_fullscreen(&self, sender: Option<&AnyObject>) {
+            let on = switch_is_on(sender);
+            let _ = Config::update_default_key("window.start_fullscreen", if on { "true" } else { "false" });
+            super::apply_settings_config(move |cfg| cfg.window.start_fullscreen = on);
+            self.set_note(if on {
+                "Tachyon will open in notch full screen on next launch."
+            } else {
+                "Tachyon will open windowed on launch (`window.start_fullscreen = false`)."
+            });
             refresh_if_open();
         }
 
@@ -1108,18 +1153,70 @@ impl SettingsWindow {
     fn build_interface(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
         let target: &AnyObject = self.actions.as_ref();
         let cfg = Config::load_default();
-        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 276.0)));
+        let row_h = 43.0;
+        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 402.0)));
 
-        let rows: [(&str, &str, bool, objc2::runtime::Sel); 5] = [
-            ("Show Multi-Host Sidebar", "Collapsible Liquid Glass sidebar (⌘B)", cfg.window.sidebar, sel!(toggleSidebarSetting:)),
+        // Theme Preset popup (row 0) & Chrome Style popup (row 1).
+        let popups: [(&str, &str, &[&str], isize, objc2::runtime::Sel); 2] = [
+            (
+                "Theme Preset",
+                "Dark colour palette (obsidian matches Herdr's low-glare charcoal)",
+                &["Default (Tachyon)", "Obsidian (Dark Minimal)"],
+                match cfg.theme_preset {
+                    ThemePreset::Default => 0,
+                    ThemePreset::Obsidian => 1,
+                },
+                sel!(changeThemePreset:),
+            ),
+            (
+                "Chrome Style",
+                "Window surface & chrome: Liquid Glass or opaque dark minimal presets",
+                &["Liquid Glass (Default)", "Herdr (Dark Minimal)", "Terminals (Pill Tabs)", "Core (Zero Chrome)"],
+                match cfg.window.chrome {
+                    ChromeStyle::Glass => 0,
+                    ChromeStyle::Herdr => 1,
+                    ChromeStyle::Terminals => 2,
+                    ChromeStyle::Core => 3,
+                },
+                sel!(changeChromeStyle:),
+            ),
+        ];
+
+        for (i, (title, sub, items, sel_idx, action)) in popups.iter().enumerate() {
+            let ry = 12.0 + i as f64 * row_h;
+            let pt = label(mtm, title, 12.5, true, &NSColor::labelColor());
+            pt.setFrame(NSRect::new(NSPoint::new(14.0, ry), NSSize::new(w - 184.0, 16.0)));
+            let pd = label(mtm, sub, 11.0, false, &NSColor::secondaryLabelColor());
+            pd.setFrame(NSRect::new(NSPoint::new(14.0, ry + 17.0), NSSize::new(w - 184.0, 15.0)));
+            let popup = NSPopUpButton::initWithFrame_pullsDown(
+                NSPopUpButton::alloc(mtm),
+                NSRect::new(NSPoint::new(w - 166.0, ry + 4.0), NSSize::new(152.0, 24.0)),
+                false,
+            );
+            for item_title in *items {
+                popup.addItemWithTitle(&NSString::from_str(item_title));
+            }
+            popup.selectItemAtIndex(*sel_idx);
+            unsafe {
+                popup.setTarget(Some(target));
+                popup.setAction(Some(*action));
+            }
+            card.addSubview(&pt);
+            card.addSubview(&pd);
+            card.addSubview(&popup);
+        }
+
+        let rows: [(&str, &str, bool, objc2::runtime::Sel); 6] = [
+            ("Show Multi-Host Sidebar", "Collapsible sidebar (⌘B)", cfg.window.sidebar, sel!(toggleSidebarSetting:)),
             ("Show Standard Title Bar", "Off uses Tachyon's edge-to-edge layout", cfg.window.title_bar, sel!(toggleTitleBarSetting:)),
             ("Bottom Shortcut Hints Band", "Contextual shortcuts & footer tool icons", cfg.window.hints, sel!(toggleHintsSetting:)),
             ("Host Accent & Danger Tint", "Subtle glass tint, top edge hairline & badge per remote/SSH host", cfg.window.host_tint, sel!(toggleHostTintSetting:)),
+            ("Open in Full Screen at Launch", "Start in notch full screen on open (`window.start_fullscreen`)", cfg.window.start_fullscreen, sel!(toggleStartFullscreen:)),
             ("Persist Shells Across Quits", "Run shells inside Tachyon's background server", cfg.shell.persist, sel!(togglePersistSetting:)),
         ];
 
         for (i, (title, sub, val, action)) in rows.iter().enumerate() {
-            let ry = 12.0 + i as f64 * 44.0;
+            let ry = 12.0 + (i + 2) as f64 * row_h;
             let t = label(mtm, title, 12.5, true, &NSColor::labelColor());
             t.setFrame(NSRect::new(NSPoint::new(14.0, ry), NSSize::new(w - 86.0, 16.0)));
             let d = label(mtm, sub, 11.0, false, &NSColor::secondaryLabelColor());
@@ -1131,8 +1228,8 @@ impl SettingsWindow {
             card.addSubview(&sw);
         }
 
-        // Pane headers mode popup.
-        let ry = 12.0 + 5.0 * 44.0;
+        // Pane headers mode popup (row 8).
+        let ry = 12.0 + 8.0 * row_h;
         let pt = label(mtm, "Per-Pane Header Bars", 12.5, true, &NSColor::labelColor());
         pt.setFrame(NSRect::new(NSPoint::new(14.0, ry), NSSize::new(w - 160.0, 16.0)));
         let pd = label(mtm, "Optional title, OSC 7501 status pill & host badge (off by default)", 11.0, false, &NSColor::secondaryLabelColor());
@@ -1159,7 +1256,7 @@ impl SettingsWindow {
         card.addSubview(&popup);
 
         self.detail.addSubview(&card);
-        *y += 292.0;
+        *y += 418.0;
     }
 
     fn build_notifications(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {

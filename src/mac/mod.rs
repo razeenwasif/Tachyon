@@ -87,7 +87,7 @@ use objc2_quartz_core::{
 };
 use parking_lot::Mutex;
 
-use crate::config::{Appearance, Backdrop, Config, Contrast, OptionAsMeta, PaneHeaders, ThemeConfig};
+use crate::config::{Appearance, Backdrop, ChromeStyle, Config, Contrast, OptionAsMeta, PaneHeaders, ThemeConfig, ThemePreset};
 use crate::term::jobs::JobRef;
 use crate::term::rewind::RewindLog;
 use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
@@ -2331,8 +2331,11 @@ struct TermWindow {
     /// tab is asking for a password.
     secure: bool,
     /// The two themes and which to use; `apply_appearance` picks one.
+    theme_dark_base: ThemeConfig,
     theme_dark: ThemeConfig,
     theme_light: ThemeConfig,
+    theme_preset: ThemePreset,
+    chrome_style: ChromeStyle,
     appearance: Appearance,
     /// Use the high-contrast themes: always, never, or with Increase
     /// Contrast.
@@ -2790,12 +2793,18 @@ impl TermWindow {
     }
 
     /// Use the light or dark theme to match the system (or the setting), with
-    /// the system accent colour where the theme asks for it.
+    /// the system accent colour where the theme asks for it, plus `theme.preset`
+    /// and `window.chrome` dark minimal overrides.
     fn apply_appearance(&mut self) {
-        let dark = match self.appearance {
-            Appearance::Dark => true,
-            Appearance::Light => false,
-            Appearance::Auto => appearance_is_dark(&self.view),
+        let minimal = self.chrome_style.is_minimal();
+        let dark = if minimal {
+            true
+        } else {
+            match self.appearance {
+                Appearance::Dark => true,
+                Appearance::Light => false,
+                Appearance::Auto => appearance_is_dark(&self.view),
+            }
         };
         let high = match self.contrast {
             Contrast::High => true,
@@ -2803,6 +2812,10 @@ impl TermWindow {
             Contrast::Auto => NSWorkspace::sharedWorkspace().accessibilityDisplayShouldIncreaseContrast(),
         };
         let mut theme = if dark { self.theme_dark.clone() } else { self.theme_light.clone() };
+        let tokens = renderer::chrome_tokens(self.chrome_style, theme.background);
+        if let Some(bg) = tokens.pane_bg_override {
+            theme.background = bg;
+        }
         if high {
             theme = theme.high_contrast(dark);
         }
@@ -2816,22 +2829,53 @@ impl TermWindow {
                 }
             }
         }
-        if !self.glass {
-            self.window.setBackgroundColor(Some(&srgb_color(theme.background, 1.0)));
-        }
-        let alpha = if high { 1.0 } else { self.glass_tint as f64 };
-        self.base_glass_bg = theme.background;
-        self.base_glass_alpha = alpha;
-        self.applied_host_tint = None;
-        if let Some(glass) = &self.host_glass {
-            // Increase Contrast: the glass keeps its shape and edge, but the
-            // text sits on a solid background, as macOS does with its own
-            // materials.
-            let tint = (alpha > 0.0).then(|| srgb_color(theme.background, alpha));
-            glass.setTintColor(tint.as_deref());
+
+        let app_name = if minimal {
+            Some(unsafe { NSAppearanceNameDarkAqua })
+        } else {
+            match self.appearance {
+                Appearance::Dark => Some(unsafe { NSAppearanceNameDarkAqua }),
+                Appearance::Light => Some(unsafe { NSAppearanceNameAqua }),
+                Appearance::Auto => None,
+            }
+        };
+        self.window.setAppearance(app_name.and_then(NSAppearance::appearanceNamed).as_deref());
+
+        self.renderer.set_chrome(self.chrome_style);
+        if let Some(sb) = &self.sidebar {
+            sb.set_chrome(self.chrome_style);
         }
         if let Some(cap) = &self.capsule {
-            cap.set_tint(None);
+            cap.set_chrome(self.chrome_style);
+        }
+
+        if minimal {
+            let alpha = 1.0;
+            self.base_glass_bg = tokens.chrome_bg;
+            self.base_glass_alpha = alpha;
+            self.applied_host_tint = None;
+            self.window.setBackgroundColor(Some(&srgb_color(tokens.chrome_bg, 1.0)));
+            if let Some(glass) = &self.host_glass {
+                glass.setTintColor(Some(&srgb_color(tokens.chrome_bg, 1.0)));
+            }
+        } else {
+            if !self.glass {
+                self.window.setBackgroundColor(Some(&srgb_color(theme.background, 1.0)));
+            }
+            let alpha = if high { 1.0 } else { self.glass_tint as f64 };
+            self.base_glass_bg = theme.background;
+            self.base_glass_alpha = alpha;
+            self.applied_host_tint = None;
+            if let Some(glass) = &self.host_glass {
+                // Increase Contrast: the glass keeps its shape and edge, but the
+                // text sits on a solid background, as macOS does with its own
+                // materials.
+                let tint = (alpha > 0.0).then(|| srgb_color(theme.background, alpha));
+                glass.setTintColor(tint.as_deref());
+            }
+            if let Some(cap) = &self.capsule {
+                cap.set_tint(None);
+            }
         }
         self.renderer.set_theme(&theme);
         self.cursor_shown = None;
@@ -2897,6 +2941,22 @@ impl TermWindow {
         }
         self.applied_host_tint = want;
         let strength = self.host_tint_strength.clamp(0.0, 2.0);
+        let minimal = self.chrome_style.is_minimal();
+        if minimal {
+            if let Some(glass) = &self.host_glass {
+                let bg = match want {
+                    Some(hc) if hc.danger && strength > 0.0 => {
+                        mix_rgb(self.base_glass_bg, hc.rgb, (0.14 * strength).clamp(0.0, 0.25))
+                    }
+                    _ => self.base_glass_bg,
+                };
+                glass.setTintColor(Some(&srgb_color(bg, 1.0)));
+            }
+            if let Some(cap) = &self.capsule {
+                cap.set_chrome(self.chrome_style);
+            }
+            return;
+        }
         if let Some(glass) = &self.host_glass {
             let alpha = self.base_glass_alpha;
             let tinted_bg = match want {
@@ -4691,7 +4751,9 @@ impl TermWindow {
     fn place_capsule(&mut self, show: bool) {
         if show && self.capsule.is_none() {
             if let Some(mtm) = MainThreadMarker::new() {
-                self.capsule = Some(strip::Capsule::new(mtm, &self.view, self.id));
+                let cap = strip::Capsule::new(mtm, &self.view, self.id);
+                cap.set_chrome(self.chrome_style);
+                self.capsule = Some(cap);
             }
         }
         if let Some(c) = &self.capsule {
@@ -6420,7 +6482,7 @@ impl App {
         cursor_layer.setHidden(true);
         layer.addSublayer(&cursor_layer);
         let mut renderer_cfg = cfg.clone();
-        if !glass {
+        if !glass || cfg.window.chrome.is_minimal() {
             renderer_cfg.window.opacity = 1.0;
         }
         let renderer = Renderer::new(Rc::clone(&self.gpu), layer, &renderer_cfg, scale as f32)?;
@@ -6443,7 +6505,11 @@ impl App {
         container.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
-        let sidebar = (!quick).then(|| sidebar::Sidebar::new(mtm, &container, id));
+        let sidebar = (!quick).then(|| {
+            let sb = sidebar::Sidebar::new(mtm, &container, id);
+            sb.set_chrome(cfg.window.chrome);
+            sb
+        });
         container.addSubview(&view);
 
         let mut host_glass = None;
@@ -6508,8 +6574,15 @@ impl App {
             base_font_size: cfg.font.size,
             notify_after: (cfg.macos.notify_after_secs > 0).then(|| Duration::from_secs(cfg.macos.notify_after_secs)),
             secure: false,
+            theme_dark_base: if cfg.theme_preset == ThemePreset::Default {
+                cfg.theme.clone()
+            } else {
+                ThemeConfig::default()
+            },
             theme_dark: cfg.theme.clone(),
             theme_light: cfg.theme_light.clone(),
+            theme_preset: cfg.theme_preset,
+            chrome_style: cfg.window.chrome,
             appearance: cfg.appearance,
             contrast: cfg.contrast,
             glass,
@@ -7727,6 +7800,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // SAFETY: storing an NSString value under an NSString key.
     let cfg_title_bar = cfg.window.title_bar;
     let cfg_notch = cfg.window.notch_full_screen;
+    let cfg_start_fullscreen = cfg.window.start_fullscreen;
     set_double_click_action(cfg_title_bar);
     build_menu(mtm, &app);
 
@@ -7788,8 +7862,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     if !restore_mux_local_window(mtm) && !restore_sessions(mtm) {
         open_window();
     }
-    // Open around the notch, when that's what full screen means here.
-    if cfg_notch {
+    // Open around the notch at launch only when `window.start_fullscreen = true`.
+    if cfg_notch && cfg_start_fullscreen {
         let key = with_app(|app| {
             let keyw = app.windows.iter().position(|w| w.window.isKeyWindow()).unwrap_or(0);
             app.windows.get(keyw).map(|w| w.id)
@@ -7911,6 +7985,82 @@ fn apply_interface_host_tint(on: bool) {
             w.apply_appearance();
             w.sync_sidebar();
             w.request_redraw();
+        }
+    });
+}
+
+pub(super) fn apply_interface_theme_preset(preset: ThemePreset) {
+    let _ = Config::update_default_key("theme.preset", preset.as_str());
+    with_app(|app| {
+        app.cfg.theme_preset = preset;
+        let dark_theme = match preset {
+            ThemePreset::Default => {
+                app.windows
+                    .first()
+                    .map(|w| w.theme_dark_base.clone())
+                    .unwrap_or_else(ThemeConfig::default)
+            }
+            ThemePreset::Obsidian => ThemeConfig::obsidian(),
+        };
+        app.cfg.theme = dark_theme.clone();
+        for w in &mut app.windows {
+            w.theme_preset = preset;
+            w.theme_dark = match preset {
+                ThemePreset::Default => w.theme_dark_base.clone(),
+                ThemePreset::Obsidian => ThemeConfig::obsidian(),
+            };
+            w.apply_appearance();
+        }
+    });
+}
+
+pub(super) fn apply_interface_chrome(style: ChromeStyle) {
+    let _ = Config::update_default_key("window.chrome", style.as_str());
+    with_app(|app| {
+        app.cfg.window.chrome = style;
+        for w in &mut app.windows {
+            w.chrome_style = style;
+            w.apply_appearance();
+            w.layout();
+        }
+    });
+}
+
+pub(super) fn apply_appearance_bundle(preset: ThemePreset, chrome: ChromeStyle, sidebar: Option<bool>) {
+    let _ = Config::update_default_key("theme.preset", preset.as_str());
+    let _ = Config::update_default_key("window.chrome", chrome.as_str());
+    if let Some(sb) = sidebar {
+        let _ = Config::update_default_key("window.sidebar", if sb { "true" } else { "false" });
+    }
+    with_app(|app| {
+        app.cfg.theme_preset = preset;
+        app.cfg.window.chrome = chrome;
+        if let Some(sb) = sidebar {
+            app.cfg.window.sidebar = sb;
+        }
+        let dark_theme = match preset {
+            ThemePreset::Default => app
+                .windows
+                .first()
+                .map(|w| w.theme_dark_base.clone())
+                .unwrap_or_else(ThemeConfig::default),
+            ThemePreset::Obsidian => ThemeConfig::obsidian(),
+        };
+        app.cfg.theme = dark_theme;
+        for w in &mut app.windows {
+            w.theme_preset = preset;
+            w.theme_dark = match preset {
+                ThemePreset::Default => w.theme_dark_base.clone(),
+                ThemePreset::Obsidian => ThemeConfig::obsidian(),
+            };
+            w.chrome_style = chrome;
+            if let Some(sb) = sidebar {
+                if !w.quick && w.sidebar.is_some() {
+                    w.sidebar_open = sb;
+                }
+            }
+            w.apply_appearance();
+            w.layout();
         }
     });
 }
