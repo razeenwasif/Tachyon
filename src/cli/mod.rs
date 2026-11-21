@@ -39,7 +39,8 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 continue;
             }
             "server" | "bridge" | "hosts" | "ls" | "new" | "session" | "window" | "split"
-            | "run" | "send" | "capture" | "events" | "help" | "--help" | "-h" => {
+            | "run" | "send" | "capture" | "events" | "skill" | "status" | "hook" | "help"
+            | "--help" | "-h" => {
                 return true;
             }
             _ => return false,
@@ -116,6 +117,9 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "send" => cmd_send(&opts, tail),
         "capture" => cmd_capture(&opts, tail),
         "events" => cmd_events(&opts, tail),
+        "skill" => cmd_skill(&opts, tail),
+        "status" => cmd_status(tail),
+        "hook" => cmd_hook(tail),
         other => Err(format!("unknown command `{other}` (try `tachyon help`)")),
     }
 }
@@ -1057,6 +1061,211 @@ fn cmd_events(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+fn cmd_skill(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    use crate::integrations::{self, AgentKind};
+    let sub = args.first().map(String::as_str).unwrap_or("status");
+    let home = integrations::user_home();
+    let cfg = crate::config::Config::load_default();
+
+    match sub {
+        "status" | "ls" => {
+            let statuses = integrations::inspect_all(&home);
+            if opts.json {
+                print_json(&json!({
+                    "auto_name_sessions": cfg.agents.auto_name_sessions,
+                    "agents": statuses.iter().map(|s| s.to_json()).collect::<Vec<_>>(),
+                }));
+            } else {
+                println!(
+                    "Auto-name sessions: {}",
+                    if cfg.agents.auto_name_sessions { "on" } else { "off" }
+                );
+                for s in statuses {
+                    let det = if s.detected { "detected" } else { "not found" };
+                    let inst = if s.skill_installed { "skill ✓" } else { "skill —" };
+                    let hooks = if s.settings_path.is_some() {
+                        if s.hooks_installed { ", hooks ✓" } else { ", hooks —" }
+                    } else {
+                        ""
+                    };
+                    println!("{:<12} {:<10} {inst}{hooks}", s.name, det);
+                }
+            }
+            Ok(0)
+        }
+        "setup" | "install" => {
+            let mut agent: Option<AgentKind> = None;
+            let mut all = false;
+            let mut auto_name = cfg.agents.auto_name_sessions;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--agent" | "-a" => {
+                        let name = args.get(i + 1).ok_or("--agent requires claude|antigravity|codex|opencode|pi|all")?;
+                        if name.eq_ignore_ascii_case("all") {
+                            all = true;
+                        } else {
+                            agent = Some(
+                                AgentKind::parse(name)
+                                    .ok_or_else(|| format!("unknown agent `{name}`"))?,
+                            );
+                        }
+                        i += 2;
+                    }
+                    "--auto-name" => {
+                        auto_name = true;
+                        i += 1;
+                    }
+                    "--no-auto-name" => {
+                        auto_name = false;
+                        i += 1;
+                    }
+                    other => return Err(format!("unknown skill setup option `{other}`")),
+                }
+            }
+            let _ = crate::config::Config::update_default_key(
+                "agents.auto_name_sessions",
+                if auto_name { "true" } else { "false" },
+            );
+            let statuses = if all {
+                for &k in &AgentKind::ALL {
+                    integrations::setup_agent(&home, k, auto_name).map_err(|e| e.to_string())?;
+                }
+                integrations::inspect_all(&home)
+            } else if let Some(k) = agent {
+                integrations::setup_agent(&home, k, auto_name).map_err(|e| e.to_string())?;
+                integrations::inspect_all(&home)
+            } else {
+                integrations::setup_all_detected(&home, auto_name).map_err(|e| e.to_string())?
+            };
+            if opts.json {
+                print_json(&json!({
+                    "auto_name_sessions": auto_name,
+                    "agents": statuses.iter().map(|s| s.to_json()).collect::<Vec<_>>(),
+                }));
+            } else {
+                for s in statuses.iter().filter(|s| s.skill_installed) {
+                    println!("installed {} skill -> {}", s.name, s.skill_path.display());
+                    if s.hooks_installed {
+                        if let Some(p) = &s.settings_path {
+                            println!("installed {} hooks -> {}", s.name, p.display());
+                        }
+                    }
+                }
+            }
+            Ok(0)
+        }
+        "remove" | "uninstall" => {
+            let mut agent: Option<AgentKind> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--agent" | "-a" => {
+                        let name = args.get(i + 1).ok_or("--agent requires claude|antigravity|codex|opencode|pi")?;
+                        agent = Some(
+                            AgentKind::parse(name)
+                                .ok_or_else(|| format!("unknown agent `{name}`"))?,
+                        );
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown skill remove option `{other}`")),
+                }
+            }
+            let statuses = if let Some(k) = agent {
+                integrations::remove_agent(&home, k).map_err(|e| e.to_string())?;
+                integrations::inspect_all(&home)
+            } else {
+                integrations::remove_all(&home).map_err(|e| e.to_string())?
+            };
+            if opts.json {
+                print_json(&json!({
+                    "agents": statuses.iter().map(|s| s.to_json()).collect::<Vec<_>>(),
+                }));
+            } else {
+                println!("removed Tachyon agent skills and hooks");
+            }
+            Ok(0)
+        }
+        other => Err(format!("unknown skill subcommand `{other}` (use status, setup, or remove)")),
+    }
+}
+
+fn cmd_status(args: &[String]) -> Result<i32, String> {
+    use crate::term::{ProgramState, ProgramStatus};
+    let mut state: Option<ProgramState> = None;
+    let mut clear = false;
+    let mut app: Option<String> = None;
+    let mut kind: Option<String> = None;
+    let mut msg: Option<String> = None;
+    let mut label: Option<String> = None;
+    let mut use_tty = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "clear" => {
+                clear = true;
+                i += 1;
+            }
+            "--state" | "-s" => {
+                let v = args.get(i + 1).ok_or("--state requires idle|working|blocked|done|error|clear")?;
+                if v.eq_ignore_ascii_case("clear") {
+                    clear = true;
+                } else {
+                    state = Some(
+                        ProgramState::parse(v)
+                            .ok_or_else(|| format!("unknown status state `{v}`"))?,
+                    );
+                }
+                i += 2;
+            }
+            "--app" => {
+                app = Some(args.get(i + 1).ok_or("--app requires a name")?.clone());
+                i += 2;
+            }
+            "--kind" => {
+                kind = Some(args.get(i + 1).ok_or("--kind requires a value")?.clone());
+                i += 2;
+            }
+            "--msg" | "-m" => {
+                msg = Some(args.get(i + 1).ok_or("--msg requires text")?.clone());
+                i += 2;
+            }
+            "--label" => {
+                label = Some(args.get(i + 1).ok_or("--label requires text")?.clone());
+                i += 2;
+            }
+            "--tty" => {
+                use_tty = true;
+                i += 1;
+            }
+            other => {
+                if let Some(st) = ProgramState::parse(other) {
+                    state = Some(st);
+                    i += 1;
+                } else {
+                    return Err(format!("unknown status option `{other}`"));
+                }
+            }
+        }
+    }
+
+    if clear {
+        crate::integrations::emit_osc_7501(None, use_tty).map_err(|e| e.to_string())?;
+        return Ok(0);
+    }
+    let state = state.ok_or("specify --state <idle|working|blocked|done|error|clear>")?;
+    let st = ProgramStatus { state, app, kind, msg, label };
+    crate::integrations::emit_osc_7501(Some(&st), use_tty).map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+fn cmd_hook(args: &[String]) -> Result<i32, String> {
+    let agent = args.first().map(String::as_str).unwrap_or("agent");
+    let event = args.get(1).map(String::as_str).unwrap_or("working");
+    Ok(crate::integrations::run_hook(agent, event))
+}
+
 const HELP: &str = "\
 Tachyon — GPU-accelerated multi-host multiplexer terminal
 
@@ -1084,6 +1293,11 @@ Sessions, Windows & Automation:
   tachyon send [-b B] [--enter] <TEXT | ->
   tachyon capture [-b B] [--lines N] [--ansi]
   tachyon events [-s SESSION] [--json]
+
+Coding Agents & Live Status (OSC 7501):
+  tachyon skill status|setup|remove         manage Claude Code, Antigravity, Codex, OpenCode & Pi skills/hooks
+  tachyon status --state S [--app A] [--msg M] [--tty]
+  tachyon hook <agent> <event>              internal hook entrypoint for coding agents
 
 Global flags:
   -S, --server <host>   target host alias or ssh://... URI (default: $TACHYON_SERVER or local)

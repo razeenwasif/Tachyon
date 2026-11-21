@@ -78,10 +78,10 @@ window.padding_y = 6.0
 # window.fullscreen = native
 
 # macOS: collapsible Rex-style multi-host sidebar (`⌘B` toggles at runtime)
-# and per-pane header bars (`always`, `auto`, or `never`).
+# and optional minimal per-pane header strip (`never` by default, or `auto`/`always`).
 # window.sidebar       = true
 # window.sidebar_width = 240
-# window.pane_headers  = always
+# window.pane_headers  = never
 
 # macOS: Liquid Glass's style. clear (the default) is less frosted and bends
 # more of what's behind at its edges; regular frosts it more and adapts its
@@ -185,6 +185,14 @@ theme.bold_is_bright = false
 # another app or window posts a notification with its receipt; clicking it
 # brings its tab to the front. 0 turns notifications off.
 # notify.after = 10
+
+# macOS: post notifications when an unfocused local or remote coding agent
+# transitions to blocked, done, or error (OSC 7501).
+# notify.agent_status = true
+
+# Coding agent integrations (`tachyon skill setup` / Settings > Integrations):
+# let coding agents rename auto-generated sessions after the task they're doing.
+# agents.auto_name_sessions = true
 
 # ---------------------------------------------------------------------------
 # Shell

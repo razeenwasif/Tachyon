@@ -115,6 +115,43 @@ fn cli_end_to_end_server_sessions_splits_run_capture_and_bridge() {
     let snap: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(snap["sessions"][0]["name"], "renamed-work");
 
+    // 5.5. Emit OSC 7501 status inside a managed block and verify `ls --json` reports it.
+    let status_cmd = format!(
+        "'{}' status --state blocked --app claude --msg 'Approve tool' && sleep 5",
+        bin()
+    );
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["new", "agent-test", "--json", "--", "/bin/sh", "-c", &status_cmd],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let agent_created: Value = serde_json::from_str(&out).unwrap();
+    let agent_bid = agent_created["block"]["id"].as_str().unwrap().to_string();
+    let mut saw_status = false;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(60));
+        let (c, ls_out, _) = run_cli(&sock, &hosts, &["ls", "--json"]);
+        if c == 0 {
+            let ls_json: Value = serde_json::from_str(&ls_out).unwrap();
+            if let Some(blk) = ls_json["blocks"]
+                .as_array()
+                .and_then(|arr| arr.iter().find(|b| b["id"] == agent_bid))
+            {
+                if blk["status"]["state"] == "blocked"
+                    && blk["status"]["app"] == "claude"
+                    && blk["status"]["msg"] == "Approve tool"
+                {
+                    saw_status = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(saw_status, "expected OSC 7501 blocked status in tachyon ls --json");
+    let (code, _, err) = run_cli(&sock, &hosts, &["session", "kill", "agent-test"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
     // 6. Verify `tachyon bridge` relays live Mux v2 frames cleanly over stdio.
     let mut bridge = Command::new(bin())
         .args(["bridge", "--socket"])

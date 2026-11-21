@@ -38,6 +38,9 @@ impl Term {
         if let (Some(title), true) = (&self.title, title_live) {
             let _ = write!(out, "\x1b]2;{}\x07", title.replace(['\x07', '\x1b'], ""));
         }
+        if let Some(status) = &self.program_status {
+            out.push_str(&status.encode_osc_7501());
+        }
 
         // The shell's screen, with its scrollback, and its marks.
         let primary = if alt { &self.inactive } else { &self.grid };
@@ -392,5 +395,21 @@ mod tests {
         assert_eq!(exits(&t), exits(&r));
         assert!(r.commands.values().all(|c| c.started.is_none()), "no made-up times");
         assert!(r.take_command_events().is_empty(), "nothing to notify about");
+    }
+
+    #[test]
+    fn program_status_round_trips_through_to_vt() {
+        use crate::term::{ProgramState, ProgramStatus};
+        let mut t = Term::new(40, 8, 100);
+        let expected = ProgramStatus {
+            state: ProgramState::Working,
+            app: Some("claude".into()),
+            kind: Some("agent".into()),
+            msg: Some("Refactoring auth.rs".into()),
+            label: Some("Coding".into()),
+        };
+        feed(&mut t, &expected.encode_osc_7501());
+        let r = restored(&t);
+        assert_eq!(r.program_status, Some(expected));
     }
 }

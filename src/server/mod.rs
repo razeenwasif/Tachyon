@@ -90,6 +90,7 @@ fn serve_connection(state: Arc<ServerState>, mut reader: std::os::unix::net::Uni
         .name(format!("tachyon-mux-wr-{}", outbox.id))
         .spawn(move || writer_loop(&writer_state, &writer_outbox, &mut writer));
 
+    let mut wake_shutdown = false;
     loop {
         let frame = match proto::read_frame(&mut reader) {
             Ok(f) => f,
@@ -98,10 +99,9 @@ fn serve_connection(state: Arc<ServerState>, mut reader: std::os::unix::net::Uni
         match frame.kind {
             FrameKind::RpcReq => {
                 if let Ok(req) = frame.parse_json() {
-                    let want_shutdown = state.handle_rpc(&outbox, frame.channel, &req);
-                    if want_shutdown {
-                        // Poke the accept loop so it wakes up and exits cleanly.
-                        let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+                    if state.handle_rpc(&outbox, frame.channel, &req) {
+                        wake_shutdown = true;
+                        break;
                     }
                 }
             }
@@ -125,6 +125,10 @@ fn serve_connection(state: Arc<ServerState>, mut reader: std::os::unix::net::Uni
     state.unregister_client(&outbox);
     if let Ok(handle) = writer_thread {
         let _ = handle.join();
+    }
+    if wake_shutdown {
+        // Poke the accept loop only after the shutdown RpcRes has been flushed.
+        let _ = std::os::unix::net::UnixStream::connect(&socket_path);
     }
 }
 

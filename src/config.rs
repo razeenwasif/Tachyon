@@ -167,7 +167,7 @@ impl Default for WindowConfig {
             hints: true,
             sidebar: cfg!(target_os = "macos"),
             sidebar_width: 240.0,
-            pane_headers: if cfg!(target_os = "macos") { PaneHeaders::Always } else { PaneHeaders::Never },
+            pane_headers: PaneHeaders::Never,
             opacity_explicit: false,
         }
     }
@@ -401,12 +401,30 @@ pub enum OptionAsMeta {
 }
 
 #[derive(Clone, Debug)]
+pub struct AgentsConfig {
+    /// Allow integrated coding agents (Claude Code, Codex, OpenCode, Pi) to
+    /// rename sessions after the task they're working on.
+    pub auto_name_sessions: bool,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        AgentsConfig {
+            auto_name_sessions: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct MacConfig {
     pub option_as_meta: OptionAsMeta,
     /// A command that ran at least this long, and finished while you were
     /// looking elsewhere, posts a notification with its receipt. 0 turns
     /// notifications off.
     pub notify_after_secs: u64,
+    /// Post macOS notifications when an unfocused local or remote coding agent
+    /// transitions to `blocked`, `done`, or `error` (OSC 7501).
+    pub notify_agent_status: bool,
     /// Fairy, the assistant: her button at the bottom right, and where her
     /// socket is (empty for where she keeps it).
     pub fairy: bool,
@@ -422,7 +440,16 @@ pub struct MacConfig {
 
 impl Default for MacConfig {
     fn default() -> Self {
-        MacConfig { option_as_meta: OptionAsMeta::default(), notify_after_secs: 10, fairy: true, fairy_socket: String::new(), editor: "auto".into(), quick_hotkey: "ctrl+`".into(), monitor: true }
+        MacConfig {
+            option_as_meta: OptionAsMeta::default(),
+            notify_after_secs: 10,
+            notify_agent_status: true,
+            fairy: true,
+            fairy_socket: String::new(),
+            editor: "auto".into(),
+            quick_hotkey: "ctrl+`".into(),
+            monitor: true,
+        }
     }
 }
 
@@ -440,6 +467,7 @@ pub struct Config {
     /// ones, when Increase Contrast is on.
     pub contrast: Contrast,
     pub shell: ShellConfig,
+    pub agents: AgentsConfig,
     pub macos: MacConfig,
     pub scrollback: usize,
     /// Diagnostics produced while loading, surfaced by the caller.
@@ -457,6 +485,7 @@ impl Default for Config {
             appearance: Appearance::default(),
             contrast: Contrast::default(),
             shell: ShellConfig::default(),
+            agents: AgentsConfig::default(),
             macos: MacConfig::default(),
             scrollback: 10_000,
             warnings: Vec::new(),
@@ -480,6 +509,46 @@ impl Config {
             Some(p) if p.exists() => Config::load(&p),
             _ => Config::default(),
         }
+    }
+
+    /// Update (or append) a single `key = value` line in the user's default
+    /// `tachyon.conf`, preserving existing comments and unrelated settings.
+    pub fn update_default_key(key: &str, value: &str) -> std::io::Result<()> {
+        let path = Config::default_path().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve config path")
+        })?;
+        Config::update_key_in_file(&path, key, value)
+    }
+
+    /// Update (or append) a single `key = value` line in `path`.
+    pub fn update_key_in_file(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let existing = fs::read_to_string(path).unwrap_or_default();
+        let mut lines: Vec<String> = Vec::new();
+        let mut replaced = false;
+        for raw in existing.lines() {
+            let trimmed = strip_comment(raw).trim();
+            if let Some((k, _)) = trimmed.split_once('=') {
+                if k.trim() == key {
+                    if !replaced {
+                        lines.push(format!("{key} = {value}"));
+                        replaced = true;
+                    }
+                    continue;
+                }
+            }
+            lines.push(raw.to_string());
+        }
+        if !replaced {
+            lines.push(format!("{key} = {value}"));
+        }
+        let mut out = lines.join("\n");
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        fs::write(path, out)
     }
 
     pub fn load(path: &Path) -> Config {
@@ -657,6 +726,8 @@ impl Config {
             "shell.integration" => self.shell.integration = parse_bool(value)?,
             "shell.persist" => self.shell.persist = parse_bool(value)?,
             "shell.suggestions" => self.shell.suggestions = parse_bool(value)?,
+            "agents.auto_name_sessions" => self.agents.auto_name_sessions = parse_bool(value)?,
+            "notify.agent_status" => self.macos.notify_agent_status = parse_bool(value)?,
             "window.hints" => self.window.hints = parse_bool(value)?,
             "window.sidebar" => self.window.sidebar = parse_bool(value)?,
             "window.sidebar_width" => self.window.sidebar_width = parse_f32(value, 180.0, 360.0)?,
@@ -958,7 +1029,7 @@ mod contrast_tests {
         let mut c = Config::default();
         if cfg!(target_os = "macos") {
             assert!(c.window.sidebar);
-            assert_eq!(c.window.pane_headers, PaneHeaders::Always);
+            assert_eq!(c.window.pane_headers, PaneHeaders::Never);
         }
         assert_eq!(c.window.sidebar_width, 240.0);
 
@@ -979,5 +1050,36 @@ mod contrast_tests {
         c.set("window.pane_headers", "always").unwrap();
         assert_eq!(c.window.pane_headers, PaneHeaders::Always);
         assert!(c.set("window.pane_headers", "sometimes").is_err());
+
+        assert!(c.agents.auto_name_sessions);
+        assert!(c.macos.notify_agent_status);
+        c.set("agents.auto_name_sessions", "false").unwrap();
+        c.set("notify.agent_status", "off").unwrap();
+        assert!(!c.agents.auto_name_sessions);
+        assert!(!c.macos.notify_agent_status);
+    }
+
+    #[test]
+    fn update_key_in_file_preserves_comments_and_other_keys() {
+        let dir = std::env::temp_dir().join(format!("tachyon-cfg-upd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("tachyon.conf");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "# My config\nfont.size = 13\nwindow.sidebar = true # keep\n").unwrap();
+
+        Config::update_key_in_file(&path, "window.sidebar", "false").unwrap();
+        Config::update_key_in_file(&path, "agents.auto_name_sessions", "false").unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# My config"));
+        assert!(text.contains("font.size = 13"));
+        assert!(text.contains("window.sidebar = false"));
+        assert!(text.contains("agents.auto_name_sessions = false"));
+        let parsed = Config::load(&path);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert!(!parsed.window.sidebar);
+        assert!(!parsed.agents.auto_name_sessions);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
