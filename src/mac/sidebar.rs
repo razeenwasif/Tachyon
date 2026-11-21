@@ -306,6 +306,7 @@ impl SidebarTreeView {
         state.window.set(window);
         let this = Self::alloc(mtm).set_ivars(state);
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        view.setClipsToBounds(true);
         let tracking = unsafe {
             NSTrackingArea::initWithRect_options_owner_userInfo(
                 NSTrackingArea::alloc(),
@@ -511,6 +512,7 @@ impl SidebarTreeView {
 
     fn draw(&self) {
         let b = self.bounds();
+        NSBezierPath::clipRect(b);
         let w = b.size.width;
         let scroll = self.ivars().scroll_y.get();
         let hover = self.ivars().hover.get();

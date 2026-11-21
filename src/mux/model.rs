@@ -235,6 +235,7 @@ impl BlockInfo {
         if let Some(app) = self.status.as_ref().and_then(|s| s.app.as_deref()).filter(|s| !s.is_empty()) {
             return match app.to_ascii_lowercase().as_str() {
                 "claude" | "claude-code" => "Claude Code".into(),
+                "antigravity" | "agy" => "Antigravity".into(),
                 "codex" => "Codex".into(),
                 "opencode" => "OpenCode".into(),
                 "pi" => "Pi".into(),

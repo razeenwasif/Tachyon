@@ -78,10 +78,10 @@ window.padding_y = 6.0
 # window.fullscreen = native
 
 # macOS: collapsible Rex-style multi-host sidebar (`⌘B` toggles at runtime)
-# and per-pane header bars (`always`, `auto`, or `never`).
+# and optional minimal per-pane header strip (`never` by default, or `auto`/`always`).
 # window.sidebar       = true
 # window.sidebar_width = 240
-# window.pane_headers  = always
+# window.pane_headers  = never
 
 # macOS: Liquid Glass's style. clear (the default) is less frosted and bends
 # more of what's behind at its edges; regular frosts it more and adapts its

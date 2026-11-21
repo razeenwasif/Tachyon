@@ -25,17 +25,25 @@ const HOOK_MARKER: &str = "tachyon hook claude";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentKind {
     Claude,
+    Antigravity,
     Codex,
     OpenCode,
     Pi,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::OpenCode, Self::Pi];
+    pub const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Antigravity,
+        Self::Codex,
+        Self::OpenCode,
+        Self::Pi,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
             Self::Claude => "claude",
+            Self::Antigravity => "antigravity",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
@@ -45,6 +53,7 @@ impl AgentKind {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
+            Self::Antigravity => "Antigravity",
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
@@ -54,6 +63,7 @@ impl AgentKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claudecode" => Some(Self::Claude),
+            "antigravity" | "agy" => Some(Self::Antigravity),
             "codex" => Some(Self::Codex),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "pi" => Some(Self::Pi),
@@ -61,18 +71,28 @@ impl AgentKind {
         }
     }
 
-    fn config_dir(self, home: &Path) -> PathBuf {
+    fn config_dirs(self, home: &Path) -> Vec<PathBuf> {
         match self {
-            Self::Claude => home.join(".claude"),
-            Self::Codex => home.join(".codex"),
-            Self::OpenCode => home.join(".config").join("opencode"),
-            Self::Pi => home.join(".pi"),
+            Self::Claude => vec![home.join(".claude")],
+            Self::Antigravity => vec![
+                home.join(".gemini").join("config"),
+                home.join(".gemini").join("antigravity"),
+            ],
+            Self::Codex => vec![home.join(".codex")],
+            Self::OpenCode => vec![home.join(".config").join("opencode")],
+            Self::Pi => vec![home.join(".pi")],
         }
     }
 
     fn skill_path(self, home: &Path) -> PathBuf {
         match self {
             Self::Claude => home.join(".claude").join("skills").join("tachyon").join("SKILL.md"),
+            Self::Antigravity => home
+                .join(".gemini")
+                .join("config")
+                .join("skills")
+                .join("tachyon")
+                .join("SKILL.md"),
             Self::Codex => home.join(".codex").join("skills").join("tachyon").join("SKILL.md"),
             Self::OpenCode => home
                 .join(".config")
@@ -92,16 +112,18 @@ impl AgentKind {
     fn settings_path(self, home: &Path) -> Option<PathBuf> {
         match self {
             Self::Claude => Some(home.join(".claude").join("settings.json")),
+            Self::Antigravity => Some(home.join(".gemini").join("config").join("hooks.json")),
             _ => None,
         }
     }
 
-    fn binary_name(self) -> &'static str {
+    fn binary_names(self) -> &'static [&'static str] {
         match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Pi => "pi",
+            Self::Claude => &["claude"],
+            Self::Antigravity => &["agy", "antigravity"],
+            Self::Codex => &["codex"],
+            Self::OpenCode => &["opencode"],
+            Self::Pi => &["pi"],
         }
     }
 }
@@ -155,14 +177,16 @@ fn on_path(bin: &str) -> bool {
 
 /// Inspect one coding agent's detection & Tachyon integration status.
 pub fn inspect_agent(home: &Path, kind: AgentKind) -> AgentStatus {
-    let cfg_dir = kind.config_dir(home);
     let skill_path = kind.skill_path(home);
     let settings_path = kind.settings_path(home);
-    let detected = cfg_dir.exists() || on_path(kind.binary_name());
+    let detected = kind.config_dirs(home).iter().any(|d| d.exists())
+        || kind.binary_names().iter().any(|b| on_path(b));
     let skill_installed = skill_path.is_file();
-    let hooks_installed = settings_path
-        .as_deref()
-        .is_some_and(claude_hooks_present);
+    let hooks_installed = match (kind, settings_path.as_deref()) {
+        (AgentKind::Claude, Some(p)) => claude_hooks_present(p),
+        (AgentKind::Antigravity, Some(p)) => antigravity_hooks_present(p),
+        _ => false,
+    };
 
     AgentStatus {
         kind,
@@ -191,7 +215,7 @@ pub fn any_installed(home: &Path) -> bool {
         .any(|s| s.skill_installed || s.hooks_installed)
 }
 
-/// Install the Tachyon skill (and Claude Code hooks when applicable) for `kind`.
+/// Install the Tachyon skill (and lifecycle hooks when applicable) for `kind`.
 pub fn setup_agent(home: &Path, kind: AgentKind, auto_name: bool) -> io::Result<AgentStatus> {
     let skill_path = kind.skill_path(home);
     if let Some(parent) = skill_path.parent() {
@@ -199,10 +223,10 @@ pub fn setup_agent(home: &Path, kind: AgentKind, auto_name: bool) -> io::Result<
     }
     fs::write(&skill_path, skill_markdown(auto_name))?;
 
-    if kind == AgentKind::Claude {
-        if let Some(settings_path) = kind.settings_path(home) {
-            install_claude_hooks(&settings_path)?;
-        }
+    match (kind, kind.settings_path(home)) {
+        (AgentKind::Claude, Some(p)) => install_claude_hooks(&p)?,
+        (AgentKind::Antigravity, Some(p)) => install_antigravity_hooks(&p)?,
+        _ => {}
     }
     Ok(inspect_agent(home, kind))
 }
@@ -234,10 +258,10 @@ pub fn remove_agent(home: &Path, kind: AgentKind) -> io::Result<AgentStatus> {
             let _ = fs::remove_dir(parent);
         }
     }
-    if kind == AgentKind::Claude {
-        if let Some(settings_path) = kind.settings_path(home) {
-            remove_claude_hooks(&settings_path)?;
-        }
+    match (kind, kind.settings_path(home)) {
+        (AgentKind::Claude, Some(p)) => remove_claude_hooks(&p)?,
+        (AgentKind::Antigravity, Some(p)) => remove_antigravity_hooks(&p)?,
+        _ => {}
     }
     Ok(inspect_agent(home, kind))
 }
@@ -442,6 +466,89 @@ pub fn remove_claude_hooks(path: &Path) -> io::Result<()> {
     fs::write(path, format!("{formatted}\n"))
 }
 
+const ANTIGRAVITY_HOOK_KEY: &str = "tachyon";
+
+fn antigravity_hooks_present(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    val.get(ANTIGRAVITY_HOOK_KEY).is_some()
+}
+
+/// Non-destructively merge Tachyon's named hook block into Antigravity's
+/// `~/.gemini/config/hooks.json`, preserving all user hooks.
+pub fn install_antigravity_hooks(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut root: Value = match fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid JSON in {}: {e}", path.display())))?,
+        _ => json!({}),
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hooks.json root is not a JSON object",
+        ));
+    };
+    obj.insert(
+        ANTIGRAVITY_HOOK_KEY.to_string(),
+        json!({
+            "PreInvocation": [{
+                "type": "command",
+                "command": "tachyon hook antigravity prompt",
+                "timeout": 5
+            }],
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "tachyon hook antigravity working",
+                    "timeout": 5
+                }]
+            }],
+            "Stop": [{
+                "type": "command",
+                "command": "tachyon hook antigravity done",
+                "timeout": 5
+            }]
+        }),
+    );
+    let formatted = serde_json::to_string_pretty(&root)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    fs::write(path, format!("{formatted}\n"))
+}
+
+/// Remove only Tachyon's `"tachyon"` block from Antigravity's `~/.gemini/config/hooks.json`.
+pub fn remove_antigravity_hooks(path: &Path) -> io::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    let mut root: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(());
+    };
+    obj.remove(ANTIGRAVITY_HOOK_KEY);
+    if obj.is_empty() {
+        let _ = fs::remove_file(path);
+        return Ok(());
+    }
+    let formatted = serde_json::to_string_pretty(&root)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    fs::write(path, format!("{formatted}\n"))
+}
+
 /// Emit an OSC 7501 escape sequence to `/dev/tty` (when `use_tty` is true and
 /// `/dev/tty` is openable) or stdout otherwise.
 pub fn emit_osc_7501(status: Option<&ProgramStatus>, use_tty: bool) -> io::Result<()> {
@@ -532,11 +639,14 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
     let _ = io::stdin().read_to_string(&mut stdin_raw);
     let payload: Value = serde_json::from_str(&stdin_raw).unwrap_or(Value::Null);
 
+    let is_agy = agent.eq_ignore_ascii_case("antigravity") || agent.eq_ignore_ascii_case("agy");
+
     let (state, msg, label) = match event.to_ascii_lowercase().as_str() {
         "prompt" => {
             let prompt_text = payload
                 .get("prompt")
                 .and_then(Value::as_str)
+                .or_else(|| payload.get("lastUserInput").and_then(Value::as_str))
                 .or_else(|| payload.get("message").and_then(Value::as_str))
                 .unwrap_or("");
             maybe_auto_name_session(prompt_text);
@@ -547,6 +657,7 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
             let tool = payload
                 .get("tool_name")
                 .and_then(Value::as_str)
+                .or_else(|| payload.get("toolName").and_then(Value::as_str))
                 .map(|t| format!("Running {t}"));
             (ProgramState::Working, tool, Some("Working".to_string()))
         }
@@ -573,10 +684,18 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
         }
         "idle" => (ProgramState::Idle, None, Some("Idle".to_string())),
         "clear" => {
-            let _ = emit_osc_7501(None, true);
+            let _ = emit_osc_7501_tty_only_if(None, is_agy);
+            if is_agy {
+                println!("{{}}");
+            }
             return 0;
         }
-        _ => return 0,
+        _ => {
+            if is_agy {
+                println!("{{}}");
+            }
+            return 0;
+        }
     };
 
     let status = ProgramStatus {
@@ -586,8 +705,28 @@ pub fn run_hook(agent: &str, event: &str) -> i32 {
         msg,
         label,
     };
-    let _ = emit_osc_7501(Some(&status), true);
+    let _ = emit_osc_7501_tty_only_if(Some(&status), is_agy);
+    if is_agy {
+        // Antigravity hooks expect a JSON object on stdout.
+        println!("{{}}");
+    }
     0
+}
+
+fn emit_osc_7501_tty_only_if(status: Option<&ProgramStatus>, tty_only: bool) -> io::Result<()> {
+    if !tty_only {
+        return emit_osc_7501(status, true);
+    }
+    let seq = match status {
+        Some(st) => st.encode_osc_7501(),
+        None => "\x1b]7501;state=clear\x07".to_string(),
+    };
+    #[cfg(unix)]
+    if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty") {
+        tty.write_all(seq.as_bytes())?;
+        tty.flush()?;
+    }
+    Ok(())
 }
 
 fn truncate_msg(s: &str, max_chars: usize) -> Option<String> {
@@ -722,5 +861,48 @@ mod tests {
         assert!(is_generated_session_name("s_12"));
         assert!(!is_generated_session_name("refactor-auth"));
         assert!(!is_generated_session_name("train-gpt"));
+    }
+
+    #[test]
+    fn antigravity_skill_and_hooks_install_and_remove_preserving_user_hooks() {
+        let home = temp_home("agy");
+        let cfg_dir = home.join(".gemini").join("config");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        let hooks_path = cfg_dir.join("hooks.json");
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&json!({
+                "my-linter": {
+                    "PostToolUse": [{ "matcher": "edit_file", "hooks": [{ "command": "echo lint" }] }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let status = setup_agent(&home, AgentKind::Antigravity, true).unwrap();
+        assert!(status.detected);
+        assert!(status.skill_installed);
+        assert!(status.hooks_installed);
+        assert_eq!(status.skill_path, cfg_dir.join("skills").join("tachyon").join("SKILL.md"));
+
+        let after_install: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(after_install.get("my-linter").is_some());
+        assert!(after_install.get("tachyon").is_some());
+        assert_eq!(
+            after_install["tachyon"]["Stop"][0]["command"],
+            "tachyon hook antigravity done"
+        );
+
+        let after_rm = remove_agent(&home, AgentKind::Antigravity).unwrap();
+        assert!(!after_rm.skill_installed);
+        assert!(!after_rm.hooks_installed);
+        let final_json: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(final_json.get("my-linter").is_some());
+        assert!(final_json.get("tachyon").is_none());
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

@@ -4172,7 +4172,6 @@ impl TermWindow {
                 remote_host,
                 status,
                 focused: p_idx == tab.focus,
-                zoomed: tab.zoomed,
                 running,
             });
             slot += 1;
@@ -5935,11 +5934,6 @@ fn close_active_tab(window: u64) {
     }
 }
 
-/// Close the focused pane from a pane header's `×` button.
-fn close_focused_pane(window: u64) {
-    close_active_tab(window);
-}
-
 /// A view that puts `view` on glass: Liquid Glass on macOS 26 and later,
 /// otherwise the blurred window material macOS used before.
 fn glass_host(
@@ -7553,6 +7547,7 @@ fn handle_mux_event(host: String, ev: serde_json::Value) {
                             .filter(|s| !s.is_empty())
                             .map(|a| match a.to_ascii_lowercase().as_str() {
                                 "claude" | "claude-code" => "Claude Code",
+                                "antigravity" | "agy" => "Antigravity",
                                 "codex" => "Codex",
                                 "opencode" => "OpenCode",
                                 "pi" => "Pi",

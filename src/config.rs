@@ -167,7 +167,7 @@ impl Default for WindowConfig {
             hints: true,
             sidebar: cfg!(target_os = "macos"),
             sidebar_width: 240.0,
-            pane_headers: if cfg!(target_os = "macos") { PaneHeaders::Always } else { PaneHeaders::Never },
+            pane_headers: PaneHeaders::Never,
             opacity_explicit: false,
         }
     }
@@ -1029,7 +1029,7 @@ mod contrast_tests {
         let mut c = Config::default();
         if cfg!(target_os = "macos") {
             assert!(c.window.sidebar);
-            assert_eq!(c.window.pane_headers, PaneHeaders::Always);
+            assert_eq!(c.window.pane_headers, PaneHeaders::Never);
         }
         assert_eq!(c.window.sidebar_width, 240.0);
 

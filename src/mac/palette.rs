@@ -216,7 +216,7 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             action: PaletteAction::FollowJob,
         },
         PaletteItem {
-            title: "Integrate Coding Agents (Claude Code, Codex, OpenCode, Pi)".into(),
+            title: "Integrate Coding Agents (Claude Code, Antigravity, Codex, OpenCode, Pi)".into(),
             subtitle: "Install Tachyon skill & OSC 7501 hooks for detected agents".into(),
             shortcut: "",
             action: PaletteAction::SetupAgentIntegrations,
@@ -410,6 +410,7 @@ impl PaletteListView {
         state.window.set(window);
         let view: Retained<Self> =
             unsafe { msg_send![super(Self::alloc(mtm).set_ivars(state)), initWithFrame: NSRect::ZERO] };
+        view.setClipsToBounds(true);
         let tracking = unsafe {
             NSTrackingArea::initWithRect_options_owner_userInfo(
                 NSTrackingArea::alloc(),
@@ -468,6 +469,7 @@ impl PaletteListView {
 
     fn draw(&self) {
         let b = self.bounds();
+        NSBezierPath::clipRect(b);
         let w = b.size.width;
         let scroll = self.ivars().scroll_y.get();
         let sel = self.ivars().selected.get();
@@ -658,8 +660,8 @@ impl PaletteCard {
         search.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
 
         let list = PaletteListView::new(mtm, window);
-        content.addSubview(&search);
         content.addSubview(&list);
+        content.addSubview(&search);
         host.setHidden(true);
         parent.addSubview(&host);
 
@@ -688,12 +690,12 @@ impl PaletteCard {
 
         let pad = 12.0;
         self.search.setFrame(NSRect::new(
-            NSPoint::new(pad, h - 38.0),
-            NSSize::new((w - 2.0 * pad).max(80.0), 26.0),
+            NSPoint::new(pad, h - 40.0),
+            NSSize::new((w - 2.0 * pad).max(80.0), 28.0),
         ));
         self.list.setFrame(NSRect::new(
             NSPoint::new(6.0, 8.0),
-            NSSize::new((w - 12.0).max(80.0), (h - 52.0).max(60.0)),
+            NSSize::new((w - 12.0).max(80.0), (h - 56.0).max(60.0)),
         ));
     }
 }

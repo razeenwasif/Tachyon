@@ -494,10 +494,9 @@ grouped `Host → Session → Window` trees — click any local or remote window
 attach immediately with LZ4 screen restore, filter live from the bottom search
 box, right-click for session/window actions, drag the right divider to resize
 (`180–360 pt`), or click the globe button to add discovered `~/.ssh/config`
-hosts. Each visible pane gets a compact header bar showing its title, live OSC 7501
-status pill, a remote host pill when running on another machine, and hover
-buttons for split right, split down, zoom, and close (`window.sidebar`,
-`window.sidebar_width`, `window.pane_headers = always | auto | never`).
+hosts. Panes stay clean and full-height by default (keyboard-driven splitting and
+closing via `⌘D`, `⌘⇧D`, `⌘⇧↩`, `⌘W`, or optional `window.pane_headers = auto |
+always` for a minimal status/host strip).
 
 **Command Palette (`⌘⇧P`), Floating Cheatsheet (`⌘/`), & Settings (`⌘,`).**
 Press **⌘⇧P** (or click `⌘` in the sidebar toolbar) to fuzzy-search every
@@ -512,14 +511,15 @@ sidebar footer) for native Liquid Glass Settings (**Server**, **Remote Hosts**,
 **Coding agent integrations & OSC 7501 status.** Tachyon parses OSC 7501
 (`ESC ] 7501 ; state=... ; app=... ; msg=<b64> ; label=<b64> BEL/ST`) across
 both local and remote servers, preserving live status through `Term::to_vt()`
-restores, showing live agent icons (`✳` Claude Code, `◎` Codex, `◈` OpenCode,
-`π` Pi) and badges in the sidebar & pane headers, and posting macOS
-notifications when an unfocused local or remote agent blocks for approval or
-finishes (`notify.agent_status = true`; clicking jumps straight to that pane).
-Run `tachyon skill setup` (or toggle **Settings > Integrations**) to install the
-Tachyon agent skill and non-destructive Claude Code lifecycle hooks, with
-optional automatic task-based session naming (`agents.auto_name_sessions = true`).
-See [docs/REX_ARCHITECTURE.md](docs/REX_ARCHITECTURE.md) for the full design and
+restores, showing live agent icons (`✳` Claude Code, `✦` Antigravity, `◎` Codex,
+`◈` OpenCode, `π` Pi) and badges in the sidebar, and posting macOS notifications
+when an unfocused local or remote agent blocks for approval or finishes
+(`notify.agent_status = true`; clicking jumps straight to that pane). Run
+`tachyon skill setup` (or toggle **Settings > Integrations**) to install the
+Tachyon agent skill and non-destructive Claude Code & Antigravity lifecycle
+hooks, with optional automatic task-based session naming
+(`agents.auto_name_sessions = true`). See
+[docs/REX_ARCHITECTURE.md](docs/REX_ARCHITECTURE.md) for the full design and
 roadmap.
 
 **Shortcut hints.** A band along the bottom lists the shortcuts worth knowing,

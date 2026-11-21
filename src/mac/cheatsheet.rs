@@ -118,7 +118,7 @@ pub const ENTRIES: &[SheetEntry] = &[
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon -S kagutsuchi new work", detail: "Start persistent session on Mac mini host", action: Some(SheetAction::CopyCli("tachyon -S kagutsuchi new work")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon run --wait --capture -- CMD", detail: "Run command in a managed pane & collect output", action: Some(SheetAction::CopyCli("tachyon run --wait --capture -- ")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon split --right", detail: "Split current pane from CLI or coding agent", action: Some(SheetAction::CopyCli("tachyon split --right")) },
-    SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon skill setup", detail: "Install Claude Code, Codex, OpenCode & Pi hooks", action: Some(SheetAction::CopyCli("tachyon skill setup")) },
+    SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon skill setup", detail: "Install Claude Code, Antigravity, Codex, OpenCode & Pi hooks", action: Some(SheetAction::CopyCli("tachyon skill setup")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon status --state working --tty", detail: "Emit OSC 7501 status pill & notification", action: Some(SheetAction::CopyCli("tachyon status --state working --app agent --msg \"Working\" --tty")) },
 ];
 
@@ -249,6 +249,7 @@ impl CheatsheetListView {
         state.window.set(window);
         let view: Retained<Self> =
             unsafe { msg_send![super(Self::alloc(mtm).set_ivars(state)), initWithFrame: NSRect::ZERO] };
+        view.setClipsToBounds(true);
         let tracking = unsafe {
             NSTrackingArea::initWithRect_options_owner_userInfo(
                 NSTrackingArea::alloc(),
@@ -311,6 +312,7 @@ impl CheatsheetListView {
 
     fn draw(&self) {
         let b = self.bounds();
+        NSBezierPath::clipRect(b);
         let w = b.size.width;
         let scroll = self.ivars().scroll_y.get();
         let hover = self.ivars().hover.get();
@@ -471,7 +473,7 @@ pub struct CheatsheetCard {
 }
 
 impl CheatsheetCard {
-    const WIDTH: f64 = 520.0;
+    const WIDTH: f64 = 540.0;
     const HEIGHT: f64 = 540.0;
 
     pub fn new(mtm: MainThreadMarker, parent: &NSView, target: &AnyObject, window: u64) -> Self {
@@ -520,11 +522,11 @@ impl CheatsheetCard {
         let list = CheatsheetListView::new(mtm, window);
 
         for v in [
+            &*list as &NSView,
             &*title as &NSView,
             &*hint as &NSView,
             &*close as &NSView,
             &*search as &NSView,
-            &*list as &NSView,
         ] {
             content.addSubview(v);
         }
@@ -556,7 +558,7 @@ impl CheatsheetCard {
             NSSize::new((w - 2.0 * pad - 30.0).max(60.0), 20.0),
         ));
         self.hint.setFrame(NSRect::new(
-            NSPoint::new(pad, h - 49.0),
+            NSPoint::new(pad, h - 50.0),
             NSSize::new((w - 2.0 * pad - 30.0).max(60.0), 15.0),
         ));
         self.close.setFrame(NSRect::new(
@@ -564,12 +566,12 @@ impl CheatsheetCard {
             NSSize::new(24.0, 22.0),
         ));
         self.search.setFrame(NSRect::new(
-            NSPoint::new(pad, h - 78.0),
-            NSSize::new((w - 2.0 * pad).max(80.0), 24.0),
+            NSPoint::new(pad, h - 86.0),
+            NSSize::new((w - 2.0 * pad).max(80.0), 28.0),
         ));
         self.list.setFrame(NSRect::new(
             NSPoint::new(pad - 4.0, 10.0),
-            NSSize::new((w - 2.0 * pad + 8.0).max(80.0), (h - 94.0).max(60.0)),
+            NSSize::new((w - 2.0 * pad + 8.0).max(80.0), (h - 104.0).max(60.0)),
         ));
     }
 

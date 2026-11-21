@@ -3,7 +3,7 @@
 //! Sidebar-navigated configuration window covering:
 //! 0. Server        — local Mux v2 daemon status, start/restart & launchd service
 //! 1. Remote Hosts  — live host list, reconnect/remove, ~/.ssh/config discovery & add
-//! 2. Integrations  — Claude Code / Codex / OpenCode / Pi skills, hooks & auto-naming
+//! 2. Integrations  — Claude Code / Antigravity / Codex / OpenCode / Pi skills, hooks & auto-naming
 //! 3. Interface     — sidebar, pane headers, title bar, shortcut hints & persistence
 //! 4. Notifications — OSC 7501 coding-agent notifications & test alert
 
@@ -425,7 +425,7 @@ define_class!(
             let auto_name = Config::load_default().agents.auto_name_sessions;
             let res = if on {
                 integrations::setup_all_detected(&home, auto_name)
-                    .map(|_| "Installed Tachyon skills & Claude Code OSC 7501 hooks.")
+                    .map(|_| "Installed Tachyon skills & OSC 7501 hooks for detected agents.")
             } else {
                 integrations::remove_all(&home)
                     .map(|_| "Removed Tachyon agent skills & hooks (your settings preserved).")
@@ -845,12 +845,13 @@ impl SettingsWindow {
         self.detail.addSubview(&sub1);
         *y += 22.0;
 
-        let card1 = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 128.0)));
+        let card1 = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 138.0)));
         let summary_line: String = statuses
             .iter()
             .map(|s| {
                 let icon = match s.id {
                     "claude" => "✳",
+                    "antigravity" => "✦",
                     "codex" => "◎",
                     "opencode" => "◈",
                     _ => "π",
@@ -859,22 +860,22 @@ impl SettingsWindow {
                 format!("{icon} {} {state}", s.name)
             })
             .collect::<Vec<_>>()
-            .join("    ");
-        let agents_lbl = label(mtm, &summary_line, 12.0, true, &NSColor::labelColor());
-        agents_lbl.setFrame(NSRect::new(NSPoint::new(14.0, 14.0), NSSize::new(w - 28.0, 18.0)));
+            .join("   ");
+        let agents_lbl = label(mtm, &summary_line, 11.5, true, &NSColor::labelColor());
+        agents_lbl.setFrame(NSRect::new(NSPoint::new(14.0, 12.0), NSSize::new(w - 28.0, 28.0)));
 
         let row1_t = label(mtm, "Integrate with available agents", 13.0, true, &NSColor::labelColor());
-        row1_t.setFrame(NSRect::new(NSPoint::new(14.0, 44.0), NSSize::new(w - 86.0, 18.0)));
+        row1_t.setFrame(NSRect::new(NSPoint::new(14.0, 50.0), NSSize::new(w - 86.0, 18.0)));
         let row1_d = label(
             mtm,
-            "Installs Tachyon skill & OSC 7501 hooks for detected agents (Claude Code, Codex, OpenCode, Pi)",
+            "Installs Tachyon skill & OSC 7501 hooks for detected agents (Claude Code, Antigravity, Codex, OpenCode, Pi)",
             11.0,
             false,
             &NSColor::secondaryLabelColor(),
         );
-        row1_d.setFrame(NSRect::new(NSPoint::new(14.0, 64.0), NSSize::new(w - 86.0, 28.0)));
+        row1_d.setFrame(NSRect::new(NSPoint::new(14.0, 70.0), NSSize::new(w - 86.0, 30.0)));
         let sw1 = toggle_switch(mtm, any_on, target, sel!(toggleIntegrateAgents:));
-        sw1.setFrame(NSRect::new(NSPoint::new(w - 56.0, 48.0), NSSize::new(42.0, 24.0)));
+        sw1.setFrame(NSRect::new(NSPoint::new(w - 56.0, 54.0), NSSize::new(42.0, 24.0)));
 
         let foot1 = label(
             mtm,
@@ -883,7 +884,7 @@ impl SettingsWindow {
             false,
             &NSColor::tertiaryLabelColor(),
         );
-        foot1.setFrame(NSRect::new(NSPoint::new(14.0, 98.0), NSSize::new(w - 28.0, 16.0)));
+        foot1.setFrame(NSRect::new(NSPoint::new(14.0, 108.0), NSSize::new(w - 28.0, 16.0)));
 
         for v in [
             &*agents_lbl as &NSView,
@@ -895,7 +896,7 @@ impl SettingsWindow {
             card1.addSubview(v);
         }
         self.detail.addSubview(&card1);
-        *y += 144.0;
+        *y += 154.0;
 
         // Card 2: Agent Behavior
         let sub2 = label(mtm, "Agent Behavior", 12.5, true, &NSColor::secondaryLabelColor());
@@ -961,7 +962,7 @@ impl SettingsWindow {
         let ry = 12.0 + 4.0 * 44.0;
         let pt = label(mtm, "Per-Pane Header Bars", 12.5, true, &NSColor::labelColor());
         pt.setFrame(NSRect::new(NSPoint::new(14.0, ry), NSSize::new(w - 160.0, 16.0)));
-        let pd = label(mtm, "Title, OSC 7501 status pill, host badge & split actions", 11.0, false, &NSColor::secondaryLabelColor());
+        let pd = label(mtm, "Optional title, OSC 7501 status pill & host badge (off by default)", 11.0, false, &NSColor::secondaryLabelColor());
         pd.setFrame(NSRect::new(NSPoint::new(14.0, ry + 17.0), NSSize::new(w - 160.0, 15.0)));
         let popup = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),

@@ -1101,7 +1101,7 @@ fn cmd_skill(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--agent" | "-a" => {
-                        let name = args.get(i + 1).ok_or("--agent requires claude|codex|opencode|pi|all")?;
+                        let name = args.get(i + 1).ok_or("--agent requires claude|antigravity|codex|opencode|pi|all")?;
                         if name.eq_ignore_ascii_case("all") {
                             all = true;
                         } else {
@@ -1161,7 +1161,7 @@ fn cmd_skill(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--agent" | "-a" => {
-                        let name = args.get(i + 1).ok_or("--agent requires claude|codex|opencode|pi")?;
+                        let name = args.get(i + 1).ok_or("--agent requires claude|antigravity|codex|opencode|pi")?;
                         agent = Some(
                             AgentKind::parse(name)
                                 .ok_or_else(|| format!("unknown agent `{name}`"))?,
@@ -1295,7 +1295,7 @@ Sessions, Windows & Automation:
   tachyon events [-s SESSION] [--json]
 
 Coding Agents & Live Status (OSC 7501):
-  tachyon skill status|setup|remove         manage Claude Code, Codex, OpenCode & Pi skills/hooks
+  tachyon skill status|setup|remove         manage Claude Code, Antigravity, Codex, OpenCode & Pi skills/hooks
   tachyon status --state S [--app A] [--msg M] [--tty]
   tachyon hook <agent> <event>              internal hook entrypoint for coding agents
 
