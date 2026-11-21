@@ -35,6 +35,26 @@ pub enum StreamChunk {
     Output(Vec<u8>),
 }
 
+/// Payload returned by `MuxClient::rewind_frame`.
+#[derive(Clone, Debug)]
+pub struct RewindFrameData {
+    pub seq: u64,
+    pub cols: usize,
+    pub rows: usize,
+    pub age_ms: u64,
+    pub vt: Vec<u8>,
+    pub text: Option<String>,
+}
+
+/// Payload returned by `MuxClient::rewind_provenance`.
+#[derive(Clone, Debug)]
+pub struct RewindProvenanceData {
+    pub offset: u64,
+    pub before_ms: u64,
+    pub context: String,
+    pub scrolled: bool,
+}
+
 /// Handle to a live attached block stream. Dropping detaches cleanly.
 pub struct AttachedStream {
     pub stream_id: u32,
@@ -508,6 +528,94 @@ impl MuxClient {
         }
         let data = self.rpc(req)?;
         Ok(data.get("exit_code").and_then(Value::as_i64).unwrap_or(0) as i32)
+    }
+
+    /// List server-side Rewind frames for `block_id` as `(seq, age_ms)` oldest first.
+    pub fn rewind_list(&self, block_id: &str) -> io::Result<Vec<(u64, u64)>> {
+        let data = self.rpc(json!({
+            "op": "block.rewind.list",
+            "block_id": block_id,
+        }))?;
+        let arr = data
+            .get("frames")
+            .and_then(Value::as_array)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing frames array"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            if let Some(pair) = item.as_array() {
+                if let (Some(seq), Some(age)) = (
+                    pair.first().and_then(Value::as_u64),
+                    pair.get(1).and_then(Value::as_u64),
+                ) {
+                    out.push((seq, age));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch and LZ4-decompress a historical Rewind frame from the server.
+    pub fn rewind_frame(
+        &self,
+        block_id: &str,
+        seq: u64,
+        include_text: bool,
+        ansi: bool,
+    ) -> io::Result<RewindFrameData> {
+        let data = self.rpc(json!({
+            "op": "block.rewind.frame",
+            "block_id": block_id,
+            "seq": seq,
+            "include_text": include_text,
+            "ansi": ansi,
+        }))?;
+        let cols = data.get("cols").and_then(Value::as_u64).unwrap_or(80) as usize;
+        let rows = data.get("rows").and_then(Value::as_u64).unwrap_or(24) as usize;
+        let age_ms = data.get("age_ms").and_then(Value::as_u64).unwrap_or(0);
+        let b64 = data
+            .get("vt_lz4_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing vt_lz4_b64"))?;
+        let lz4 = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let vt = lz4_flex::decompress_size_prepended(&lz4)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let text = data.get("text").and_then(Value::as_str).map(str::to_string);
+        Ok(RewindFrameData { seq, cols, rows, age_ms, vt, text })
+    }
+
+    /// Query server-side cell provenance (`⌥`-click on a rewound screen).
+    pub fn rewind_provenance(
+        &self,
+        block_id: &str,
+        seq: u64,
+        x: usize,
+        y: usize,
+    ) -> io::Result<Option<RewindProvenanceData>> {
+        let data = self.rpc(json!({
+            "op": "block.rewind.provenance",
+            "block_id": block_id,
+            "seq": seq,
+            "x": x,
+            "y": y,
+        }))?;
+        if data.get("found").and_then(Value::as_bool) != Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(RewindProvenanceData {
+            offset: data.get("offset").and_then(Value::as_u64).unwrap_or(0),
+            before_ms: data.get("before_ms").and_then(Value::as_u64).unwrap_or(0),
+            context: data
+                .get("context")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            scrolled: data
+                .get("scrolled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }))
     }
 
     /// Attach a live stream to `block_id`. The first item on `rx` (when `restore`

@@ -1257,6 +1257,11 @@ struct Rewound {
     at: Instant,
     /// Cell provenance from the last Option-click, shown under the slider.
     note: Option<String>,
+    /// Present when backed by server-side Rewind on a Mux v2 host (`host`, `block_id`).
+    remote_host: Option<String>,
+    remote_block: Option<String>,
+    /// Cached `(seq, approx_instant)` list fetched from the server for smooth scrubbing.
+    server_frames: Option<Vec<(u64, Instant)>>,
 }
 
 /// The glass panel at the top while rewound: when the screen is from, a
@@ -2252,6 +2257,8 @@ struct TermWindow {
     /// Rewind: the earlier screen being shown instead of the live one.
     rewound: Option<Rewound>,
     rewind_badge: Option<RewindBadge>,
+    /// Monotonic counter invalidating stale async server-rewind fetches on fast scrub or Esc.
+    rewind_gen: u64,
     glass_tint: f32,
     /// Per-host accent & danger colour settings (`window.host_tint`,
     /// `window.host_tint_strength`, `host.color.*`) and cached glass state.
@@ -5409,7 +5416,137 @@ impl TermWindow {
 
     /// ⌘[ and ⌘]: show the screen one frame earlier or later. Stepping
     /// forward past the newest frame goes back to live.
+    ///
+    /// For Mux v2 panes (local `This Mac` server across app restarts, or remote
+    /// `kagutsuchi`/`amaterasu`/Linux hosts), queries the server's `RewindLog`
+    /// over Mux v2 RPC, gracefully falling back to the local log if an older
+    /// server doesn't support `block.rewind.*`.
     fn rewind_step(&mut self, back: bool) {
+        let mux_info = {
+            let pane = self.tabs[self.active].pane();
+            pane.pty
+                .mux_client()
+                .cloned()
+                .zip(pane.pty.mux_meta().cloned())
+        };
+        if let Some((client, meta)) = mux_info {
+            // Fast path: already rewound on this server block with cached frame list.
+            if let Some(rw) = &self.rewound {
+                if rw.remote_block.as_deref() == Some(meta.block_id.as_str()) {
+                    if let Some(frames) = &rw.server_frames {
+                        if frames.len() < 2 {
+                            objc2_app_kit::NSBeep();
+                            return;
+                        }
+                        let live = frames.len() - 1;
+                        let next_index = if back {
+                            rw.index.saturating_sub(1)
+                        } else if rw.index + 1 >= live {
+                            self.rewind_exit();
+                            return;
+                        } else {
+                            rw.index + 1
+                        };
+                        self.rewind_to(next_index);
+                        return;
+                    }
+                }
+            }
+            if !back {
+                return;
+            }
+            // Initial server-side Rewind entry: list frames & fetch the previous frame off-thread.
+            self.rewind_gen = self.rewind_gen.wrapping_add(1);
+            let gen = self.rewind_gen;
+            let win_id = self.id;
+            let host = meta.host;
+            let block_id = meta.block_id;
+            let _ = std::thread::Builder::new()
+                .name("tachyon-rewind-enter".into())
+                .spawn(move || {
+                    let list = match client.rewind_list(&block_id) {
+                        Ok(l) => l,
+                        Err(_) => {
+                            // Un-upgraded remote server: fall back cleanly to local log.
+                            DispatchQueue::main().exec_async(move || {
+                                with_window(win_id, |w| {
+                                    if w.rewind_gen == gen {
+                                        w.rewind_step_local(true);
+                                    }
+                                });
+                            });
+                            return;
+                        }
+                    };
+                    if list.len() < 2 {
+                        DispatchQueue::main().exec_async(move || {
+                            with_window(win_id, |w| {
+                                if w.rewind_gen == gen {
+                                    // If local log has more frames (e.g. just attached), try it; else beep.
+                                    let local_len = w.tabs[w.active].pane().log.lock().frames().len();
+                                    if local_len >= 2 {
+                                        w.rewind_step_local(true);
+                                    } else {
+                                        objc2_app_kit::NSBeep();
+                                    }
+                                }
+                            });
+                        });
+                        return;
+                    }
+                    let now = Instant::now();
+                    let server_frames: Vec<(u64, Instant)> = list
+                        .into_iter()
+                        .map(|(seq, age_ms)| {
+                            let at = now
+                                .checked_sub(std::time::Duration::from_millis(age_ms))
+                                .unwrap_or(now);
+                            (seq, at)
+                        })
+                        .collect();
+                    let index = server_frames.len() - 2;
+                    let (seq, at) = server_frames[index];
+                    let Ok(frame) = client.rewind_frame(&block_id, seq, false, false) else {
+                        DispatchQueue::main().exec_async(|| objc2_app_kit::NSBeep());
+                        return;
+                    };
+                    let term = decode_rewind_vt(frame.cols, frame.rows, &frame.vt);
+                    let total = server_frames.len();
+                    DispatchQueue::main().exec_async(move || {
+                        with_window(win_id, |w| {
+                            if w.rewind_gen != gen {
+                                return;
+                            }
+                            let still_same = w.tabs[w.active]
+                                .pane()
+                                .pty
+                                .mux_meta()
+                                .is_some_and(|m| m.block_id == block_id);
+                            if !still_same {
+                                return;
+                            }
+                            w.rewound = Some(Rewound {
+                                term,
+                                seq,
+                                index,
+                                frames: total,
+                                at,
+                                note: None,
+                                remote_host: Some(host),
+                                remote_block: Some(block_id),
+                                server_frames: Some(server_frames),
+                            });
+                            w.show_rewind_badge();
+                            w.request_redraw();
+                        });
+                    });
+                });
+            return;
+        }
+        self.rewind_step_local(back);
+    }
+
+    fn rewind_step_local(&mut self, back: bool) {
         let log = Arc::clone(&self.tabs[self.active].pane().log);
         let log = log.lock();
         let frames = log.frames();
@@ -5430,11 +5567,67 @@ impl TermWindow {
             (Some(rw), false) => rw.index + 1,
         };
         drop(log);
-        self.rewind_to(index);
+        self.rewind_to_local(index);
     }
 
     /// Show frame `index`, from ⌘[ / ⌘], the slider or the wheel.
     fn rewind_to(&mut self, index: usize) {
+        let server_req = self.rewound.as_ref().and_then(|rw| {
+            let bid = rw.remote_block.as_ref()?;
+            let frames = rw.server_frames.as_ref()?;
+            let &(seq, at) = frames.get(index)?;
+            if rw.seq == seq {
+                return None;
+            }
+            let client = self.tabs[self.active].pane().pty.mux_client()?.clone();
+            Some((client, bid.clone(), seq, at))
+        });
+
+        if let Some((client, block_id, seq, at)) = server_req {
+            self.rewind_gen = self.rewind_gen.wrapping_add(1);
+            let gen = self.rewind_gen;
+            let win_id = self.id;
+            if let Some(rw) = &mut self.rewound {
+                rw.index = index;
+                rw.seq = seq;
+                rw.at = at;
+                rw.note = None;
+            }
+            self.show_rewind_badge();
+            let _ = std::thread::Builder::new()
+                .name("tachyon-rewind-frame".into())
+                .spawn(move || {
+                    let Ok(frame) = client.rewind_frame(&block_id, seq, false, false) else {
+                        return;
+                    };
+                    let term = decode_rewind_vt(frame.cols, frame.rows, &frame.vt);
+                    DispatchQueue::main().exec_async(move || {
+                        with_window(win_id, |w| {
+                            if w.rewind_gen != gen {
+                                return;
+                            }
+                            if let Some(rw) = &mut w.rewound {
+                                if rw.seq == seq {
+                                    rw.term = term;
+                                    w.request_redraw();
+                                }
+                            }
+                        });
+                    });
+                });
+            return;
+        }
+        if self
+            .rewound
+            .as_ref()
+            .is_some_and(|rw| rw.server_frames.is_some())
+        {
+            return;
+        }
+        self.rewind_to_local(index);
+    }
+
+    fn rewind_to_local(&mut self, index: usize) {
         let log = Arc::clone(&self.tabs[self.active].pane().log);
         let log = log.lock();
         let frames = log.frames();
@@ -5448,7 +5641,17 @@ impl TermWindow {
             return;
         };
         drop(log);
-        self.rewound = Some(Rewound { term, seq, index, frames: frames.len(), at, note: None });
+        self.rewound = Some(Rewound {
+            term,
+            seq,
+            index,
+            frames: frames.len(),
+            at,
+            note: None,
+            remote_host: None,
+            remote_block: None,
+            server_frames: None,
+        });
         self.show_rewind_badge();
         self.request_redraw();
     }
@@ -5458,6 +5661,57 @@ impl TermWindow {
         let (_, (x, y)) = self.cell_at(event);
         let Some(rw) = &self.rewound else { return };
         let ch = rw.term.grid().row(y).cells().get(x).and_then(|c| c.scalar()).unwrap_or(' ');
+        if let Some(bid) = rw.remote_block.clone() {
+            let Some(client) = self.tabs[self.active].pane().pty.mux_client().cloned() else {
+                return;
+            };
+            let seq = rw.seq;
+            let host_lbl = rw
+                .remote_host
+                .as_deref()
+                .filter(|h| *h != "local")
+                .map(|h| format!(" on {h}"))
+                .unwrap_or_default();
+            if let Some(rw) = &mut self.rewound {
+                rw.note = Some(format!("Inspecting cell ({}, {}){host_lbl}…", x + 1, y + 1));
+            }
+            self.show_rewind_badge();
+            let win_id = self.id;
+            let _ = std::thread::Builder::new()
+                .name("tachyon-rewind-prov".into())
+                .spawn(move || {
+                    let note = match client.rewind_provenance(&bid, seq, x, y) {
+                        Ok(Some(p)) => {
+                            let before = p.before_ms as f64 / 1000.0;
+                            let how = if p.scrolled { "scrolled here by" } else { "written by" };
+                            format!(
+                                "‘{ch}’ column {}, row {} · byte {} · {before:.1} s before this frame · {how} {}",
+                                x + 1,
+                                y + 1,
+                                group_digits(p.offset),
+                                p.context
+                            )
+                        }
+                        Ok(None) => format!(
+                            "‘{ch}’ at column {}, row {}: not changed in the output kept",
+                            x + 1,
+                            y + 1
+                        ),
+                        Err(e) => format!("Cell provenance unavailable: {e}"),
+                    };
+                    DispatchQueue::main().exec_async(move || {
+                        with_window(win_id, |w| {
+                            if let Some(rw) = &mut w.rewound {
+                                if rw.seq == seq && rw.remote_block.as_deref() == Some(bid.as_str()) {
+                                    rw.note = Some(note);
+                                    w.show_rewind_badge();
+                                }
+                            }
+                        });
+                    });
+                });
+            return;
+        }
         let log = Arc::clone(&self.tabs[self.active].pane().log);
         let found = log.lock().provenance(rw.seq, x, y);
         let note = match found {
@@ -5482,6 +5736,7 @@ impl TermWindow {
     }
 
     fn rewind_exit(&mut self) {
+        self.rewind_gen = self.rewind_gen.wrapping_add(1);
         if self.rewound.take().is_some() {
             if let Some(b) = &self.rewind_badge {
                 b.glass.setHidden(true);
@@ -5500,7 +5755,11 @@ impl TermWindow {
             s if s < 7200 => format!("{} min ago", s / 60),
             s => format!("{} h ago", s / 3600),
         };
-        let text = format!("Rewind · {when} · {} of {}", rw.index + 1, rw.frames);
+        let host_tag = match rw.remote_host.as_deref() {
+            Some(h) if h != "local" => format!(" ({h})"),
+            _ => String::new(),
+        };
+        let text = format!("Rewind{host_tag} · {when} · {} of {}", rw.index + 1, rw.frames);
         let (index, frames, note) = (rw.index, rw.frames, rw.note.clone());
         if self.rewind_badge.is_none() {
             if let Some(mtm) = MainThreadMarker::new() {
@@ -6097,6 +6356,7 @@ impl App {
             tooltip: None,
             rewound: None,
             rewind_badge: None,
+            rewind_gen: 0,
             dragging_divider: None,
             key_time: None,
             busy_frames: 0,
@@ -7253,6 +7513,14 @@ fn restore_sessions(mtm: MainThreadMarker) -> bool {
 fn rewind_root() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(std::path::PathBuf::from(home).join("Library/Caches/Tachyon/Rewind"))
+}
+
+/// Reconstruct a rewound `Term` screen from a server-replayed `Term::to_vt()` snapshot.
+fn decode_rewind_vt(cols: usize, rows: usize, vt: &[u8]) -> Term {
+    let mut term = Term::new(cols.max(2), rows.max(1), 0);
+    Processor::new().advance(&mut term, vt);
+    let _ = term.take_replies();
+    term
 }
 
 /// Where the shell-integration scripts live: inside the app bundle, or the

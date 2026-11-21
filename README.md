@@ -556,6 +556,16 @@ BROADCAST · N panes`** badge; zooming a pane or closing down to one pane
 automatically turns broadcast off for safety. From scripts, broadcast to every
 pane in a window with `tachyon send --all [-w WID] --enter "CMD"`.
 
+**Server-side Rewind across restarts & remote hosts (`⌘[` / `⌘]` & `tachyon
+rewind`).** Every managed block in `tachyon server` records its own `RewindLog`
+(including alternate-screen TUI frames and LZ4-compressed cold spill segments)
+continuously, even when no GUI is attached. Quitting and reopening Tachyon keeps
+prior frames scrubbable with `⌘[` / `⌘]`, slider, wheel, and `⌥`-click cell
+provenance — and works identically on remote `kagutsuchi`, `amaterasu`, and
+Linux panes over Mux v2 RPC (`block.rewind.list`, `block.rewind.frame`,
+`block.rewind.provenance`), or from the CLI via `tachyon rewind --list` /
+`--frame N` / `--provenance COL,ROW`.
+
 **Command Palette (`⌘⇧P`), Floating Cheatsheet (`⌘/`), & Settings (`⌘,`).**
 Press **⌘⇧P** (or click `⌘` in the sidebar toolbar) to fuzzy-search every
 Tachyon action and jump straight to any live session or window across **This
