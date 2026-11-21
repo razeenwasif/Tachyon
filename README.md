@@ -123,7 +123,11 @@ Display), both themes switch to high-contrast versions derived from them: a
 black (or white) background, every ANSI colour at 7:1 contrast or better
 (4.5:1 for the dim slot shells use for suggestions), a solid selection with its
 own text colour, and the glass turned into a solid background. It switches back
-when the setting does; `theme.contrast = high` or `normal` fixes it. Drawing is paced by a display link
+when the setting does; `theme.contrast = high` or `normal` fixes it. The terminal
+surface also implements macOS **VoiceOver** (`NSAccessibility` `AXTextArea`):
+screen text, the prompt insertion line and caret, selections, UTF-16 line/range
+queries, screen-space cell bounding frames, and throttled change notifications
+(with zero overhead when VoiceOver is off). Drawing is paced by a display link
 that pauses when nothing changes, so an idle window uses no CPU. Box drawing
 and block elements are drawn as rectangles, so borders and progress bars meet
 exactly. Nerd Font icons come from any installed Nerd Font, sized so its line height
@@ -287,8 +291,11 @@ with OSC 133, which gives:
   `✓ 4.2s · cpu 4.1s (P 100%) · 20.7 J · 425 MB` -- wall time, CPU time and
   the share on performance cores, energy, and peak memory footprint. CPU time is
   exact (from the shell's child-process accounting); P-core share, energy and
-  memory are sampled every half second, so very short commands show only their
-  exit status and time. Memory is the footprint Activity Monitor shows, and on
+  memory are tracked with `kqueue` (`EVFILT_PROC` `NOTE_FORK | NOTE_EXEC |
+  NOTE_EXIT`) and `proc_pid_rusage` across both raw PTYs and local `tachyon
+  server` Mux v2 panes (via `PROC_PIDTBSDINFO` `e_tpgid`), using a 25 ms burst
+  for newly forked sub-500 ms children before settling to 500 ms and sleeping
+  with zero wake-ups while idle. Memory is the footprint Activity Monitor shows, and on
   Apple silicon it includes what the command allocates on the GPU: PyTorch's
   MPS backend, MLX, anything through Metal. Measured: two 2 GiB MPS tensors
   read 4.14 GiB, the same as macOS's `footprint` tool. With a right prompt

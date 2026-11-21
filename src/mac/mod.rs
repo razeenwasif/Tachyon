@@ -15,6 +15,7 @@
 //! shell; closing one ends only that shell; the app keeps running with no
 //! windows, and clicking the Dock icon opens a fresh one.
 
+mod a11y;
 mod agents;
 mod boxdraw;
 mod chart;
@@ -59,6 +60,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
+    NSAccessibilityPostNotification, NSAccessibilityRole, NSAccessibilitySelectedTextChangedNotification,
+    NSAccessibilityTextAreaRole, NSAccessibilityTitleChangedNotification, NSAccessibilityValueChangedNotification,
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuItem, NSPasteboard,
     NSPasteboardTypeString, NSRequestUserAttentionType, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
@@ -783,6 +786,104 @@ define_class!(
         #[unsafe(method(tick:))]
         fn tick(&self, _link: &CADisplayLink) {
             with_window(self.id(), TermWindow::tick);
+        }
+
+        // -----------------------------------------------------------------
+        // VoiceOver & macOS Accessibility (`NSAccessibility` AXTextArea)
+        // -----------------------------------------------------------------
+
+        #[unsafe(method(isAccessibilityElement))]
+        fn is_accessibility_element(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method_id(accessibilityRole))]
+        fn accessibility_role(&self) -> Option<Retained<NSAccessibilityRole>> {
+            Some(objc2_foundation::NSCopying::copy(unsafe { NSAccessibilityTextAreaRole }))
+        }
+
+        #[unsafe(method_id(accessibilityRoleDescription))]
+        fn accessibility_role_description(&self) -> Option<Retained<NSString>> {
+            Some(NSString::from_str("terminal"))
+        }
+
+        #[unsafe(method_id(accessibilityLabel))]
+        fn accessibility_label(&self) -> Option<Retained<NSString>> {
+            let label = query_window(self.id(), TermWindow::a11y_label)
+                .unwrap_or_else(|| "Tachyon".to_string());
+            Some(NSString::from_str(&label))
+        }
+
+        #[unsafe(method_id(accessibilityValue))]
+        fn accessibility_value(&self) -> Option<Retained<NSString>> {
+            let text = query_window(self.id(), |w| w.a11y_grid().text).unwrap_or_default();
+            Some(NSString::from_str(&text))
+        }
+
+        #[unsafe(method(accessibilityNumberOfCharacters))]
+        fn accessibility_number_of_characters(&self) -> NSInteger {
+            query_window(self.id(), |w| w.a11y_grid().utf16_len as NSInteger).unwrap_or(0)
+        }
+
+        #[unsafe(method(accessibilityVisibleCharacterRange))]
+        fn accessibility_visible_character_range(&self) -> NSRange {
+            let len = query_window(self.id(), |w| w.a11y_grid().utf16_len).unwrap_or(0);
+            NSRange::new(0, len)
+        }
+
+        #[unsafe(method_id(accessibilitySelectedText))]
+        fn accessibility_selected_text(&self) -> Option<Retained<NSString>> {
+            let text = query_window(self.id(), |w| w.a11y_grid().selected_text.unwrap_or_default())
+                .unwrap_or_default();
+            Some(NSString::from_str(&text))
+        }
+
+        #[unsafe(method(accessibilitySelectedTextRange))]
+        fn accessibility_selected_text_range(&self) -> NSRange {
+            let (loc, len) = query_window(self.id(), |w| w.a11y_grid().selected_range).unwrap_or((0, 0));
+            NSRange::new(loc, len)
+        }
+
+        #[unsafe(method(accessibilityInsertionPointLineNumber))]
+        fn accessibility_insertion_point_line_number(&self) -> NSInteger {
+            query_window(self.id(), |w| w.a11y_grid().cursor_row as NSInteger).unwrap_or(0)
+        }
+
+        #[unsafe(method(accessibilityLineForIndex:))]
+        fn accessibility_line_for_index(&self, index: NSInteger) -> NSInteger {
+            if index < 0 {
+                return 0;
+            }
+            query_window(self.id(), |w| w.a11y_grid().line_for_utf16(index as usize) as NSInteger)
+                .unwrap_or(0)
+        }
+
+        #[unsafe(method(accessibilityRangeForLine:))]
+        fn accessibility_range_for_line(&self, line: NSInteger) -> NSRange {
+            if line < 0 {
+                return NSRange::new(NSNotFound as usize, 0);
+            }
+            query_window(self.id(), |w| {
+                w.a11y_grid()
+                    .range_for_line(line as usize)
+                    .map(|(loc, len)| NSRange::new(loc, len))
+                    .unwrap_or_else(|| NSRange::new(NSNotFound as usize, 0))
+            })
+            .unwrap_or_else(|| NSRange::new(NSNotFound as usize, 0))
+        }
+
+        #[unsafe(method_id(accessibilityStringForRange:))]
+        fn accessibility_string_for_range(&self, range: NSRange) -> Option<Retained<NSString>> {
+            let s = query_window(self.id(), |w| {
+                w.a11y_grid().substring_utf16(range.location, range.length)
+            })
+            .unwrap_or_default();
+            Some(NSString::from_str(&s))
+        }
+
+        #[unsafe(method(accessibilityFrameForRange:))]
+        fn accessibility_frame_for_range(&self, range: NSRange) -> NSRect {
+            query_window(self.id(), |w| w.a11y_frame_for_range(range)).unwrap_or(NSRect::ZERO)
         }
     }
 
@@ -2259,6 +2360,8 @@ struct TermWindow {
     rewind_badge: Option<RewindBadge>,
     /// Monotonic counter invalidating stale async server-rewind fetches on fast scrub or Esc.
     rewind_gen: u64,
+    /// Last VoiceOver `NSAccessibilityValueChangedNotification` timestamp (throttled to ~10 Hz).
+    last_a11y_notify: Option<Instant>,
     glass_tint: f32,
     /// Per-host accent & danger colour settings (`window.host_tint`,
     /// `window.host_tint_strength`, `host.color.*`) and cached glass state.
@@ -2610,6 +2713,7 @@ impl TermWindow {
         self.sync_host_tint(glass_accent.as_ref());
         self.update_cursor_layer(overlay);
         self.sync_pane_headers();
+        self.schedule_a11y_notify(true, false, false);
     }
 
     /// A divider as a hairline down (or across) the middle of its cells, in
@@ -4174,6 +4278,7 @@ impl TermWindow {
         let mut sel = Selection::new(selection::Pos { line: start, cell: 0, edge: 0 }, Unit::Char);
         sel.extend(selection::Pos { line: end - 1, cell: cols - 1, edge: cols });
         self.selection = Some(sel);
+        self.schedule_a11y_notify(false, true, false);
         self.request_redraw();
     }
 
@@ -4344,6 +4449,7 @@ impl TermWindow {
         // The cursor layer shows the old tab's cursor until redrawn.
         self.cursor_shown = None;
         self.refresh_label(self.active);
+        self.schedule_a11y_notify(true, true, true);
         self.request_redraw();
     }
 
@@ -5112,6 +5218,72 @@ impl TermWindow {
         self.window.convertRectToScreen(self.view.convertRect_toView(in_view, None))
     }
 
+    /// Snapshot of the focused pane's visible grid (or active Rewind frame) for VoiceOver.
+    fn a11y_grid(&self) -> a11y::A11yGrid {
+        if let Some(rw) = &self.rewound {
+            a11y::A11yGrid::from_term(&rw.term, None)
+        } else {
+            let term = self.term.lock();
+            a11y::A11yGrid::from_term(&term, self.selection.as_ref())
+        }
+    }
+
+    /// Contextual VoiceOver label for the focused terminal surface.
+    fn a11y_label(&mut self) -> String {
+        let label = self.tabs[self.active].label.clone();
+        let host = self.pty.mux_meta().map(|m| m.host.as_str());
+        a11y::accessibility_label(&label, host, self.rewound.is_some(), self.is_broadcasting())
+    }
+
+    /// Screen-space bounding box of a UTF-16 character range on the focused pane.
+    fn a11y_frame_for_range(&self, range: NSRange) -> NSRect {
+        let grid = self.a11y_grid();
+        let (r0, c0, r1, c1) = grid.cell_bounds_for_utf16(range.location, range.length);
+        let m = self.renderer.metrics();
+        let rect = self.tabs[self.active].pane().rect;
+        let (pad_x, pad_y) = self.renderer.pane_origin(rect.col, rect.row);
+        let s = self.scale();
+        let h = self.view.bounds().size.height;
+        let x = (pad_x + c0 as f32 * m.width) as f64 / s;
+        let w = (c1.saturating_sub(c0).max(1) as f32 * m.width) as f64 / s;
+        let top = (pad_y + r0 as f32 * m.height) as f64 / s;
+        let box_h = ((r1.saturating_sub(r0) + 1) as f32 * m.height) as f64 / s;
+        let in_view = NSRect::new(NSPoint::new(x, h - top - box_h), NSSize::new(w, box_h));
+        self.window.convertRectToScreen(self.view.convertRect_toView(in_view, None))
+    }
+
+    /// Post throttled macOS Accessibility notifications on the next runloop turn
+    /// (outside any `APP` borrow, and completely skipped when VoiceOver is off).
+    fn schedule_a11y_notify(&mut self, value_changed: bool, selection_changed: bool, title_changed: bool) {
+        if !NSWorkspace::sharedWorkspace().isVoiceOverEnabled() {
+            return;
+        }
+        let now = Instant::now();
+        if value_changed && !selection_changed && !title_changed {
+            if self.last_a11y_notify.is_some_and(|t| now.duration_since(t) < Duration::from_millis(100)) {
+                return;
+            }
+        }
+        self.last_a11y_notify = Some(now);
+        let id = self.id;
+        DispatchQueue::main().exec_async(move || {
+            let Some(view) = query_window(id, |w| w.view.clone()) else {
+                return;
+            };
+            unsafe {
+                if title_changed {
+                    NSAccessibilityPostNotification(view.as_ref(), NSAccessibilityTitleChangedNotification);
+                }
+                if value_changed {
+                    NSAccessibilityPostNotification(view.as_ref(), NSAccessibilityValueChangedNotification);
+                }
+                if selection_changed {
+                    NSAccessibilityPostNotification(view.as_ref(), NSAccessibilitySelectedTextChangedNotification);
+                }
+            }
+        });
+    }
+
     fn paste(&mut self) {
         let board = NSPasteboard::generalPasteboard();
         let Some(text) = board.stringForType(unsafe { NSPasteboardTypeString }) else {
@@ -5411,6 +5583,7 @@ impl TermWindow {
                 self.selection = None;
                 self.request_redraw();
             }
+            self.schedule_a11y_notify(false, true, false);
         }
     }
 
@@ -5820,6 +5993,7 @@ impl TermWindow {
 
     fn select_all(&mut self) {
         self.selection = Some(Selection::all(&self.term.lock()));
+        self.schedule_a11y_notify(false, true, false);
         self.request_redraw();
     }
 
@@ -6357,6 +6531,7 @@ impl App {
             rewound: None,
             rewind_badge: None,
             rewind_gen: 0,
+            last_a11y_notify: None,
             dragging_divider: None,
             key_time: None,
             busy_frames: 0,
