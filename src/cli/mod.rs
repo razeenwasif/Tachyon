@@ -1192,7 +1192,17 @@ fn cmd_skill(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                         auto_name = false;
                         i += 1;
                     }
-                    other => return Err(format!("unknown skill setup option `{other}`")),
+                    other => {
+                        if other.eq_ignore_ascii_case("all") {
+                            all = true;
+                            i += 1;
+                        } else if let Some(k) = AgentKind::parse(other) {
+                            agent = Some(k);
+                            i += 1;
+                        } else {
+                            return Err(format!("unknown skill setup option `{other}`"));
+                        }
+                    }
                 }
             }
             let _ = crate::config::Config::update_default_key(
@@ -1240,7 +1250,14 @@ fn cmd_skill(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                         );
                         i += 2;
                     }
-                    other => return Err(format!("unknown skill remove option `{other}`")),
+                    other => {
+                        if let Some(k) = AgentKind::parse(other) {
+                            agent = Some(k);
+                            i += 1;
+                        } else {
+                            return Err(format!("unknown skill remove option `{other}`"));
+                        }
+                    }
                 }
             }
             let statuses = if let Some(k) = agent {
