@@ -145,9 +145,9 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
 | ⌘B | Toggle the multi-host sidebar (local + remote servers) |
-| ⌘⇧P | Command Palette (commands, cheatsheet, live hosts & sessions) |
+| ⌘⇧P | Command Palette (commands, workspaces, cheatsheet, live hosts & sessions) |
 | ⌘/ | Floating Keyboard & CLI Cheatsheet (also via footer icon or Command Palette) |
-| ⌘, | Settings window (Server, Remote Hosts, Coding Agent Integrations, Interface, Notifications) |
+| ⌘, | Settings window (Server, Remote Hosts, Integrations, Interface, Notifications, Workspaces) |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
 | ⌘-click / ⌥⌘-click | Open a URL, a file in Quick Look, or a traceback's file:line in your editor / any file in your editor |
 | ⌃` (from any app) | The quick terminal, dropping from the notch, or away again |
@@ -524,6 +524,16 @@ Mac** stays neutral), or pick any preset/danger colour from the sidebar
 right-click menu (**Host Colour**), `⌘,` **Settings → Remote Hosts**,
 `tachyon hosts color <alias> <color>`, or `host.color.prod* = danger` in
 `tachyon.conf`.
+
+**Multi-host Session Workspaces / Templates.** Define reusable multi-host,
+multi-window, multi-pane setups as JSON templates in
+`~/.config/Tachyon/workspaces/<name>.json` (supporting `//` comments, recursive
+`layout` trees with ratios, flat `panes` shorthands, `~` home expansion on each
+host, `cmd` argv or interactive `run` commands, and an initial `focus` target).
+Launch idempotently from `⌘⇧P` (**Workspace: Up …**), `⌘,` **Settings →
+Workspaces**, or the CLI (`tachyon workspace up <name>`, `down`, `init`, `ls`,
+`show`, `rm`), or snapshot your live layout at any time with
+`tachyon workspace save <name> --all-hosts`.
 
 **Command Palette (`⌘⇧P`), Floating Cheatsheet (`⌘/`), & Settings (`⌘,`).**
 Press **⌘⇧P** (or click `⌘` in the sidebar toolbar) to fuzzy-search every

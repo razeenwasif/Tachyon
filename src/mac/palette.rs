@@ -55,6 +55,11 @@ pub enum PaletteAction {
     FollowJob,
     SetupAgentIntegrations,
     RefreshHosts,
+    LaunchWorkspace(String),
+    StopWorkspace(String),
+    SaveActiveSessionWorkspace,
+    SaveAllHostsWorkspace,
+    OpenWorkspacesFolder,
     NewSessionOnHost(String),
     SwitchWindow { host: String, window_id: String },
 }
@@ -227,7 +232,53 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             shortcut: "",
             action: PaletteAction::RefreshHosts,
         },
+        PaletteItem {
+            title: "Workspace: Save Active Session".into(),
+            subtitle: "Snapshot current session & split tree into ~/.config/Tachyon/workspaces/".into(),
+            shortcut: "",
+            action: PaletteAction::SaveActiveSessionWorkspace,
+        },
+        PaletteItem {
+            title: "Workspace: Save All Connected Hosts".into(),
+            subtitle: "Snapshot all live multi-host sessions into multi-host.json".into(),
+            shortcut: "",
+            action: PaletteAction::SaveAllHostsWorkspace,
+        },
+        PaletteItem {
+            title: "Workspace: Open Templates Folder".into(),
+            subtitle: "Reveal ~/.config/Tachyon/workspaces/ in Finder (creates starter if empty)".into(),
+            shortcut: "",
+            action: PaletteAction::OpenWorkspacesFolder,
+        },
     ];
+
+    for ws in crate::mux::workspace::list_workspaces() {
+        let running = workspace_is_running(&ws, hosts);
+        let host_list = ws.hosts.join(", ");
+        let state_tag = if running { " · ● active" } else { "" };
+        let desc = ws
+            .description
+            .as_deref()
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default();
+        items.push(PaletteItem {
+            title: format!("Workspace: Up {}", ws.name),
+            subtitle: format!(
+                "[{}] · {}s/{}w/{}p{}{}",
+                host_list, ws.session_count, ws.window_count, ws.pane_count, state_tag, desc
+            ),
+            shortcut: "",
+            action: PaletteAction::LaunchWorkspace(ws.name.clone()),
+        });
+        if running {
+            items.push(PaletteItem {
+                title: format!("Workspace: Down {}", ws.name),
+                subtitle: format!("Stop sessions for `{}` on [{}]", ws.name, host_list),
+                shortcut: "",
+                action: PaletteAction::StopWorkspace(ws.name),
+            });
+        }
+    }
 
     for h in hosts {
         items.push(PaletteItem {
@@ -263,6 +314,16 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
         }
     }
     items
+}
+
+fn workspace_is_running(ws: &crate::mux::workspace::WorkspaceSummary, hosts: &[HostView]) -> bool {
+    ws.session_names.iter().any(|(host_alias, sess_name)| {
+        hosts
+            .iter()
+            .find(|h| &h.alias == host_alias)
+            .and_then(|h| h.snapshot.as_ref())
+            .is_some_and(|snap| snap.sessions.iter().any(|s| &s.name == sess_name))
+    })
 }
 
 /// Score and filter palette items by query (prefix > substring > fuzzy subsequence).
@@ -654,7 +715,7 @@ impl PaletteCard {
         let delegate = PaletteSearchDelegate::new(mtm, window);
         let search = NSSearchField::initWithFrame(NSSearchField::alloc(mtm), NSRect::ZERO);
         search.setPlaceholderString(Some(&NSString::from_str(
-            "Type a command, cheatsheet, session, or host…",
+            "Type a command, workspace, cheatsheet, session, or host…",
         )));
         unsafe { search.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
         search.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
@@ -744,6 +805,28 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
             return;
         }
         PaletteAction::RefreshHosts => super::mux_refresh_all(),
+        PaletteAction::LaunchWorkspace(name) => super::mux_workspace_up(win_id, &name),
+        PaletteAction::StopWorkspace(name) => super::mux_workspace_down(&name),
+        PaletteAction::SaveActiveSessionWorkspace => {
+            if let Err(e) = super::mux_workspace_save(win_id, false) {
+                crate::log::force(&format!("workspace save failed: {e}"));
+            } else {
+                super::open_settings_section(5);
+                return;
+            }
+        }
+        PaletteAction::SaveAllHostsWorkspace => {
+            if let Err(e) = super::mux_workspace_save(win_id, true) {
+                crate::log::force(&format!("multi-host workspace save failed: {e}"));
+            } else {
+                super::open_settings_section(5);
+                return;
+            }
+        }
+        PaletteAction::OpenWorkspacesFolder => {
+            super::open_workspaces_folder();
+            return;
+        }
         PaletteAction::NewSessionOnHost(host) => super::mux_new_session(win_id, &host),
         PaletteAction::SwitchWindow { host, window_id } => {
             super::mux_select_window(win_id, &host, &window_id);

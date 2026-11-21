@@ -46,12 +46,13 @@ struct NavSection {
     symbol: &'static str,
 }
 
-const SECTIONS: [NavSection; 5] = [
+const SECTIONS: [NavSection; 6] = [
     NavSection { title: "Server", symbol: "server.rack" },
     NavSection { title: "Remote Hosts", symbol: "globe" },
     NavSection { title: "Integrations", symbol: "sparkles" },
     NavSection { title: "Interface", symbol: "macwindow" },
     NavSection { title: "Notifications", symbol: "bell.badge" },
+    NavSection { title: "Workspaces", symbol: "square.grid.2x2" },
 ];
 
 thread_local! {
@@ -316,6 +317,8 @@ struct ActionState {
     /// Dynamic aliases referenced by tag for host buttons.
     host_aliases: RefCell<Vec<String>>,
     ssh_candidates: RefCell<Vec<String>>,
+    workspace_names: RefCell<Vec<String>>,
+    workspace_paths: RefCell<Vec<std::path::PathBuf>>,
     status_note: RefCell<Option<String>>,
 }
 
@@ -565,6 +568,92 @@ define_class!(
             self.set_note("Sent test notification (macOS banners require /Applications/Tachyon.app).");
             refresh_if_open();
         }
+
+        #[unsafe(method(wsLaunch:))]
+        fn ws_launch(&self, sender: Option<&AnyObject>) {
+            if let Some(name) = tagged_string(sender, &self.ivars().workspace_names.borrow()) {
+                super::mux_workspace_up(0, &name);
+                self.set_note(&format!("Launching workspace `{name}`…"));
+                refresh_if_open();
+            }
+        }
+
+        #[unsafe(method(wsStop:))]
+        fn ws_stop(&self, sender: Option<&AnyObject>) {
+            if let Some(name) = tagged_string(sender, &self.ivars().workspace_names.borrow()) {
+                super::mux_workspace_down(&name);
+                self.set_note(&format!("Stopping workspace `{name}`…"));
+                refresh_if_open();
+            }
+        }
+
+        #[unsafe(method(wsEdit:))]
+        fn ws_edit(&self, sender: Option<&AnyObject>) {
+            let idx = sender
+                .and_then(|s| s.downcast_ref::<NSButton>())
+                .map(|b| b.tag());
+            if let Some(i) = idx.filter(|&i| i >= 0) {
+                if let Some(path) = self.ivars().workspace_paths.borrow().get(i as usize).cloned() {
+                    super::open_workspace_file(&path);
+                    self.set_note(&format!("Opened {}", crate::mux::workspace::display_path(&path)));
+                    refresh_if_open();
+                }
+            }
+        }
+
+        #[unsafe(method(wsDelete:))]
+        fn ws_delete(&self, sender: Option<&AnyObject>) {
+            if let Some(name) = tagged_string(sender, &self.ivars().workspace_names.borrow()) {
+                match crate::mux::workspace::remove_workspace(&name) {
+                    Ok(_) => self.set_note(&format!("Removed workspace `{name}`.")),
+                    Err(e) => self.set_note(&format!("Remove failed: {e}")),
+                }
+                refresh_if_open();
+            }
+        }
+
+        #[unsafe(method(wsSaveActive:))]
+        fn ws_save_active(&self, _sender: Option<&AnyObject>) {
+            match super::mux_workspace_save(0, false) {
+                Ok((name, path)) => self.set_note(&format!(
+                    "Saved `{name}` -> {}",
+                    crate::mux::workspace::display_path(&path)
+                )),
+                Err(e) => self.set_note(&format!("Save failed: {e}")),
+            }
+            refresh_if_open();
+        }
+
+        #[unsafe(method(wsSaveAll:))]
+        fn ws_save_all(&self, _sender: Option<&AnyObject>) {
+            match super::mux_workspace_save(0, true) {
+                Ok((name, path)) => self.set_note(&format!(
+                    "Saved `{name}` -> {}",
+                    crate::mux::workspace::display_path(&path)
+                )),
+                Err(e) => self.set_note(&format!("Save failed: {e}")),
+            }
+            refresh_if_open();
+        }
+
+        #[unsafe(method(wsNewStarter:))]
+        fn ws_new_starter(&self, _sender: Option<&AnyObject>) {
+            match super::mux_workspace_init_starter() {
+                Ok((name, path)) => self.set_note(&format!(
+                    "Created `{name}` -> {}",
+                    crate::mux::workspace::display_path(&path)
+                )),
+                Err(e) => self.set_note(&format!("Init failed: {e}")),
+            }
+            refresh_if_open();
+        }
+
+        #[unsafe(method(wsOpenFolder:))]
+        fn ws_open_folder(&self, _sender: Option<&AnyObject>) {
+            super::open_workspaces_folder();
+            self.set_note("Opened workspaces folder in Finder.");
+            refresh_if_open();
+        }
     }
 );
 
@@ -692,7 +781,8 @@ impl SettingsWindow {
             1 => self.build_remote_hosts(mtm, pad, inner_w, &mut y),
             2 => self.build_integrations(mtm, pad, inner_w, &mut y),
             3 => self.build_interface(mtm, pad, inner_w, &mut y),
-            _ => self.build_notifications(mtm, pad, inner_w, &mut y),
+            4 => self.build_notifications(mtm, pad, inner_w, &mut y),
+            _ => self.build_workspaces(mtm, pad, inner_w, &mut y),
         }
 
         if let Some(note) = self.actions.ivars().status_note.borrow().as_deref() {
@@ -1110,6 +1200,165 @@ impl SettingsWindow {
         }
         self.detail.addSubview(&card);
         *y += 150.0;
+    }
+
+    fn build_workspaces(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
+        let target: &AnyObject = self.actions.as_ref();
+        let hosts = super::mux_host_views();
+        let all_ws = crate::mux::workspace::list_workspaces();
+        let shown: Vec<_> = all_ws.iter().take(5).cloned().collect();
+
+        {
+            let mut names = self.actions.ivars().workspace_names.borrow_mut();
+            let mut paths = self.actions.ivars().workspace_paths.borrow_mut();
+            names.clear();
+            paths.clear();
+            for ws in &shown {
+                names.push(ws.name.clone());
+                paths.push(ws.path.clone());
+            }
+        }
+
+        let sub = label(
+            mtm,
+            "Multi-host Session Templates (launch from here, ⌘⇧P, or `tachyon workspace up`)",
+            11.5,
+            false,
+            &NSColor::secondaryLabelColor(),
+        );
+        sub.setFrame(NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 16.0)));
+        self.detail.addSubview(&sub);
+        *y += 22.0;
+
+        let row_h = 46.0;
+        let extra_row = if all_ws.len() > shown.len() { 20.0 } else { 0.0 };
+        let list_h = if shown.is_empty() {
+            66.0
+        } else {
+            16.0 + shown.len() as f64 * row_h + extra_row
+        };
+        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, list_h)));
+
+        if shown.is_empty() {
+            let empty = label(
+                mtm,
+                "No saved workspaces yet. Click “Save Active Session” or “New Starter” below, or run `tachyon workspace init dev`.",
+                11.5,
+                false,
+                &NSColor::secondaryLabelColor(),
+            );
+            empty.setFrame(NSRect::new(NSPoint::new(14.0, 16.0), NSSize::new(w - 28.0, 36.0)));
+            card.addSubview(&empty);
+        } else {
+            for (idx, ws) in shown.iter().enumerate() {
+                let ry = 10.0 + idx as f64 * row_h;
+                let active = ws.session_names.iter().any(|(host_alias, sess_name)| {
+                    hosts
+                        .iter()
+                        .find(|h| &h.alias == host_alias)
+                        .and_then(|h| h.snapshot.as_ref())
+                        .is_some_and(|snap| snap.sessions.iter().any(|s| &s.name == sess_name))
+                });
+                let title_text = if active {
+                    format!("🟢 {}", ws.name)
+                } else {
+                    ws.name.clone()
+                };
+                let t = label(mtm, &title_text, 12.5, true, &NSColor::labelColor());
+                t.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                t.setFrame(NSRect::new(NSPoint::new(14.0, ry), NSSize::new((w - 236.0).max(80.0), 17.0)));
+
+                let meta = format!(
+                    "[{}] · {}s/{}w/{}p",
+                    ws.hosts.join(", "),
+                    ws.session_count,
+                    ws.window_count,
+                    ws.pane_count
+                );
+                let d = label(mtm, &meta, 10.5, false, &NSColor::secondaryLabelColor());
+                d.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                d.setFrame(NSRect::new(NSPoint::new(14.0, ry + 18.0), NSSize::new((w - 236.0).max(80.0), 15.0)));
+
+                let launch_btn = push_button(mtm, "Up", target, sel!(wsLaunch:));
+                launch_btn.setTag(idx as isize);
+                launch_btn.setFrame(NSRect::new(NSPoint::new(w - 210.0, ry + 5.0), NSSize::new(48.0, 24.0)));
+
+                let stop_btn = push_button(mtm, "Down", target, sel!(wsStop:));
+                stop_btn.setTag(idx as isize);
+                stop_btn.setFrame(NSRect::new(NSPoint::new(w - 158.0, ry + 5.0), NSSize::new(56.0, 24.0)));
+
+                let edit_btn = push_button(mtm, "Edit", target, sel!(wsEdit:));
+                edit_btn.setTag(idx as isize);
+                edit_btn.setFrame(NSRect::new(NSPoint::new(w - 98.0, ry + 5.0), NSSize::new(48.0, 24.0)));
+
+                let del_btn = push_button(mtm, "×", target, sel!(wsDelete:));
+                del_btn.setTag(idx as isize);
+                del_btn.setFrame(NSRect::new(NSPoint::new(w - 46.0, ry + 5.0), NSSize::new(32.0, 24.0)));
+
+                for v in [
+                    &*t as &NSView,
+                    &*d as &NSView,
+                    &*launch_btn as &NSView,
+                    &*stop_btn as &NSView,
+                    &*edit_btn as &NSView,
+                    &*del_btn as &NSView,
+                ] {
+                    card.addSubview(v);
+                }
+            }
+            if all_ws.len() > shown.len() {
+                let more = label(
+                    mtm,
+                    &format!(
+                        "+{} more template(s) — launch any via ⌘⇧P or Open Folder",
+                        all_ws.len() - shown.len()
+                    ),
+                    10.5,
+                    false,
+                    &NSColor::tertiaryLabelColor(),
+                );
+                more.setFrame(NSRect::new(
+                    NSPoint::new(14.0, 10.0 + shown.len() as f64 * row_h),
+                    NSSize::new(w - 28.0, 16.0),
+                ));
+                card.addSubview(&more);
+            }
+        }
+        self.detail.addSubview(&card);
+        *y += list_h + 14.0;
+
+        // Actions card: Snapshot / Starter / Open Folder.
+        let acard = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 88.0)));
+        let b_save = push_button(mtm, "Save Active Session", target, sel!(wsSaveActive:));
+        b_save.setFrame(NSRect::new(NSPoint::new(14.0, 12.0), NSSize::new(150.0, 26.0)));
+        let b_all = push_button(mtm, "Save All Hosts", target, sel!(wsSaveAll:));
+        b_all.setFrame(NSRect::new(NSPoint::new(170.0, 12.0), NSSize::new(120.0, 26.0)));
+        let b_init = push_button(mtm, "New Starter", target, sel!(wsNewStarter:));
+        b_init.setFrame(NSRect::new(NSPoint::new(296.0, 12.0), NSSize::new(104.0, 26.0)));
+
+        let b_open = push_button(mtm, "Open Folder", target, sel!(wsOpenFolder:));
+        b_open.setFrame(NSRect::new(NSPoint::new(14.0, 48.0), NSSize::new(108.0, 26.0)));
+        let dir_lbl = label(
+            mtm,
+            &crate::mux::workspace::display_path(&crate::mux::workspace::workspaces_dir()),
+            11.0,
+            false,
+            &NSColor::tertiaryLabelColor(),
+        );
+        dir_lbl.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        dir_lbl.setFrame(NSRect::new(NSPoint::new(130.0, 53.0), NSSize::new(w - 144.0, 16.0)));
+
+        for v in [
+            &*b_save as &NSView,
+            &*b_all as &NSView,
+            &*b_init as &NSView,
+            &*b_open as &NSView,
+            &*dir_lbl as &NSView,
+        ] {
+            acard.addSubview(v);
+        }
+        self.detail.addSubview(&acard);
+        *y += 102.0;
     }
 }
 

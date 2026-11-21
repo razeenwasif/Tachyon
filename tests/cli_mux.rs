@@ -325,3 +325,142 @@ fn cli_hosts_color_sets_lists_and_resets_color() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_workspace_init_up_idempotent_save_recreate_down_and_rm() {
+    let dir = temp_dir("workspace-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    let ws_dir = dir.join("workspaces");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let run_ws = |args: &[&str]| -> (i32, String, String) {
+        let out = Command::new(bin())
+            .args(args)
+            .env("TACHYON_SOCKET", &sock)
+            .env("TACHYON_HOSTS_FILE", &hosts)
+            .env("TACHYON_WORKSPACES_DIR", &ws_dir)
+            .env_remove("TACHYON_SERVER")
+            .env_remove("TACHYON_SESSION")
+            .env_remove("TACHYON_WINDOW")
+            .env_remove("TACHYON_BLOCK")
+            .output()
+            .expect("spawn tachyon cli");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // 1. Start local isolated server.
+    let (code, _, err) = run_ws(&["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // 2. Write a 3-pane recursive layout + 2nd window panes-shorthand template.
+    let tpl_path = ws_dir.join("dev-stack.json");
+    let tpl = r#"{
+      // End-to-end workspace fixture
+      "name": "dev-stack",
+      "description": "3-pane nested layout + 2nd window",
+      "focus": { "host": "local", "session": "dev-stack", "window": "code" },
+      "sessions": [
+        {
+          "host": "local",
+          "name": "dev-stack",
+          "cwd": "~",
+          "windows": [
+            {
+              "name": "code",
+              "layout": {
+                "split": "right",
+                "ratio": 0.65,
+                "a": { "label": "left-main", "cmd": ["/bin/sh", "-c", "echo LEFT_OK; sleep 20"] },
+                "b": {
+                  "split": "down",
+                  "ratio": 0.4,
+                  "a": { "label": "top-right", "focus": true, "cmd": ["/bin/sh", "-c", "echo TOPRIGHT_OK; sleep 20"] },
+                  "b": { "label": "bot-right", "cmd": ["/bin/sh", "-c", "echo BOTRIGHT_OK; sleep 20"] }
+                }
+              }
+            },
+            {
+              "name": "ops",
+              "panes": [
+                { "label": "ops-1", "cmd": ["/bin/sh", "-c", "echo OPS1; sleep 20"] },
+                { "label": "ops-2", "split": "right", "cmd": ["/bin/sh", "-c", "echo OPS2; sleep 20"] }
+              ]
+            }
+          ]
+        }
+      ]
+    }"#;
+    std::fs::write(&tpl_path, tpl).unwrap();
+
+    // 3. `workspace ls --json` lists it with accurate counts (1s/2w/5p).
+    let (code, out, err) = run_ws(&["workspace", "ls", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let ls_v: Value = serde_json::from_str(&out).unwrap();
+    let arr = ls_v["workspaces"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "dev-stack");
+    assert_eq!(arr[0]["windows"], 2);
+    assert_eq!(arr[0]["panes"], 5);
+
+    // 4. `workspace up dev-stack --json` creates the exact 3-pane nested tree & ratios.
+    let (code, out, err) = run_ws(&["workspace", "up", "dev-stack", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let up_v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(up_v["sessions"][0]["reused"], false);
+    assert_eq!(up_v["sessions"][0]["windows"].as_array().unwrap().len(), 2);
+    assert_eq!(up_v["sessions"][0]["windows"][0]["blocks"].as_array().unwrap().len(), 3);
+    assert_eq!(up_v["sessions"][0]["windows"][1]["blocks"].as_array().unwrap().len(), 2);
+    let focus_wid = up_v["focus"]["window_id"].as_str().unwrap().to_string();
+    assert_eq!(focus_wid, up_v["sessions"][0]["windows"][0]["window_id"]);
+
+    // Verify exact nested layout ratios & focus on server state.
+    let (code, state_out, err) = run_ws(&["ls", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let snap: Value = serde_json::from_str(&state_out).unwrap();
+    let code_win = snap["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"] == focus_wid)
+        .expect("code window present");
+    assert_eq!(code_win["name"], "code");
+    assert_eq!(code_win["layout"]["dir"], "right");
+    assert!((code_win["layout"]["ratio"].as_f64().unwrap() - 0.65).abs() < 0.01);
+    assert_eq!(code_win["layout"]["b"]["dir"], "down");
+    assert!((code_win["layout"]["b"]["ratio"].as_f64().unwrap() - 0.4).abs() < 0.01);
+
+    // 5. Second `workspace up dev-stack --json` is idempotent (reused = true).
+    let (code, out, err) = run_ws(&["workspace", "up", "dev-stack", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let up2: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(up2["sessions"][0]["reused"], true);
+    assert_eq!(up2["sessions"][0]["session_id"], up_v["sessions"][0]["session_id"]);
+
+    // 6. `workspace save captured` snapshots the live multi-window split tree cleanly.
+    let (code, out, err) = run_ws(&["workspace", "save", "captured", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let saved: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(saved["name"], "captured");
+    assert_eq!(saved["windows"], 2);
+    assert_eq!(saved["panes"], 5);
+
+    // 7. `workspace down dev-stack` stops the session; `workspace rm` deletes templates.
+    let (code, out, err) = run_ws(&["workspace", "down", "dev-stack", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let down_v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(down_v["stopped"].as_array().unwrap().len(), 1);
+
+    let (code, _, err) = run_ws(&["workspace", "init", "starter-demo"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, _, err) = run_ws(&["workspace", "rm", "starter-demo"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let (code, _, err) = run_ws(&["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
