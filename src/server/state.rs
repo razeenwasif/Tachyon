@@ -167,6 +167,7 @@ struct StreamSub {
 struct ParsedBlock {
     term: Term,
     processor: Processor,
+    rewind: crate::term::rewind::RewindLog,
     size: (u16, u16),
     last_title_rev: u64,
     last_status_rev: u64,
@@ -178,9 +179,15 @@ impl ParsedBlock {
         let ws = pty.size();
         if ws != self.size {
             self.size = ws;
-            self.term.resize(ws.0.max(1) as usize, ws.1.max(1) as usize);
+            let (c, r) = (ws.0.max(1) as usize, ws.1.max(1) as usize);
+            self.term.resize(c, r);
+            self.rewind.record_resize(c, r);
         }
+        self.rewind.record(chunk);
         self.processor.advance(&mut self.term, chunk);
+        if self.rewind.wants_snapshot() && self.processor.is_ground() {
+            self.rewind.snapshot(self.term.rewind_snapshot());
+        }
         self.term.take_command_events();
         self.term.take_dirty();
         let rev = self.term.title_revision;
@@ -354,6 +361,9 @@ impl ServerState {
     }
 
     pub fn with_auth_token(auth_token: Option<String>) -> Arc<Self> {
+        if let Some(root) = server_rewind_root() {
+            crate::term::rewind::remove_stale(&root);
+        }
         Arc::new(Self {
             host_info: HostInfo {
                 hostname: local_hostname(),
@@ -525,16 +535,27 @@ impl ServerState {
             self.rpc_block_attach(outbox, req_id, req);
             return RpcOutcome::Continue;
         }
-        // `block.wait` blocks until process exit; run off the reader thread so
-        // the client's connection stays responsive for events/pings/output.
-        if op == "block.wait" {
+        // `block.wait`, `block.rewind.frame`, and `block.rewind.provenance` may
+        // block or replay cold disk segments; run off the client reader loop so
+        // live PTY I/O, pings, and events stay responsive.
+        if matches!(
+            op,
+            "block.wait" | "block.rewind.frame" | "block.rewind.provenance"
+        ) {
             let state = Arc::clone(self);
             let out = Arc::clone(outbox);
+            let op_owned = op.to_string();
             let req_owned = req.clone();
             let _ = std::thread::Builder::new()
-                .name("tachyon-srv-wait".into())
+                .name("tachyon-srv-async-rpc".into())
                 .spawn(move || {
-                    let body = match state.rpc_block_wait(&req_owned) {
+                    let res = match op_owned.as_str() {
+                        "block.wait" => state.rpc_block_wait(&req_owned),
+                        "block.rewind.frame" => state.rpc_block_rewind_frame(&req_owned),
+                        "block.rewind.provenance" => state.rpc_block_rewind_provenance(&req_owned),
+                        _ => Err(format!("unknown op `{op_owned}`")),
+                    };
+                    let body = match res {
                         Ok(data) => json!({ "ok": true, "data": data }),
                         Err(err) => json!({ "ok": false, "error": err }),
                     };
@@ -577,6 +598,9 @@ impl ServerState {
             "block.detach" => self.rpc_block_detach(outbox, req),
             "block.send" => self.rpc_block_send(req),
             "block.capture" => self.rpc_block_capture(req),
+            "block.rewind.list" => self.rpc_block_rewind_list(req),
+            "block.rewind.frame" => self.rpc_block_rewind_frame(req),
+            "block.rewind.provenance" => self.rpc_block_rewind_provenance(req),
             "block.wait" => self.rpc_block_wait(req),
             _ => Err(format!("unknown op `{op}`")),
         };
@@ -703,6 +727,10 @@ impl ServerState {
             parsed: Mutex::new(ParsedBlock {
                 term: Term::new(cols as usize, rows as usize, DEFAULT_SCROLLBACK),
                 processor: Processor::new(),
+                rewind: crate::term::rewind::RewindLog::new(
+                    Term::new(cols as usize, rows as usize, 0),
+                    server_rewind_dir(&block_id),
+                ),
                 size: (cols, rows),
                 last_title_rev: 0,
                 last_status_rev: 0,
@@ -1346,6 +1374,123 @@ impl ServerState {
         Ok(json!({ "block_id": bid, "text": text }))
     }
 
+    fn rpc_block_rewind_list(&self, req: &Value) -> Result<Value, String> {
+        let bid = req.get("block_id").and_then(Value::as_str).ok_or("missing block_id")?;
+        let block = self
+            .inner
+            .lock()
+            .blocks
+            .get(bid)
+            .cloned()
+            .ok_or_else(|| format!("no block `{bid}`"))?;
+        let mut parsed = block.parsed.lock();
+        block.drain_queue_into(&mut parsed);
+        let frames: Vec<Value> = parsed
+            .rewind
+            .frames_with_age()
+            .into_iter()
+            .map(|(seq, age_ms)| json!([seq, age_ms]))
+            .collect();
+        Ok(json!({
+            "block_id": bid,
+            "frames": frames,
+        }))
+    }
+
+    fn rpc_block_rewind_frame(&self, req: &Value) -> Result<Value, String> {
+        use base64::Engine;
+        let bid = req.get("block_id").and_then(Value::as_str).ok_or("missing block_id")?;
+        let seq = req
+            .get("seq")
+            .and_then(Value::as_u64)
+            .ok_or("missing seq")?;
+        let include_text = req
+            .get("include_text")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let ansi = req.get("ansi").and_then(Value::as_bool).unwrap_or(false);
+        let block = self
+            .inner
+            .lock()
+            .blocks
+            .get(bid)
+            .cloned()
+            .ok_or_else(|| format!("no block `{bid}`"))?;
+        let (term, age_ms) = {
+            let mut parsed = block.parsed.lock();
+            block.drain_queue_into(&mut parsed);
+            let age_ms = parsed
+                .rewind
+                .chunk_time(seq)
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let term = parsed
+                .rewind
+                .replay(seq)
+                .ok_or_else(|| format!("rewind frame `{seq}` unavailable"))?;
+            (term, age_ms)
+        };
+        let cols = term.cols();
+        let rows = term.rows();
+        let vt = term.to_vt();
+        let lz4 = lz4_flex::compress_prepend_size(&vt);
+        let vt_lz4_b64 = base64::engine::general_purpose::STANDARD.encode(&lz4);
+        let mut out = json!({
+            "block_id": bid,
+            "seq": seq,
+            "cols": cols,
+            "rows": rows,
+            "age_ms": age_ms,
+            "vt_lz4_b64": vt_lz4_b64,
+        });
+        if include_text {
+            let text = if ansi {
+                String::from_utf8_lossy(&vt).into_owned()
+            } else {
+                let h = term.grid().history_len();
+                if rows == 0 || cols == 0 {
+                    String::new()
+                } else {
+                    term.text_range(h, 0, h + rows - 1, cols - 1)
+                }
+            };
+            out["text"] = json!(text);
+        }
+        Ok(out)
+    }
+
+    fn rpc_block_rewind_provenance(&self, req: &Value) -> Result<Value, String> {
+        let bid = req.get("block_id").and_then(Value::as_str).ok_or("missing block_id")?;
+        let seq = req.get("seq").and_then(Value::as_u64).ok_or("missing seq")?;
+        let x = req.get("x").and_then(Value::as_u64).ok_or("missing x")? as usize;
+        let y = req.get("y").and_then(Value::as_u64).ok_or("missing y")? as usize;
+        let block = self
+            .inner
+            .lock()
+            .blocks
+            .get(bid)
+            .cloned()
+            .ok_or_else(|| format!("no block `{bid}`"))?;
+        let mut parsed = block.parsed.lock();
+        block.drain_queue_into(&mut parsed);
+        let frame_time = parsed.rewind.chunk_time(seq);
+        match parsed.rewind.provenance(seq, x, y) {
+            Some(p) => {
+                let before_ms = frame_time
+                    .map(|ft| ft.saturating_duration_since(p.time).as_millis() as u64)
+                    .unwrap_or(0);
+                Ok(json!({
+                    "found": true,
+                    "offset": p.offset,
+                    "before_ms": before_ms,
+                    "context": p.context,
+                    "scrolled": p.scrolled,
+                }))
+            }
+            None => Ok(json!({ "found": false })),
+        }
+    }
+
     fn rpc_block_wait(&self, req: &Value) -> Result<Value, String> {
         let bid = req.get("block_id").and_then(Value::as_str).ok_or("missing block_id")?;
         let timeout = req.get("timeout_ms").and_then(Value::as_u64).map(Duration::from_millis);
@@ -1516,4 +1661,28 @@ fn expand_tilde(path: &str) -> String {
         return std::path::PathBuf::from(home).join(rest).to_string_lossy().into_owned();
     }
     path.to_string()
+}
+
+/// Root folder for server-owned Rewind cold segments (cleaned of dead-PID
+/// directories on server startup).
+fn server_rewind_root() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|d| std::path::PathBuf::from(d).join("Tachyon").join("rewind"))
+            .or_else(|| Some(std::env::temp_dir().join("tachyon-rewind")))
+    }
+    #[cfg(not(windows))]
+    {
+        let sock = crate::mux::default_socket_path();
+        sock.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join("rewind"))
+    }
+}
+
+fn server_rewind_dir(block_id: &str) -> Option<std::path::PathBuf> {
+    let root = server_rewind_root()?;
+    Some(root.join(format!("{}-{block_id}", std::process::id())))
 }

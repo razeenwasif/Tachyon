@@ -40,8 +40,8 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 continue;
             }
             "server" | "bridge" | "hosts" | "workspace" | "ws" | "agents" | "agent" | "ls"
-            | "new" | "session" | "window" | "split" | "run" | "send" | "capture" | "events"
-            | "skill" | "status" | "hook" | "help" | "--help" | "-h" => {
+            | "new" | "session" | "window" | "split" | "run" | "send" | "capture" | "rewind"
+            | "events" | "skill" | "status" | "hook" | "help" | "--help" | "-h" => {
                 return true;
             }
             _ => return false,
@@ -119,6 +119,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "run" => cmd_run(&opts, tail),
         "send" => cmd_send(&opts, tail),
         "capture" => cmd_capture(&opts, tail),
+        "rewind" => cmd_rewind(&opts, tail),
         "events" => cmd_events(&opts, tail),
         "skill" => cmd_skill(&opts, tail),
         "status" => cmd_status(tail),
@@ -1188,6 +1189,151 @@ fn cmd_capture(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+fn cmd_rewind(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    let mut block: Option<String> = None;
+    let mut list = false;
+    let mut frame_idx: Option<usize> = None;
+    let mut seq_arg: Option<u64> = None;
+    let mut ansi = false;
+    let mut prov_xy: Option<(usize, usize)> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-b" | "--block" => {
+                block = Some(args.get(i + 1).ok_or("-b/--block requires an id")?.clone());
+                i += 2;
+            }
+            "--list" | "-l" => {
+                list = true;
+                i += 1;
+            }
+            "--frame" | "-f" => {
+                let v = args.get(i + 1).ok_or("--frame requires a 1-based index")?;
+                frame_idx = Some(v.parse::<usize>().map_err(|_| format!("invalid --frame `{v}`"))?);
+                i += 2;
+            }
+            "--seq" => {
+                let v = args.get(i + 1).ok_or("--seq requires a frame sequence number")?;
+                seq_arg = Some(v.parse::<u64>().map_err(|_| format!("invalid --seq `{v}`"))?);
+                i += 2;
+            }
+            "--ansi" => {
+                ansi = true;
+                i += 1;
+            }
+            "--provenance" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or("--provenance requires COL,ROW (1-based)")?;
+                let (cx, cy) = v
+                    .split_once(',')
+                    .ok_or("--provenance expects COL,ROW (e.g. 1,1)")?;
+                let x = cx.trim().parse::<usize>().map_err(|_| "bad COL")?.saturating_sub(1);
+                let y = cy.trim().parse::<usize>().map_err(|_| "bad ROW")?.saturating_sub(1);
+                prov_xy = Some((x, y));
+                i += 2;
+            }
+            other => return Err(format!("unknown rewind option `{other}`")),
+        }
+    }
+
+    let (_, c) = connect(opts, false)?;
+    let bid = resolve_block_id(block, &c)?;
+    let frames = c.rewind_list(&bid).map_err(|e| e.to_string())?;
+
+    if list || (frame_idx.is_none() && seq_arg.is_none() && prov_xy.is_none()) {
+        if opts.json {
+            print_json(&json!({
+                "block_id": bid,
+                "frames": frames.iter().enumerate().map(|(idx, (seq, age_ms))| json!({
+                    "frame": idx + 1,
+                    "seq": seq,
+                    "age_ms": age_ms,
+                })).collect::<Vec<_>>(),
+            }));
+        } else if frames.is_empty() {
+            println!("No rewind frames recorded for `{bid}`.");
+        } else {
+            for (idx, (seq, age_ms)) in frames.iter().enumerate() {
+                println!(
+                    "#{:<4} seq={:<6}  {:.1}s ago",
+                    idx + 1,
+                    seq,
+                    *age_ms as f64 / 1000.0
+                );
+            }
+        }
+        return Ok(0);
+    }
+
+    let seq = if let Some(s) = seq_arg {
+        s
+    } else if let Some(f1) = frame_idx {
+        if f1 == 0 || f1 > frames.len() {
+            return Err(format!("frame {f1} out of range (1..={})", frames.len()));
+        }
+        frames[f1 - 1].0
+    } else {
+        frames
+            .last()
+            .map(|(s, _)| *s)
+            .ok_or_else(|| format!("no rewind frames for `{bid}`"))?
+    };
+
+    if let Some((x, y)) = prov_xy {
+        let prov = c
+            .rewind_provenance(&bid, seq, x, y)
+            .map_err(|e| e.to_string())?;
+        if opts.json {
+            print_json(&json!({
+                "block_id": bid,
+                "seq": seq,
+                "col": x + 1,
+                "row": y + 1,
+                "provenance": prov.as_ref().map(|p| json!({
+                    "offset": p.offset,
+                    "before_ms": p.before_ms,
+                    "context": p.context,
+                    "scrolled": p.scrolled,
+                })),
+            }));
+        } else if let Some(p) = prov {
+            let how = if p.scrolled { "scrolled by" } else { "written by" };
+            println!(
+                "col {}, row {} · byte {} · {:.1}s before frame · {} {}",
+                x + 1,
+                y + 1,
+                p.offset,
+                p.before_ms as f64 / 1000.0,
+                how,
+                p.context
+            );
+        } else {
+            println!("col {}, row {}: not modified in kept output", x + 1, y + 1);
+        }
+        return Ok(0);
+    }
+
+    let frame = c
+        .rewind_frame(&bid, seq, true, ansi)
+        .map_err(|e| e.to_string())?;
+    let text = frame.text.unwrap_or_default();
+    if opts.json {
+        print_json(&json!({
+            "block_id": bid,
+            "seq": frame.seq,
+            "cols": frame.cols,
+            "rows": frame.rows,
+            "age_ms": frame.age_ms,
+            "text": text,
+        }));
+    } else {
+        println!("{text}");
+    }
+    Ok(0)
+}
+
 fn cmd_events(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let mut session_filter: Option<String> = None;
     let mut i = 0;
@@ -1971,6 +2117,7 @@ Sessions, Windows & Automation:
   tachyon run [--session S] [--split right|down] [--wait] [--capture] -- CMD...
   tachyon send [-b B | --all [-w W]] [--enter] <TEXT | ->
   tachyon capture [-b B] [--lines N] [--ansi]
+  tachyon rewind [-b B] [--list | --frame N | --seq S] [--provenance C,R] [--ansi]
   tachyon events [-s SESSION] [--json]
 
 Coding Agents & Live Status (OSC 7501):

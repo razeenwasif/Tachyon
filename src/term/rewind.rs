@@ -221,6 +221,21 @@ impl RewindLog {
         out
     }
 
+    /// The frames that can be shown, oldest first, as `(seq, age_ms)` relative
+    /// to now (wire-safe across machines without clock-skew assumptions).
+    pub fn frames_with_age(&self) -> Vec<(u64, u64)> {
+        let now = Instant::now();
+        self.frames()
+            .into_iter()
+            .map(|(seq, t)| (seq, now.saturating_duration_since(t).as_millis() as u64))
+            .collect()
+    }
+
+    /// Timestamp of chunk `seq` if still retained in memory or on disk.
+    pub fn chunk_time(&self, seq: u64) -> Option<Instant> {
+        self.index().find(|&(s, _, _, _)| s == seq).map(|(_, _, t, _)| t)
+    }
+
     /// The snapshot to replay `seq` from, and the chunks after it up to and
     /// including `seq`, reading a segment from disk if need be.
     fn chunks_for(&self, seq: u64) -> Option<(&Term, Vec<Chunk>)> {

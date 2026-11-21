@@ -601,3 +601,91 @@ fn cli_send_all_broadcasts_input_to_all_split_panes_in_window() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_server_rewind_preserves_alt_screen_frames_and_provenance_without_gui() {
+    let dir = temp_dir("rewind-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // Emit distinct frames separated by >60ms (> FRAME_GAP_MS = 40ms), including
+    // an alternate-screen TUI screen that is exited before we inspect it!
+    let script = r#"printf 'FRAME_ONE\r\n'; sleep 0.08; printf '\033[?1049h\033[HALT_SCREEN_HUD\r\n'; sleep 0.08; printf '\033[?1049lBACK_TO_MAIN\r\n'; sleep 15"#;
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["new", "rw-sess", "--json", "--", "/bin/sh", "-c", script],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let created: Value = serde_json::from_str(&out).unwrap();
+    let bid = created["block"]["id"].as_str().unwrap().to_string();
+
+    // Wait for all 3 bursts to land on the server while NO GUI is attached.
+    let mut frames_val = Value::Null;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(60));
+        let (c, cap, _) = run_cli(&sock, &hosts, &["capture", "-b", &bid]);
+        if c == 0 && cap.contains("BACK_TO_MAIN") {
+            let (lc, lout, lerr) = run_cli(&sock, &hosts, &["rewind", "-b", &bid, "--list", "--json"]);
+            assert_eq!(lc, 0, "stderr: {lerr}");
+            frames_val = serde_json::from_str(&lout).unwrap();
+            if frames_val["frames"].as_array().is_some_and(|a| a.len() >= 3) {
+                break;
+            }
+        }
+    }
+    let frames = frames_val["frames"]
+        .as_array()
+        .expect("server rewind frames array");
+    assert!(frames.len() >= 3, "expected >=3 frames, got: {frames_val}");
+
+    // Find the historical alternate-screen frame (which normal capture no longer has!).
+    let mut alt_seq = None;
+    for f in frames {
+        let seq = f["seq"].as_u64().unwrap();
+        let (fc, fout, ferr) = run_cli(
+            &sock,
+            &hosts,
+            &["rewind", "-b", &bid, "--seq", &seq.to_string(), "--json"],
+        );
+        assert_eq!(fc, 0, "stderr: {ferr}");
+        let fv: Value = serde_json::from_str(&fout).unwrap();
+        if fv["text"].as_str().unwrap_or("").contains("ALT_SCREEN_HUD") {
+            alt_seq = Some(seq);
+            break;
+        }
+    }
+    let alt_seq = alt_seq.expect("server-side Rewind should recover exited alt-screen frame");
+
+    // Verify server-side cell provenance on cell (1,1) ('A' in ALT_SCREEN_HUD).
+    let (pc, pout, perr) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "rewind",
+            "-b",
+            &bid,
+            "--seq",
+            &alt_seq.to_string(),
+            "--provenance",
+            "1,1",
+            "--json",
+        ],
+    );
+    assert_eq!(pc, 0, "stderr: {perr}");
+    let pv: Value = serde_json::from_str(&pout).unwrap();
+    assert!(
+        pv["provenance"]["context"]
+            .as_str()
+            .unwrap_or("")
+            .contains('A'),
+        "provenance: {pv}"
+    );
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
