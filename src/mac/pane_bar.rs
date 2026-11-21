@@ -29,6 +29,7 @@ use objc2_foundation::{
 
 use super::panes;
 use super::with_window;
+use crate::term::{ProgramState, ProgramStatus};
 
 /// Width reserved for each compact right-hand action button, in points.
 const BTN_W: f64 = 20.0;
@@ -51,6 +52,8 @@ pub struct PaneHeaderModel {
     pub title: String,
     /// `None` for local panes; `Some("kagutsuchi")` for remote panes.
     pub remote_host: Option<String>,
+    /// Live OSC 7501 agent/program status, if any.
+    pub status: Option<ProgramStatus>,
     pub focused: bool,
     pub zoomed: bool,
     pub running: bool,
@@ -243,34 +246,33 @@ impl PaneHeaderView {
             }
         }
 
-        // Left: terminal prompt glyph + title + optional remote host pill.
+        // Left: agent/terminal glyph + title + optional status & remote host pills.
         let mut x = 8.0;
         let line_h = 15.0;
         let text_y = ((b.size.height - line_h) / 2.0).round();
 
-        let icon_color = if m.running {
-            NSColor::controlAccentColor()
-        } else if m.focused {
-            NSColor::secondaryLabelColor()
-        } else {
-            NSColor::tertiaryLabelColor()
-        };
+        let (glyph, icon_color) = app_badge(
+            m.status.as_ref().and_then(|s| s.app.as_deref()),
+            m.status.as_ref().map(|s| s.state),
+            m.running,
+            m.focused,
+        );
         draw_left(
-            ">_",
-            10.5,
+            glyph,
+            if glyph == ">_" { 10.5 } else { 12.0 },
             true,
             &icon_color,
             NSRect::new(NSPoint::new(x, text_y), NSSize::new(18.0, line_h)),
         );
         x += 19.0;
 
-        // Optional remote host badge pill (`kagutsuchi`, etc.).
+        // Right-aligned pills: remote host badge (`kagutsuchi`), then live OSC 7501 status pill.
         let max_right = if show_buttons { buttons_left } else { b.size.width - 8.0 };
         let mut title_right = max_right;
         if let Some(host) = &m.remote_host {
             let pill_w = ((host.len() as f64) * 6.5 + 14.0).clamp(44.0, 120.0);
-            if max_right - pill_w > x + 48.0 {
-                let pill_x = max_right - pill_w;
+            if title_right - pill_w > x + 48.0 {
+                let pill_x = title_right - pill_w;
                 let pill_h = (b.size.height - 6.0).clamp(14.0, 17.0);
                 let pill_y = ((b.size.height - pill_h) / 2.0).round();
                 let pill_rect = NSRect::new(NSPoint::new(pill_x, pill_y), NSSize::new(pill_w, pill_h));
@@ -278,7 +280,28 @@ impl PaneHeaderView {
                 NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill_rect, pill_h / 2.0, pill_h / 2.0).fill();
                 let pill_fg = NSColor::controlAccentColor();
                 draw_centered(host, 10.5, true, &pill_fg, pill_rect);
-                title_right = pill_x - 8.0;
+                title_right = pill_x - 6.0;
+            }
+        }
+        if let Some(st) = &m.status {
+            let (prefix, tint) = status_style(st.state);
+            let raw = st.short_text();
+            let text = if raw.chars().count() > 22 {
+                let cut: String = raw.chars().take(21).collect();
+                format!("{prefix} {cut}…")
+            } else {
+                format!("{prefix} {raw}")
+            };
+            let pill_w = ((text.chars().count() as f64) * 6.2 + 14.0).clamp(52.0, 170.0);
+            if title_right - pill_w > x + 48.0 {
+                let pill_x = title_right - pill_w;
+                let pill_h = (b.size.height - 6.0).clamp(14.0, 17.0);
+                let pill_y = ((b.size.height - pill_h) / 2.0).round();
+                let pill_rect = NSRect::new(NSPoint::new(pill_x, pill_y), NSSize::new(pill_w, pill_h));
+                tint.colorWithAlphaComponent(0.18).setFill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill_rect, pill_h / 2.0, pill_h / 2.0).fill();
+                draw_centered(&text, 10.0, true, &tint, pill_rect);
+                title_right = pill_x - 6.0;
             }
         }
 
@@ -337,4 +360,45 @@ fn draw_centered(text: &str, size: f64, medium: bool, color: &NSColor, rect: NSR
         )
     };
     s.drawInRect(rect);
+}
+
+pub(crate) fn app_badge(
+    app: Option<&str>,
+    state: Option<ProgramState>,
+    running: bool,
+    focused: bool,
+) -> (&'static str, Retained<NSColor>) {
+    if let Some(name) = app {
+        match name.to_ascii_lowercase().as_str() {
+            "claude" | "claude-code" => {
+                let c = NSColor::colorWithSRGBRed_green_blue_alpha(0.87, 0.49, 0.36, 1.0);
+                return ("✳", c);
+            }
+            "codex" => return ("◎", NSColor::systemTealColor()),
+            "opencode" | "open-code" => return ("◈", NSColor::systemIndigoColor()),
+            "pi" => return ("π", NSColor::systemPurpleColor()),
+            "antigravity" => return ("✦", NSColor::systemBlueColor()),
+            _ => {}
+        }
+    }
+    let color = match state {
+        Some(ProgramState::Blocked) => NSColor::systemOrangeColor(),
+        Some(ProgramState::Error) => NSColor::systemRedColor(),
+        Some(ProgramState::Done) => NSColor::systemGreenColor(),
+        Some(ProgramState::Working) => NSColor::controlAccentColor(),
+        _ if running => NSColor::controlAccentColor(),
+        _ if focused => NSColor::secondaryLabelColor(),
+        _ => NSColor::tertiaryLabelColor(),
+    };
+    (">_", color)
+}
+
+pub(crate) fn status_style(state: ProgramState) -> (&'static str, Retained<NSColor>) {
+    match state {
+        ProgramState::Working => ("●", NSColor::controlAccentColor()),
+        ProgramState::Blocked => ("▲", NSColor::systemOrangeColor()),
+        ProgramState::Done => ("✓", NSColor::systemGreenColor()),
+        ProgramState::Error => ("✕", NSColor::systemRedColor()),
+        ProgramState::Idle => ("○", NSColor::secondaryLabelColor()),
+    }
 }

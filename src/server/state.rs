@@ -167,11 +167,12 @@ struct ParsedBlock {
     processor: Processor,
     size: (u16, u16),
     last_title_rev: u64,
+    last_status_rev: u64,
     awake: bool,
 }
 
 impl ParsedBlock {
-    fn feed(&mut self, pty: &HostPty, chunk: &[u8]) -> (Vec<u8>, bool) {
+    fn feed(&mut self, pty: &HostPty, chunk: &[u8]) -> (Vec<u8>, bool, bool) {
         let ws = pty.size();
         if ws != self.size {
             self.size = ws;
@@ -183,7 +184,10 @@ impl ParsedBlock {
         let rev = self.term.title_revision;
         let meta_changed = rev != self.last_title_rev;
         self.last_title_rev = rev;
-        (self.term.take_replies(), meta_changed)
+        let srev = self.term.status_revision;
+        let status_changed = srev != self.last_status_rev;
+        self.last_status_rev = srev;
+        (self.term.take_replies(), meta_changed, status_changed)
     }
 }
 
@@ -228,6 +232,7 @@ impl Block {
             awake: p.awake,
             attached_clients: self.attached_count.load(Ordering::Acquire),
             created_at: self.created_at,
+            status: p.term.program_status.clone(),
         }
     }
 
@@ -624,6 +629,7 @@ impl ServerState {
                 processor: Processor::new(),
                 size: (cols, rows),
                 last_title_rev: 0,
+                last_status_rev: 0,
                 awake: false,
             }),
             alive: AtomicBool::new(true),
@@ -1378,11 +1384,19 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
         };
         block.space.notify_one();
         let Some(chunk) = chunk else { continue };
-        let (replies, meta_changed) = parsed.feed(&block.pty, &chunk);
+        let (replies, meta_changed, status_changed) = parsed.feed(&block.pty, &chunk);
         drop(parsed);
 
         if !replies.is_empty() && block.attached_count.load(Ordering::Acquire) == 0 {
             let _ = block.pty.write(&replies);
+        }
+        if status_changed {
+            let info = block.info();
+            state.broadcast_event(json!({
+                "event": "block.status",
+                "block": info.to_json(),
+                "status": info.status.as_ref().map(crate::mux::model::status_to_json),
+            }));
         }
         if meta_changed {
             state.broadcast_event(json!({

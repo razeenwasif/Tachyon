@@ -8,6 +8,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod integrations;
 pub mod log;
 pub mod mux;
 pub mod server;

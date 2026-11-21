@@ -26,6 +26,26 @@ fn tab_of(identifier: &str) -> Option<u64> {
     identifier.strip_prefix("tachyon.tab.")?.split('.').next()?.parse().ok()
 }
 
+/// Request identifiers for Mux v2 local/remote agent notifications:
+/// `tachyon.mux.<host_b64url>.<window_id>.<block_id>.<seq>`.
+fn mux_identifier(host: &str, window_id: &str, block_id: &str, seq: u64) -> String {
+    use base64::Engine;
+    let host_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(host.as_bytes());
+    format!("tachyon.mux.{host_b64}.{window_id}.{block_id}.{seq}")
+}
+
+fn mux_target_of(identifier: &str) -> Option<(String, String, String)> {
+    use base64::Engine;
+    let rest = identifier.strip_prefix("tachyon.mux.")?;
+    let mut parts = rest.split('.');
+    let host_b64 = parts.next()?;
+    let window_id = parts.next()?.to_string();
+    let block_id = parts.next()?.to_string();
+    let host_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(host_b64).ok()?;
+    let host = String::from_utf8(host_bytes).ok()?;
+    Some((host, window_id, block_id))
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "TachyonNotificationDelegate"]
@@ -55,7 +75,9 @@ define_class!(
             handler: &block2::DynBlock<dyn Fn()>,
         ) {
             let id = response.notification().request().identifier().to_string();
-            if let Some(tab) = tab_of(&id) {
+            if let Some((host, window_id, block_id)) = mux_target_of(&id) {
+                DispatchQueue::main().exec_async(move || super::mux_focus_block(host, window_id, block_id));
+            } else if let Some(tab) = tab_of(&id) {
                 DispatchQueue::main().exec_async(move || super::show_tab(tab));
             }
             handler.call(());
@@ -129,6 +151,34 @@ impl Notifier {
         self.center
             .requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &done);
     }
+
+    /// Post a notification for a local or remote Mux v2 agent/block transition.
+    /// Clicking it brings Tachyon forward and focuses `(host, window_id, block_id)`.
+    pub fn post_mux(&self, host: &str, window_id: &str, block_id: &str, title: &str, subtitle: &str, body: &str) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let content = UNMutableNotificationContent::new();
+        content.setTitle(&NSString::from_str(title));
+        if !subtitle.is_empty() {
+            content.setSubtitle(&NSString::from_str(subtitle));
+        }
+        content.setBody(&NSString::from_str(body));
+        content.setSound(Some(&UNNotificationSound::defaultSound()));
+        content.setThreadIdentifier(&NSString::from_str(&format!("tachyon.mux.{host}.{window_id}")));
+        let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+            &NSString::from_str(&mux_identifier(host, window_id, block_id, seq)),
+            &content,
+            None,
+        );
+        let center = self.center.clone();
+        let done = RcBlock::new(move |granted: Bool, _error: *mut NSError| {
+            if granted.as_bool() {
+                center.addNotificationRequest_withCompletionHandler(&request, None);
+            }
+        });
+        self.center
+            .requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &done);
+    }
 }
 
 /// Post a notification from the session host, which has no app around it:
@@ -170,11 +220,21 @@ pub fn post_detached(session: u64, key: &str, title: &str, subtitle: &str, body:
 
 #[cfg(test)]
 mod tests {
-    use super::{identifier, tab_of};
+    use super::{identifier, mux_identifier, mux_target_of, tab_of};
 
     #[test]
     fn identifiers_carry_the_tab() {
         assert_eq!(tab_of(&identifier(42, 7)), Some(42));
         assert_eq!(tab_of("something.else"), None);
+    }
+
+    #[test]
+    fn mux_identifiers_round_trip_dotted_hostnames() {
+        let id = mux_identifier("mac-mini.tail4ca.ts.net", "w_12", "b_34", 9);
+        assert_eq!(
+            mux_target_of(&id),
+            Some(("mac-mini.tail4ca.ts.net".into(), "w_12".into(), "b_34".into()))
+        );
+        assert_eq!(mux_target_of("tachyon.tab.42.7"), None);
     }
 }

@@ -26,7 +26,8 @@ use objc2_foundation::{
 };
 
 use super::host_mgr::{HostStatus, HostView};
-use super::{machines, with_window};
+use super::{machines, pane_bar, with_window};
+use crate::term::{ProgramState, ProgramStatus};
 
 pub const MIN_WIDTH: f64 = 180.0;
 pub const MAX_WIDTH: f64 = 360.0;
@@ -58,6 +59,7 @@ enum TreeRow {
         pane_count: usize,
         running: bool,
         active: bool,
+        status: Option<ProgramStatus>,
     },
     Note {
         host: String,
@@ -378,6 +380,12 @@ impl SidebarTreeView {
                             .blocks
                             .iter()
                             .any(|b| leaves.contains(&b.id) && b.command_running);
+                        let status = pick_window_status(
+                            snap.blocks
+                                .iter()
+                                .filter(|b| leaves.contains(&b.id))
+                                .filter_map(|b| b.status.as_ref()),
+                        );
 
                         if !sess_matches && !title.to_ascii_lowercase().contains(&filter) {
                             continue;
@@ -393,6 +401,7 @@ impl SidebarTreeView {
                             pane_count: leaves.len(),
                             running,
                             active: is_active,
+                            status,
                         });
                     }
 
@@ -639,6 +648,7 @@ impl SidebarTreeView {
                     pane_count,
                     running,
                     active,
+                    status,
                     ..
                 } => {
                     let pill = NSRect::new(
@@ -653,23 +663,28 @@ impl SidebarTreeView {
                         NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, 13.0, 13.0).fill();
                     }
 
-                    // Terminal glyph badge on left.
+                    // Agent or terminal glyph badge on left.
                     let badge = NSRect::new(NSPoint::new(14.0, y + 6.0), NSSize::new(16.0, 16.0));
-                    let badge_bg = if *running {
-                        NSColor::controlAccentColor().colorWithAlphaComponent(0.22)
+                    let (glyph, glyph_col) = pane_bar::app_badge(
+                        status.as_ref().and_then(|s| s.app.as_deref()),
+                        status.as_ref().map(|s| s.state),
+                        *running,
+                        *active,
+                    );
+                    let badge_bg = if status.is_some() || *running {
+                        glyph_col.colorWithAlphaComponent(0.20)
                     } else {
                         NSColor::labelColor().colorWithAlphaComponent(0.09)
                     };
                     badge_bg.setFill();
                     NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(badge, 4.0, 4.0).fill();
-                    let glyph_col = if *running {
-                        NSColor::controlAccentColor()
-                    } else if *active {
-                        NSColor::labelColor().colorWithAlphaComponent(0.9)
-                    } else {
-                        NSColor::secondaryLabelColor()
-                    };
-                    draw_text_centered(">_", 9.5, true, &glyph_col, badge);
+                    draw_text_centered(
+                        glyph,
+                        if glyph == ">_" { 9.5 } else { 11.0 },
+                        true,
+                        &glyph_col,
+                        badge,
+                    );
 
                     let mut right_x = w - 14.0;
                     if hovered {
@@ -686,6 +701,23 @@ impl SidebarTreeView {
                             NSRect::new(NSPoint::new(w - 25.0, y + 5.0), NSSize::new(16.0, 16.0)),
                         );
                         right_x = w - 28.0;
+                    } else if let Some(st) = status {
+                        let (sym, col) = pane_bar::status_style(st.state);
+                        if st.state == ProgramState::Blocked {
+                            let b_rect = NSRect::new(NSPoint::new(w - 30.0, y + 7.0), NSSize::new(16.0, 14.0));
+                            col.colorWithAlphaComponent(0.22).setFill();
+                            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(b_rect, 7.0, 7.0).fill();
+                            draw_text_centered(sym, 9.5, true, &col, b_rect);
+                            right_x = w - 34.0;
+                        } else {
+                            col.setFill();
+                            NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                                NSPoint::new(w - 22.0, y + 11.0),
+                                NSSize::new(6.0, 6.0),
+                            ))
+                            .fill();
+                            right_x = w - 26.0;
+                        }
                     } else if *pane_count > 1 {
                         let badge_rect = NSRect::new(NSPoint::new(w - 30.0, y + 7.0), NSSize::new(16.0, 14.0));
                         NSColor::labelColor().colorWithAlphaComponent(0.10).setFill();
@@ -845,6 +877,16 @@ define_class!(
             super::mux_refresh_all();
         }
 
+        #[unsafe(method(sidebarPalette:))]
+        fn sidebar_palette(&self, _sender: Option<&AnyObject>) {
+            with_window(self.ivars().window.get(), |w| w.toggle_palette());
+        }
+
+        #[unsafe(method(sidebarSettings:))]
+        fn sidebar_settings(&self, _sender: Option<&AnyObject>) {
+            super::open_settings();
+        }
+
         #[unsafe(method(sidebarHostsMenu:))]
         fn sidebar_hosts_menu(&self, sender: Option<&AnyObject>) {
             let Some(mtm) = MainThreadMarker::new() else { return };
@@ -994,9 +1036,11 @@ pub struct Sidebar {
     root_view: Retained<SidebarRootView>,
     tree: Retained<SidebarTreeView>,
     toggle_btn: Retained<NSButton>,
+    palette_btn: Retained<NSButton>,
     refresh_btn: Retained<NSButton>,
     new_btn: Retained<NSButton>,
     filter: Retained<NSSearchField>,
+    settings_btn: Retained<NSButton>,
     hosts_btn: Retained<NSButton>,
     server_btn: Retained<NSButton>,
 }
@@ -1014,10 +1058,12 @@ impl Sidebar {
 
         let target: &AnyObject = root_view.as_ref();
         let toggle_btn = symbol_button(mtm, "sidebar.left", "Toggle Sidebar (⌘B)", target, sel!(sidebarToggle:));
+        let palette_btn = symbol_button(mtm, "command", "Command Palette (⌘⇧P)", target, sel!(sidebarPalette:));
         let refresh_btn = symbol_button(mtm, "arrow.clockwise", "Refresh Hosts", target, sel!(sidebarRefresh:));
         let new_btn = symbol_button(mtm, "plus", "New Session", target, sel!(sidebarNewSession:));
+        let settings_btn = symbol_button(mtm, "gearshape", "Settings (⌘,)", target, sel!(sidebarSettings:));
         let hosts_btn = symbol_button(mtm, "globe", "Remote Hosts", target, sel!(sidebarHostsMenu:));
-        let server_btn = symbol_button(mtm, "server.rack", "Server Status", target, sel!(sidebarRefresh:));
+        let server_btn = symbol_button(mtm, "server.rack", "Server Status", target, sel!(sidebarSettings:));
 
         let filter = NSSearchField::initWithFrame(NSSearchField::alloc(mtm), NSRect::ZERO);
         filter.setPlaceholderString(Some(&NSString::from_str("Filter")));
@@ -1025,9 +1071,11 @@ impl Sidebar {
         filter.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
 
         root_view.addSubview(&toggle_btn);
+        root_view.addSubview(&palette_btn);
         root_view.addSubview(&refresh_btn);
         root_view.addSubview(&new_btn);
         root_view.addSubview(&filter);
+        root_view.addSubview(&settings_btn);
         root_view.addSubview(&hosts_btn);
         root_view.addSubview(&server_btn);
 
@@ -1039,9 +1087,11 @@ impl Sidebar {
             root_view,
             tree,
             toggle_btn,
+            palette_btn,
             refresh_btn,
             new_btn,
             filter,
+            settings_btn,
             hosts_btn,
             server_btn,
         }
@@ -1056,19 +1106,21 @@ impl Sidebar {
         // Top toolbar buttons (clear of traffic lights on the left).
         let btn_y = top_y + (TOP_BAR_H - 22.0) / 2.0;
         self.toggle_btn.setFrame(NSRect::new(NSPoint::new(76.0, btn_y), NSSize::new(24.0, 22.0)));
-        self.new_btn.setFrame(NSRect::new(NSPoint::new((w - 30.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
-        self.refresh_btn.setFrame(NSRect::new(NSPoint::new((w - 56.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
+        self.new_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
+        self.palette_btn.setFrame(NSRect::new(NSPoint::new((w - 52.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
+        self.refresh_btn.setFrame(NSRect::new(NSPoint::new((w - 76.0).max(104.0), btn_y), NSSize::new(22.0, 22.0)));
 
         // Middle tree area.
         let tree_h = (h - TOP_BAR_H - FOOTER_H).max(0.0);
         self.tree.setFrame(NSRect::new(NSPoint::new(0.0, FOOTER_H), NSSize::new(w, tree_h)));
 
-        // Bottom footer: Filter box + server & hosts buttons.
+        // Bottom footer: Filter box + settings, server & hosts buttons.
         let fy = (FOOTER_H - 22.0) / 2.0;
-        let filter_w = (w - 68.0).max(60.0);
+        let filter_w = (w - 92.0).max(52.0);
         self.filter.setFrame(NSRect::new(NSPoint::new(8.0, fy), NSSize::new(filter_w, 22.0)));
-        self.server_btn.setFrame(NSRect::new(NSPoint::new((w - 54.0).max(70.0), fy), NSSize::new(22.0, 22.0)));
-        self.hosts_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(94.0), fy), NSSize::new(22.0, 22.0)));
+        self.settings_btn.setFrame(NSRect::new(NSPoint::new((w - 76.0).max(66.0), fy), NSSize::new(22.0, 22.0)));
+        self.server_btn.setFrame(NSRect::new(NSPoint::new((w - 52.0).max(90.0), fy), NSSize::new(22.0, 22.0)));
+        self.hosts_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(114.0), fy), NSSize::new(22.0, 22.0)));
 
         self.tree.rebuild_rows();
     }
@@ -1142,6 +1194,19 @@ fn symbol_button(
     btn.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
     btn.setToolTip(Some(&NSString::from_str(tooltip)));
     btn
+}
+
+fn pick_window_status<'a>(statuses: impl Iterator<Item = &'a ProgramStatus>) -> Option<ProgramStatus> {
+    fn rank(s: ProgramState) -> u8 {
+        match s {
+            ProgramState::Blocked => 5,
+            ProgramState::Error => 4,
+            ProgramState::Working => 3,
+            ProgramState::Done => 2,
+            ProgramState::Idle => 1,
+        }
+    }
+    statuses.max_by_key(|s| rank(s.state)).cloned()
 }
 
 fn rep_string(sender: Option<&AnyObject>) -> Option<String> {

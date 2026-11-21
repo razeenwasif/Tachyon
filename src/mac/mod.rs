@@ -17,6 +17,7 @@
 
 mod boxdraw;
 mod chart;
+mod cheatsheet;
 mod dock;
 mod editor;
 pub mod hotkey;
@@ -32,6 +33,7 @@ mod neutrino;
 mod ledger;
 mod links;
 mod notify;
+mod palette;
 mod pane_bar;
 mod panes;
 mod power;
@@ -39,6 +41,7 @@ mod pty;
 mod receipts;
 mod renderer;
 mod selection;
+mod settings;
 mod sidebar;
 mod strip;
 mod suggest;
@@ -511,6 +514,21 @@ define_class!(
         #[unsafe(method(tachyonToggleSidebar:))]
         fn toggle_sidebar(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), TermWindow::toggle_sidebar);
+        }
+
+        #[unsafe(method(tachyonSettings:))]
+        fn open_settings(&self, _sender: Option<&AnyObject>) {
+            open_settings();
+        }
+
+        #[unsafe(method(tachyonPalette:))]
+        fn toggle_palette(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_palette);
+        }
+
+        #[unsafe(method(tachyonCheatsheet:))]
+        fn toggle_cheatsheet(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_cheatsheet);
         }
 
         #[unsafe(method(tachyonMonitor:))]
@@ -1179,6 +1197,12 @@ define_class!(
         #[unsafe(method(tachyonQuickTerminal:))]
         fn quick_terminal(&self, _sender: Option<&AnyObject>) {
             toggle_quick();
+        }
+
+        /// ⌘, works even when no terminal window is open.
+        #[unsafe(method(tachyonSettings:))]
+        fn open_settings(&self, _sender: Option<&AnyObject>) {
+            open_settings();
         }
 
         /// ⌥⌘T with no window open: the tab comes back in a new one.
@@ -2241,6 +2265,11 @@ struct TermWindow {
     neutrino_card: Option<NeutrinoCard>,
     neutrino_button: Option<Retained<objc2_app_kit::NSButton>>,
     neutrino: bool,
+    /// Floating keyboard/CLI cheatsheet card (⌘/, Command Palette, or footer icon).
+    cheatsheet_card: Option<cheatsheet::CheatsheetCard>,
+    cheatsheet_button: Option<Retained<objc2_app_kit::NSButton>>,
+    /// Floating Liquid Glass Command Palette (⌘⇧P).
+    palette_card: Option<palette::PaletteCard>,
     /// The quick terminal: borderless, dropping from the screen's top, and
     /// whether it's showing; the app that was in front, to go back to.
     quick: bool,
@@ -2496,7 +2525,16 @@ impl TermWindow {
         } else {
             Vec::new()
         };
-        let leftmost = [&self.neutrino_button, &self.monitor_button, &self.fairy_button].iter().filter_map(|b| b.as_ref()).map(|b| b.frame().origin.x).fold(f64::INFINITY, f64::min);
+        let leftmost = [
+            &self.cheatsheet_button,
+            &self.neutrino_button,
+            &self.monitor_button,
+            &self.fairy_button,
+        ]
+        .iter()
+        .filter_map(|b| b.as_ref())
+        .map(|b| b.frame().origin.x)
+        .fold(f64::INFINITY, f64::min);
         let hints_right = if leftmost.is_finite() { (leftmost * self.scale()) as f32 - 12.0 } else { self.renderer.padding_right_edge() };
         self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, panel.as_ref(), &hints, hints_right, presented);
         let overlay = match focus_at {
@@ -3243,6 +3281,8 @@ impl TermWindow {
         if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_fairy();
         }
+        self.close_cheatsheet();
+        self.close_palette();
         if self.monitor_card.is_none() {
             self.monitor_card = Some(MonitorCard::new(mtm, &self.view));
         }
@@ -3312,6 +3352,169 @@ impl TermWindow {
         }
     }
 
+    /// Put the Keyboard Cheatsheet icon in the bottom-right footer band (left of
+    /// Neutrino / Monitor / Fairy) and position its floating Liquid Glass card.
+    fn place_cheatsheet(&mut self) {
+        if self.quick {
+            return;
+        }
+        if self.cheatsheet_button.is_none() {
+            if let (Some(mtm), Some(icon)) = (
+                MainThreadMarker::new(),
+                objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str("keyboard"),
+                    Some(&NSString::from_str("Keyboard Cheatsheet")),
+                ),
+            ) {
+                let target: &AnyObject = self.view.as_ref();
+                let button = unsafe {
+                    objc2_app_kit::NSButton::buttonWithImage_target_action(
+                        &icon,
+                        Some(target),
+                        Some(sel!(tachyonCheatsheet:)),
+                        mtm,
+                    )
+                };
+                button.setBordered(false);
+                button.setToolTip(Some(&NSString::from_str("Keyboard Cheatsheet (⌘/ · ⌘⇧P)")));
+                self.view.addSubview(&button);
+                self.cheatsheet_button = Some(button);
+            }
+        }
+        let scale = self.scale();
+        let size = self.view.bounds().size;
+        let (y0, h) = self.renderer.hints_rect();
+        let band_bottom = (size.height * scale - (y0 + h) as f64).max(0.0) / scale;
+        let band_h = h as f64 / scale;
+        let open = self.cheatsheet_card.as_ref().is_some_and(|c| !c.host.isHidden());
+        if let Some(b) = &self.cheatsheet_button {
+            let pad_x = self.renderer.padding().0 as f64 / scale;
+            let right = [&self.neutrino_button, &self.monitor_button, &self.fairy_button]
+                .iter()
+                .filter_map(|b| b.as_ref())
+                .map(|b| b.frame().origin.x - 10.0)
+                .fold(size.width - pad_x, f64::min);
+            let side = 20.0;
+            b.setFrame(NSRect::new(
+                NSPoint::new(right - side, band_bottom + (band_h - side) / 2.0),
+                NSSize::new(side, side),
+            ));
+            b.setContentTintColor(Some(&*if open {
+                NSColor::controlAccentColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            }));
+        }
+        if let Some(card) = &self.cheatsheet_card {
+            card.place(size, band_bottom + band_h, self.title_bar_height());
+        }
+    }
+
+    fn open_cheatsheet(&mut self) {
+        if self.quick {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        self.close_palette();
+        if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_fairy();
+        }
+        if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_monitor();
+        }
+        if self.neutrino_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_neutrino();
+        }
+        if self.cheatsheet_card.is_none() {
+            let target: &AnyObject = self.view.as_ref();
+            self.cheatsheet_card = Some(cheatsheet::CheatsheetCard::new(mtm, &self.view, target, self.id));
+        }
+        if let Some(card) = &self.cheatsheet_card {
+            card.reset_filter();
+            card.host.setHidden(false);
+        }
+        self.place_cheatsheet();
+        if let Some(card) = &self.cheatsheet_card {
+            self.window.makeFirstResponder(Some(&card.search));
+        }
+    }
+
+    fn close_cheatsheet(&mut self) {
+        if let Some(card) = &self.cheatsheet_card {
+            if !card.host.isHidden() {
+                card.host.setHidden(true);
+                self.place_cheatsheet();
+            }
+        }
+    }
+
+    fn toggle_cheatsheet(&mut self) {
+        if self.cheatsheet_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.close_cheatsheet();
+            self.focus_terminal();
+        } else {
+            self.open_cheatsheet();
+        }
+    }
+
+    fn place_palette(&self) {
+        if let Some(card) = &self.palette_card {
+            card.place(self.view.bounds().size, self.title_bar_height());
+        }
+    }
+
+    fn close_palette(&mut self) {
+        if let Some(card) = &self.palette_card {
+            if !card.host.isHidden() {
+                card.host.setHidden(true);
+            }
+        }
+    }
+
+    fn toggle_palette(&mut self) {
+        if self.quick {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        if self.palette_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.close_palette();
+            self.focus_terminal();
+            return;
+        }
+        self.close_cheatsheet();
+        if self.palette_card.is_none() {
+            self.palette_card = Some(palette::PaletteCard::new(mtm, &self.view, self.id));
+        }
+        let hosts = mux_host_views();
+        if let Some(card) = &self.palette_card {
+            card.refresh(&hosts);
+            card.place(self.view.bounds().size, self.title_bar_height());
+            card.host.setHidden(false);
+            self.window.makeFirstResponder(Some(&card.search));
+        }
+    }
+
+    fn copy_command_output(&mut self) {
+        self.copy_output();
+    }
+
+    fn toggle_fold_output(&mut self) {
+        if let Some(cmd) = self.block_target() {
+            self.toggle_fold(cmd);
+        }
+    }
+
+    fn toggle_ledger(&mut self) {
+        ledger::SHOWN.fetch_xor(true, Ordering::Relaxed);
+        self.request_redraw();
+    }
+
+    fn toggle_title_bar(&mut self) {
+        let on = !self.title_bar;
+        self.set_title_bar(on);
+        set_double_click_action(on);
+    }
+
     /// Where `ntr` runs for the focused shell: here in its folder, or on the
     /// Neutrino server's Mac over ssh when the shell is an ssh session there.
     fn neutrino_place(&self) -> neutrino::Place {
@@ -3339,6 +3542,8 @@ impl TermWindow {
         if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_fairy();
         }
+        self.close_cheatsheet();
+        self.close_palette();
         if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_monitor();
         }
@@ -3451,6 +3656,8 @@ impl TermWindow {
         if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_monitor();
         }
+        self.close_cheatsheet();
+        self.close_palette();
         if self.fairy_card.is_none() {
             self.fairy_card = Some(FairyCard::new(mtm, &self.view));
         }
@@ -3950,9 +4157,9 @@ impl TermWindow {
             if pane.header_rect.is_none() || slot >= self.pane_headers.len() {
                 continue;
             }
-            let (title, running) = {
+            let (title, running, status) = {
                 let t = pane.term.lock();
-                (tab_label(&t), t.command_running())
+                (tab_label(&t), t.command_running(), t.program_status.clone())
             };
             let remote_host = pane
                 .pty
@@ -3963,6 +4170,7 @@ impl TermWindow {
                 pane_id: pane.id,
                 title,
                 remote_host,
+                status,
                 focused: p_idx == tab.focus,
                 zoomed: tab.zoomed,
                 running,
@@ -3993,11 +4201,15 @@ impl TermWindow {
             self.renderer.set_strip_band(Some((band * scale).round() as f32));
             self.place_capsule(strip);
         }
-        // The band along the bottom: hints, and Fairy's button at its right.
-        self.renderer.set_hints_band(self.hints || self.fairy_socket.is_some() || self.monitor || self.neutrino);
+        // The band along the bottom: hints, and footer tool icons at its right.
+        self.renderer.set_hints_band(
+            self.hints || self.fairy_socket.is_some() || self.monitor || self.neutrino || !self.quick,
+        );
         self.place_fairy();
         self.place_monitor();
         self.place_neutrino();
+        self.place_cheatsheet();
+        self.place_palette();
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
             crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
@@ -4380,12 +4592,24 @@ impl TermWindow {
         if !self.preedit.is_empty() {
             return true;
         }
-        // Escape closes the training chart, when it's open.
+        // Escape closes floating overlays (Command Palette, Cheatsheet, Training Chart).
         const ESCAPE_KEY: u16 = 53;
-        if event.keyCode() == ESCAPE_KEY && self.chart.is_some() {
-            self.chart = None;
-            self.request_redraw();
-            return false;
+        if event.keyCode() == ESCAPE_KEY {
+            if self.palette_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+                self.close_palette();
+                self.focus_terminal();
+                return false;
+            }
+            if self.cheatsheet_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+                self.close_cheatsheet();
+                self.focus_terminal();
+                return false;
+            }
+            if self.chart.is_some() {
+                self.chart = None;
+                self.request_redraw();
+                return false;
+            }
         }
         // A suggestion showing: Tab, →, End or ⌃F take it, ⌥→ a word of it.
         // Tab only while one shows: otherwise it's the shell's completion.
@@ -4658,6 +4882,10 @@ impl TermWindow {
     }
 
     fn mouse_down(&mut self, event: &NSEvent, button: MouseButton) {
+        if self.palette_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.close_palette();
+            self.focus_terminal();
+        }
         // Rewound: Option-click tells where a cell came from; other clicks
         // do nothing, since selection belongs to the live screen.
         if self.rewound.is_some() && self.strip_hit(event).is_none() {
@@ -5484,6 +5712,9 @@ impl App {
             neutrino_card: None,
             neutrino_button: None,
             neutrino: neutrino::installed(),
+            cheatsheet_card: None,
+            cheatsheet_button: None,
+            palette_card: None,
             quick: false,
             quick_shown: false,
             quick_inset: 0.0,
@@ -5977,6 +6208,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     let main = NSMenu::new(mtm);
 
     let app_menu = NSMenu::new(mtm);
+    item(&app_menu, "Settings…", sel!(tachyonSettings:), ",");
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     item(&app_menu, "Hide Tachyon", sel!(hide:), "h");
     item(&app_menu, "Quit Tachyon", sel!(terminate:), "q");
     // ⌥⌘Q: shells end too, instead of waiting at the host for next time.
@@ -6055,6 +6288,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Next Command", sel!(tachyonNextCommand:), "\u{F701}");
     view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Toggle Sidebar", sel!(tachyonToggleSidebar:), "b");
+    item(&view, "Command Palette…", sel!(tachyonPalette:), "P");
+    item(&view, "Keyboard Cheatsheet", sel!(tachyonCheatsheet:), "/");
     item(&view, "Show Title Bar", sel!(tachyonTitleBar:), "");
     item(&view, "Full Screen Around the Notch", sel!(tachyonNotch:), "f")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
@@ -6755,6 +6990,135 @@ fn sync_all_sidebars() {
             w.sync_pane_headers();
         }
     });
+    settings::refresh_if_open();
+}
+
+fn reopen_closed_tab(window: u64) {
+    reopen_closed(Some(window));
+}
+
+fn open_settings() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        settings::open(mtm, None);
+    }
+}
+
+fn open_settings_section(section: usize) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        settings::open(mtm, Some(section));
+    }
+}
+
+fn apply_settings_config(f: impl FnOnce(&mut Config)) {
+    with_app(|app| f(&mut app.cfg));
+}
+
+fn apply_interface_sidebar(open: bool) {
+    with_app(|app| {
+        app.cfg.window.sidebar = open;
+        for w in &mut app.windows {
+            if !w.quick && w.sidebar.is_some() && w.sidebar_open != open {
+                w.sidebar_open = open;
+                w.layout();
+            }
+        }
+    });
+}
+
+fn apply_interface_pane_headers(mode: PaneHeaders) {
+    with_app(|app| {
+        app.cfg.window.pane_headers = mode;
+        for w in &mut app.windows {
+            w.pane_headers_mode = mode;
+            w.layout();
+        }
+    });
+}
+
+fn apply_interface_title_bar(show: bool) {
+    with_app(|app| {
+        app.cfg.window.title_bar = show;
+        app.title_bar = show;
+        for w in &mut app.windows {
+            w.set_title_bar(show);
+        }
+    });
+    set_double_click_action(show);
+}
+
+fn apply_interface_hints(show: bool) {
+    with_app(|app| {
+        app.cfg.window.hints = show;
+        for w in &mut app.windows {
+            w.hints = show;
+            w.layout();
+        }
+    });
+}
+
+fn send_test_agent_notification() {
+    NOTIFIER.with(|n| {
+        if let Some(notifier) = n.borrow().as_ref() {
+            notifier.post_mux(
+                "local",
+                "",
+                "",
+                "Tachyon · Agent Notifications Ready",
+                "This Mac",
+                "Coding agents on This Mac and remote hosts will alert you here when blocked or done.",
+            );
+        }
+    });
+}
+
+/// Called when clicking a local or remote Mux v2 agent notification: activates
+/// Tachyon, opens/switches to `(host, window_id)`, and focuses `block_id`.
+fn mux_focus_block(host: String, window_id: String, block_id: String) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    NSApplication::sharedApplication(mtm).activate();
+    if window_id.is_empty() {
+        return;
+    }
+    let target_win = with_app(|app| {
+        // Prefer a window that already has this tab open.
+        for w in &app.windows {
+            if w.tabs
+                .iter()
+                .any(|t| t.mux_target.as_ref().is_some_and(|(h, _, wid)| h == &host && wid == &window_id))
+            {
+                return Some((w.id, w.window.clone()));
+            }
+        }
+        app.windows
+            .iter()
+            .find(|w| !w.quick)
+            .map(|w| (w.id, w.window.clone()))
+    })
+    .flatten();
+
+    let Some((win_id, ns_win)) = target_win else {
+        open_window();
+        let h = host.clone();
+        let wid = window_id.clone();
+        let bid = block_id.clone();
+        DispatchQueue::main().exec_async(move || mux_focus_block(h, wid, bid));
+        return;
+    };
+    ns_win.makeKeyAndOrderFront(None);
+    mux_select_window(win_id, &host, &window_id);
+    if !block_id.is_empty() {
+        with_window(win_id, |w| {
+            let tab = &w.tabs[w.active];
+            if let Some(pid) = tab
+                .panes
+                .iter()
+                .find(|p| p.pty.mux_meta().is_some_and(|m| m.block_id == block_id))
+                .map(|p| p.id)
+            {
+                w.focus_pane_by_id(pid);
+            }
+        });
+    }
 }
 
 fn mux_reconnect_host(alias: &str) {
@@ -7150,10 +7514,79 @@ fn mux_kill_window(win_id: u64, host: &str, window_id: &str) {
         });
 }
 
-/// Live server event handler: when a CLI command or coding agent splits a
-/// window currently open in Tachyon, attach the new pane into the live layout.
+/// Live server event handler:
+/// - `block.status`: refresh headers/sidebars and post macOS notifications when
+///   an unfocused local or remote coding agent blocks for approval, finishes, or errors.
+/// - `block.created`: attach panes split externally (via CLI or coding agents)
+///   directly into the live window layout.
 fn handle_mux_event(host: String, ev: serde_json::Value) {
-    if ev.get("event").and_then(serde_json::Value::as_str) != Some("block.created") {
+    let event_name = ev.get("event").and_then(serde_json::Value::as_str).unwrap_or("");
+    if event_name == "block.status" {
+        if let Some(blk) = crate::mux::model::BlockInfo::from_json(ev.get("block").unwrap_or(&serde_json::Value::Null)) {
+            if let Some(status) = blk.status.as_ref() {
+                use crate::term::ProgramState;
+                let should_alert = matches!(
+                    status.state,
+                    ProgramState::Blocked | ProgramState::Done | ProgramState::Error
+                );
+                let enabled = with_app(|a| a.cfg.macos.notify_agent_status).unwrap_or(true);
+                if should_alert && enabled {
+                    let is_front_focused = MainThreadMarker::new().is_some_and(|mtm| {
+                        let app_active = NSApplication::sharedApplication(mtm).isActive();
+                        app_active
+                            && with_app(|a| {
+                                a.windows.iter().any(|w| {
+                                    w.focused
+                                        && w.tabs
+                                            .get(w.active)
+                                            .and_then(|t| t.panes.get(t.focus))
+                                            .and_then(|p| p.pty.mux_meta())
+                                            .is_some_and(|m| m.host == host && m.block_id == blk.id)
+                                })
+                            })
+                            .unwrap_or(false)
+                    });
+                    if !is_front_focused {
+                        let app_name = status
+                            .app
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|a| match a.to_ascii_lowercase().as_str() {
+                                "claude" | "claude-code" => "Claude Code",
+                                "codex" => "Codex",
+                                "opencode" => "OpenCode",
+                                "pi" => "Pi",
+                                _ => a,
+                            })
+                            .unwrap_or("Agent");
+                        let state_word = match status.state {
+                            ProgramState::Blocked => "needs input",
+                            ProgramState::Done => "finished",
+                            ProgramState::Error => "encountered an error",
+                            _ => "updated",
+                        };
+                        let title = format!("{app_name} {state_word}");
+                        let host_label = if host == "local" { "This Mac" } else { host.as_str() };
+                        let subtitle = format!("{} · {}", host_label, blk.display_name());
+                        let body = status
+                            .msg
+                            .as_deref()
+                            .or(status.label.as_deref())
+                            .unwrap_or("Click to focus pane in Tachyon");
+                        NOTIFIER.with(|n| {
+                            if let Some(notifier) = n.borrow().as_ref() {
+                                notifier.post_mux(&host, &blk.window_id, &blk.id, &title, &subtitle, body);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        sync_all_sidebars();
+        return;
+    }
+
+    if event_name != "block.created" {
         return;
     }
     let Some(win_info) = crate::mux::model::WindowInfo::from_json(ev.get("window").unwrap_or(&serde_json::Value::Null)) else {

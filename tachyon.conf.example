@@ -186,6 +186,14 @@ theme.bold_is_bright = false
 # brings its tab to the front. 0 turns notifications off.
 # notify.after = 10
 
+# macOS: post notifications when an unfocused local or remote coding agent
+# transitions to blocked, done, or error (OSC 7501).
+# notify.agent_status = true
+
+# Coding agent integrations (`tachyon skill setup` / Settings > Integrations):
+# let coding agents rename auto-generated sessions after the task they're doing.
+# agents.auto_name_sessions = true
+
 # ---------------------------------------------------------------------------
 # Shell
 # ---------------------------------------------------------------------------

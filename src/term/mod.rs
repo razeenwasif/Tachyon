@@ -190,6 +190,185 @@ pub enum CommandEvent {
     Finished(u32, Option<i32>),
 }
 
+/// Live program/agent status reported via OSC 7501 (`ESC ] 7501 ; ... BEL/ST`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Error,
+}
+
+impl ProgramState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "idle" | "ready" => Some(Self::Idle),
+            "working" | "running" | "thinking" | "busy" => Some(Self::Working),
+            "blocked" | "waiting" | "approval" | "input" | "attention" => Some(Self::Blocked),
+            "done" | "complete" | "completed" | "success" => Some(Self::Done),
+            "error" | "failed" | "fail" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// Structured live status emitted by coding agents or long-running programs
+/// via OSC 7501.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramStatus {
+    pub state: ProgramState,
+    pub app: Option<String>,
+    pub kind: Option<String>,
+    pub msg: Option<String>,
+    pub label: Option<String>,
+}
+
+impl ProgramStatus {
+    /// Encode as a spec-compliant OSC 7501 sequence (`msg` and `label` base64-encoded).
+    pub fn encode_osc_7501(&self) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut out = format!("\x1b]7501;state={}", self.state.as_str());
+        if let Some(app) = self.app.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(";app=");
+            out.push_str(&sanitize_osc_token(app));
+        }
+        if let Some(kind) = self.kind.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(";kind=");
+            out.push_str(&sanitize_osc_token(kind));
+        }
+        if let Some(msg) = self.msg.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(";msg=");
+            out.push_str(&b64.encode(msg.as_bytes()));
+        }
+        if let Some(label) = self.label.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(";label=");
+            out.push_str(&b64.encode(label.as_bytes()));
+        }
+        out.push('\x07');
+        out
+    }
+
+    /// Parse key=value parameters from OSC 7501 (excluding the leading `7501`).
+    /// Returns `Ok(None)` when `state=clear` explicitly clears status.
+    pub fn parse_osc_params(params: &[&[u8]]) -> Result<Option<Self>, ()> {
+        let mut state: Option<ProgramState> = None;
+        let mut clear = false;
+        let mut app: Option<String> = None;
+        let mut kind: Option<String> = None;
+        let mut msg: Option<String> = None;
+        let mut label: Option<String> = None;
+
+        for raw in params {
+            let s = String::from_utf8_lossy(raw);
+            let s = s.trim();
+            if s.is_empty() {
+                continue;
+            }
+            if s.eq_ignore_ascii_case("clear") {
+                clear = true;
+                continue;
+            }
+            let Some((k, v)) = s.split_once('=') else {
+                continue;
+            };
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            match key.as_str() {
+                "state" | "s" => {
+                    if val.eq_ignore_ascii_case("clear") || val.eq_ignore_ascii_case("none") || val.is_empty() {
+                        clear = true;
+                    } else if let Some(st) = ProgramState::parse(val) {
+                        state = Some(st);
+                    }
+                }
+                "app" | "program" => {
+                    if !val.is_empty() {
+                        app = Some(val.to_string());
+                    }
+                }
+                "kind" => {
+                    if !val.is_empty() {
+                        kind = Some(val.to_string());
+                    }
+                }
+                "msg" | "message" => {
+                    if !val.is_empty() {
+                        msg = Some(decode_osc_7501_text(val));
+                    }
+                }
+                "label" => {
+                    if !val.is_empty() {
+                        label = Some(decode_osc_7501_text(val));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if clear {
+            return Ok(None);
+        }
+        let Some(state) = state else {
+            return Err(());
+        };
+        Ok(Some(Self { state, app, kind, msg, label }))
+    }
+
+    /// Short display text for sidebar badges and pane headers.
+    pub fn short_text(&self) -> String {
+        if let Some(l) = self.label.as_deref().filter(|s| !s.is_empty()) {
+            return l.to_string();
+        }
+        if let Some(m) = self.msg.as_deref().filter(|s| !s.is_empty()) {
+            return m.to_string();
+        }
+        match self.state {
+            ProgramState::Idle => "Idle".into(),
+            ProgramState::Working => "Working".into(),
+            ProgramState::Blocked => "Needs input".into(),
+            ProgramState::Done => "Done".into(),
+            ProgramState::Error => "Error".into(),
+        }
+    }
+}
+
+fn sanitize_osc_token(s: &str) -> String {
+    s.chars().filter(|&c| c != '\x07' && c != '\x1b' && c != ';').collect()
+}
+
+fn decode_osc_7501_text(raw: &str) -> String {
+    use base64::Engine;
+    // Standard base64 (with or without padding). Only accept decoded bytes when
+    // they form printable UTF-8 so plain text values fall back safely.
+    let valid_chars = raw.len() >= 4
+        && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
+    if valid_chars {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(raw));
+        if let Ok(bytes) = decoded {
+            if let Ok(text) = String::from_utf8(bytes) {
+                if !text.is_empty() && text.chars().all(|c| !c.is_control() || c == '\t') {
+                    return text;
+                }
+            }
+        }
+    }
+    raw.to_string()
+}
+
 /// Commands remembered for gutter marks and receipts.
 const MAX_COMMANDS: u32 = 4096;
 
@@ -246,6 +425,11 @@ pub struct Term {
     /// app can cheaply notice.
     pub title_revision: u64,
     pub bell_revision: u64,
+    /// Live program/agent status set via OSC 7501 (`idle`, `working`,
+    /// `blocked`, `done`, `error`).
+    pub program_status: Option<ProgramStatus>,
+    /// Incremented whenever `program_status` changes (OSC 7501).
+    pub status_revision: u64,
 
     /// One-shot flag telling [`Processor`] the VT machine returned to Ground.
     ground_signal: bool,
@@ -358,6 +542,8 @@ impl Term {
             folds: FxHashMap::default(),
             title_revision: 0,
             bell_revision: 0,
+            program_status: None,
+            status_revision: 0,
             ground_signal: false,
             dirty: true,
             commands: FxHashMap::default(),
@@ -686,6 +872,8 @@ impl Term {
             folds: FxHashMap::default(),
             title_revision: 0,
             bell_revision: 0,
+            program_status: None,
+            status_revision: 0,
             ground_signal: false,
             dirty: true,
             commands: FxHashMap::default(),
@@ -2394,6 +2582,16 @@ impl Perform for Term {
             b"133" => self.semantic_mark(params),
             // iTerm2's: inline images, among other things.
             b"1337" => self.iterm_osc(&params[1..].join(&b';')),
+            // OSC 7501: live program/agent status (`state=`, `app=`, `kind=`, `msg=`, `label=`).
+            b"7501" => {
+                if let Ok(next) = ProgramStatus::parse_osc_params(&params[1..]) {
+                    if self.program_status != next {
+                        self.program_status = next;
+                        self.status_revision = self.status_revision.wrapping_add(1);
+                        self.title_revision = self.title_revision.wrapping_add(1);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -3605,5 +3803,35 @@ mod block_tests {
         assert!(!t.toggle_fold(short), "one line");
         p.advance(&mut t, b"\x1b[?1049h");
         assert!(t.output_range(ls).is_none());
+    }
+
+    #[test]
+    fn osc_7501_tracks_program_status_and_base64_messages() {
+        use base64::Engine;
+        let mut t = Term::new(40, 10, 100);
+        let mut p = Processor::new();
+        assert!(t.program_status.is_none());
+
+        let msg_b64 = base64::engine::general_purpose::STANDARD.encode("Waiting for bash approval");
+        let lbl_b64 = base64::engine::general_purpose::STANDARD.encode("Approval");
+        let seq = format!("\x1b]7501;state=blocked;app=claude;kind=agent;msg={msg_b64};label={lbl_b64}\x07");
+        p.advance(&mut t, seq.as_bytes());
+        let st = t.program_status.as_ref().expect("status set");
+        assert_eq!(st.state, ProgramState::Blocked);
+        assert_eq!(st.app.as_deref(), Some("claude"));
+        assert_eq!(st.kind.as_deref(), Some("agent"));
+        assert_eq!(st.msg.as_deref(), Some("Waiting for bash approval"));
+        assert_eq!(st.label.as_deref(), Some("Approval"));
+        assert_eq!(t.status_revision, 1);
+
+        // ST-terminated transition to done.
+        p.advance(&mut t, b"\x1b]7501;state=done;app=claude\x1b\\");
+        assert_eq!(t.program_status.as_ref().unwrap().state, ProgramState::Done);
+        assert_eq!(t.status_revision, 2);
+
+        // Explicit clear removes status.
+        p.advance(&mut t, b"\x1b]7501;state=clear\x07");
+        assert!(t.program_status.is_none());
+        assert_eq!(t.status_revision, 3);
     }
 }

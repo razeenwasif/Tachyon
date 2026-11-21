@@ -145,6 +145,9 @@ as on Windows. Logs (with `TACHYON_LOG=1`) go to `~/Library/Logs/Tachyon/`.
 |---|---|
 | ⌘T / ⌘N | New tab / new window |
 | ⌘B | Toggle the multi-host sidebar (local + remote servers) |
+| ⌘⇧P | Command Palette (commands, cheatsheet, live hosts & sessions) |
+| ⌘/ | Floating Keyboard & CLI Cheatsheet (also via footer icon or Command Palette) |
+| ⌘, | Settings window (Server, Remote Hosts, Coding Agent Integrations, Interface, Notifications) |
 | ⌘W / ⌘⇧W | Close the pane (its tab with the last pane, the window with the last tab) / close the window |
 | ⌘-click / ⌥⌘-click | Open a URL, a file in Quick Look, or a traceback's file:line in your editor / any file in your editor |
 | ⌃` (from any app) | The quick terminal, dropping from the notch, or away again |
@@ -491,11 +494,32 @@ grouped `Host → Session → Window` trees — click any local or remote window
 attach immediately with LZ4 screen restore, filter live from the bottom search
 box, right-click for session/window actions, drag the right divider to resize
 (`180–360 pt`), or click the globe button to add discovered `~/.ssh/config`
-hosts. Each visible pane gets a compact header bar showing its title, a remote
-host pill when running on another machine, and hover buttons for split right,
-split down, zoom, and close (`window.sidebar`, `window.sidebar_width`,
-`window.pane_headers = always | auto | never`). See
-[docs/REX_ARCHITECTURE.md](docs/REX_ARCHITECTURE.md) for the full design and
+hosts. Each visible pane gets a compact header bar showing its title, live OSC 7501
+status pill, a remote host pill when running on another machine, and hover
+buttons for split right, split down, zoom, and close (`window.sidebar`,
+`window.sidebar_width`, `window.pane_headers = always | auto | never`).
+
+**Command Palette (`⌘⇧P`), Floating Cheatsheet (`⌘/`), & Settings (`⌘,`).**
+Press **⌘⇧P** (or click `⌘` in the sidebar toolbar) to fuzzy-search every
+Tachyon action and jump straight to any live session or window across **This
+Mac** and remote hosts. Press **⌘/** — or click the keyboard icon on the bottom
+footer, or select **Keyboard Cheatsheet** from the Command Palette — to pop up a
+filterable Liquid Glass floating cheatsheet where clicking any action runs it
+and clicking any CLI snippet copies it. Press **⌘,** (or click `⚙` in the
+sidebar footer) for native Liquid Glass Settings (**Server**, **Remote Hosts**,
+**Integrations**, **Interface**, **Notifications**).
+
+**Coding agent integrations & OSC 7501 status.** Tachyon parses OSC 7501
+(`ESC ] 7501 ; state=... ; app=... ; msg=<b64> ; label=<b64> BEL/ST`) across
+both local and remote servers, preserving live status through `Term::to_vt()`
+restores, showing live agent icons (`✳` Claude Code, `◎` Codex, `◈` OpenCode,
+`π` Pi) and badges in the sidebar & pane headers, and posting macOS
+notifications when an unfocused local or remote agent blocks for approval or
+finishes (`notify.agent_status = true`; clicking jumps straight to that pane).
+Run `tachyon skill setup` (or toggle **Settings > Integrations**) to install the
+Tachyon agent skill and non-destructive Claude Code lifecycle hooks, with
+optional automatic task-based session naming (`agents.auto_name_sessions = true`).
+See [docs/REX_ARCHITECTURE.md](docs/REX_ARCHITECTURE.md) for the full design and
 roadmap.
 
 **Shortcut hints.** A band along the bottom lists the shortcuts worth knowing,

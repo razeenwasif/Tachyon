@@ -6,6 +6,31 @@
 
 use serde_json::{json, Value};
 
+use crate::term::{ProgramState, ProgramStatus};
+
+/// Serialize `ProgramStatus` into Mux v2 JSON.
+pub fn status_to_json(st: &ProgramStatus) -> Value {
+    json!({
+        "state": st.state.as_str(),
+        "app": st.app,
+        "kind": st.kind,
+        "msg": st.msg,
+        "label": st.label,
+    })
+}
+
+/// Deserialize `ProgramStatus` from Mux v2 JSON.
+pub fn status_from_json(v: &Value) -> Option<ProgramStatus> {
+    let state = ProgramState::parse(v.get("state")?.as_str()?)?;
+    Some(ProgramStatus {
+        state,
+        app: v.get("app").and_then(Value::as_str).map(str::to_string),
+        kind: v.get("kind").and_then(Value::as_str).map(str::to_string),
+        msg: v.get("msg").and_then(Value::as_str).map(str::to_string),
+        label: v.get("label").and_then(Value::as_str).map(str::to_string),
+    })
+}
+
 /// Direction of a binary pane split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitDir {
@@ -194,6 +219,8 @@ pub struct BlockInfo {
     pub awake: bool,
     pub attached_clients: usize,
     pub created_at: u64,
+    /// Live OSC 7501 program/agent status, if reported.
+    pub status: Option<ProgramStatus>,
 }
 
 impl BlockInfo {
@@ -204,6 +231,15 @@ impl BlockInfo {
         }
         if let Some(t) = self.title.as_deref().filter(|s| !s.is_empty()) {
             return t.to_string();
+        }
+        if let Some(app) = self.status.as_ref().and_then(|s| s.app.as_deref()).filter(|s| !s.is_empty()) {
+            return match app.to_ascii_lowercase().as_str() {
+                "claude" | "claude-code" => "Claude Code".into(),
+                "codex" => "Codex".into(),
+                "opencode" => "OpenCode".into(),
+                "pi" => "Pi".into(),
+                _ => app.to_string(),
+            };
         }
         if let Some(cmd) = self.command.as_deref().filter(|s| !s.is_empty()) {
             return cmd.to_string();
@@ -232,6 +268,7 @@ impl BlockInfo {
             "awake": self.awake,
             "attached_clients": self.attached_clients,
             "created_at": self.created_at,
+            "status": self.status.as_ref().map(status_to_json),
         })
     }
 
@@ -253,6 +290,7 @@ impl BlockInfo {
             awake: v.get("awake").and_then(Value::as_bool).unwrap_or(false),
             attached_clients: v.get("attached_clients").and_then(Value::as_u64).unwrap_or(0) as usize,
             created_at: v.get("created_at").and_then(Value::as_u64).unwrap_or(0),
+            status: v.get("status").and_then(status_from_json),
         })
     }
 }
