@@ -26,6 +26,7 @@ use objc2_foundation::{
 
 use super::host_mgr::HostView;
 use super::{panes, with_window};
+use crate::config::{ChromeStyle, ThemePreset};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
@@ -33,6 +34,11 @@ pub enum PaletteAction {
     OpenAgents,
     OpenSettings,
     ToggleSidebar,
+    SetAppearanceBundle {
+        preset: ThemePreset,
+        chrome: ChromeStyle,
+        sidebar: Option<bool>,
+    },
     NewTab,
     NewWindow,
     ClosePane,
@@ -216,6 +222,46 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Switch between edge-to-edge and standard title bar".into(),
             shortcut: "",
             action: PaletteAction::ToggleTitleBar,
+        },
+        PaletteItem {
+            title: "Appearance: Herdr Dark Minimal".into(),
+            subtitle: "Neutral charcoal #101114 / #17191d, calm ANSI & sidebar".into(),
+            shortcut: "",
+            action: PaletteAction::SetAppearanceBundle {
+                preset: ThemePreset::Obsidian,
+                chrome: ChromeStyle::Herdr,
+                sidebar: Some(true),
+            },
+        },
+        PaletteItem {
+            title: "Appearance: Terminals Minimal (Pill Tabs)".into(),
+            subtitle: "Charcoal pill tabs & terminals without the sidebar".into(),
+            shortcut: "",
+            action: PaletteAction::SetAppearanceBundle {
+                preset: ThemePreset::Obsidian,
+                chrome: ChromeStyle::Terminals,
+                sidebar: Some(false),
+            },
+        },
+        PaletteItem {
+            title: "Appearance: Core (Zero Chrome)".into(),
+            subtitle: "Pure #0A0B0C surface with dashed 1px dividers".into(),
+            shortcut: "",
+            action: PaletteAction::SetAppearanceBundle {
+                preset: ThemePreset::Obsidian,
+                chrome: ChromeStyle::Core,
+                sidebar: Some(false),
+            },
+        },
+        PaletteItem {
+            title: "Appearance: Liquid Glass (Default)".into(),
+            subtitle: "Restore translucent macOS Liquid Glass & Tachyon navy theme".into(),
+            shortcut: "",
+            action: PaletteAction::SetAppearanceBundle {
+                preset: ThemePreset::Default,
+                chrome: ChromeStyle::Glass,
+                sidebar: None,
+            },
         },
         PaletteItem {
             title: "Copy Command Output".into(),
@@ -818,6 +864,9 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
             return;
         }
         PaletteAction::ToggleSidebar => with_window(win_id, |w| w.toggle_sidebar()),
+        PaletteAction::SetAppearanceBundle { preset, chrome, sidebar } => {
+            super::apply_appearance_bundle(preset, chrome, sidebar);
+        }
         PaletteAction::NewTab => super::open_tab(win_id),
         PaletteAction::NewWindow => super::open_window(),
         PaletteAction::ClosePane => super::close_active_tab(win_id),

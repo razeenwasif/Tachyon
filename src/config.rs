@@ -109,6 +109,52 @@ pub enum PaneHeaders {
     Never,
 }
 
+/// Built-in dark colour preset (`theme.preset` in `tachyon.conf`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ThemePreset {
+    #[default]
+    Default,
+    Obsidian,
+}
+
+impl ThemePreset {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Obsidian => "obsidian",
+        }
+    }
+}
+
+/// Window surface & chrome style (`window.chrome` in `tachyon.conf`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ChromeStyle {
+    /// Liquid Glass translucency (default on macOS).
+    #[default]
+    Glass,
+    /// Herdr-inspired dark clean minimal charcoal (`#101114` chrome, `#17191d` pane, `28pt` bottom status strip).
+    Herdr,
+    /// Minimal dark chrome (`#0C0D0F` top/track, `#111214` pane) with pill tabs and no sidebar clutter.
+    Terminals,
+    /// Zero decorative chrome (`#0A0B0C` canvas & pane, dashed `1px` dividers).
+    Core,
+}
+
+impl ChromeStyle {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Glass => "glass",
+            Self::Herdr => "herdr",
+            Self::Terminals => "terminals",
+            Self::Core => "core",
+        }
+    }
+
+    pub const fn is_minimal(&self) -> bool {
+        !matches!(self, Self::Glass)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
     pub cols: usize,
@@ -131,8 +177,13 @@ pub struct WindowConfig {
     /// the tabs in it when there are two or more) instead of edge-to-edge.
     pub title_bar: bool,
     /// macOS: full screen means around the notch: the green button, ⌃⌘F and
-    /// View > Enter Full Screen use it, and Tachyon opens that way.
+    /// View > Enter Full Screen use it.
     pub notch_full_screen: bool,
+    /// macOS: open in full screen automatically at launch when
+    /// `window.fullscreen = notch` (false by default so Tachyon opens windowed).
+    pub start_fullscreen: bool,
+    /// macOS: window chrome & surface preset (`glass`, `herdr`, `terminals`, `core`).
+    pub chrome: ChromeStyle,
     /// macOS: a band along the bottom with shortcut hints.
     pub hints: bool,
     /// macOS: collapsible multi-host left sidebar (Rex style). Toggle with ⌘B.
@@ -168,6 +219,8 @@ impl Default for WindowConfig {
             glass_tint: if cfg!(target_os = "macos") { 0.75 } else { 0.0 },
             title_bar: false,
             notch_full_screen: false,
+            start_fullscreen: false,
+            chrome: ChromeStyle::Glass,
             hints: true,
             sidebar: cfg!(target_os = "macos"),
             sidebar_width: 240.0,
@@ -246,6 +299,40 @@ impl Default for ThemeConfig {
 }
 
 impl ThemeConfig {
+    /// Herdr-inspired dark clean minimal neutral charcoal theme (`theme.preset = obsidian`).
+    pub fn obsidian() -> ThemeConfig {
+        let ansi: [[u8; 3]; 16] = [
+            [0x10, 0x11, 0x14], // black (--chrome)
+            [0xDC, 0x8C, 0x95], // red
+            [0xA6, 0xBD, 0x91], // green
+            [0xD8, 0xBE, 0x87], // yellow
+            [0x96, 0xB2, 0xD7], // blue / accent
+            [0xB5, 0xA2, 0xCE], // magenta
+            [0x8C, 0xBD, 0xC3], // cyan
+            [0xD2, 0xD4, 0xD9], // white
+            [0x69, 0x6A, 0x6D], // bright black (dim)
+            [0xE6, 0xA3, 0xAB], // bright red
+            [0xB9, 0xCD, 0xA6], // bright green
+            [0xE3, 0xCC, 0xA0], // bright yellow
+            [0xAD, 0xC5, 0xE3], // bright blue
+            [0xC7, 0xB7, 0xDC], // bright magenta
+            [0xA3, 0xCE, 0xD3], // bright cyan
+            [0xEE, 0xEE, 0xEF], // bright white (--fg)
+        ];
+        ThemeConfig {
+            background: [0x17, 0x19, 0x1D],
+            foreground: [0xD2, 0xD4, 0xD9],
+            cursor: [0x96, 0xB2, 0xD7],
+            cursor_text: [0x10, 0x11, 0x14],
+            selection_bg: [0x2C, 0x2E, 0x31],
+            selection_fg: None,
+            ansi: ansi.map(Some),
+            bold_is_bright: false,
+            cursor_accent: false,
+            selection_accent: false,
+        }
+    }
+
     /// The light theme: near-white paper, and ANSI colours darkened until
     /// they read on it (the default ANSI set is tuned for dark backgrounds).
     /// The colours sit close to Apple's light-mode system colours.
@@ -464,6 +551,7 @@ pub struct Config {
     pub font: FontConfig,
     pub window: WindowConfig,
     pub render: RenderConfig,
+    pub theme_preset: ThemePreset,
     /// The dark theme, or the only one on Windows.
     pub theme: ThemeConfig,
     /// macOS: the theme used in Light Mode when `appearance` is Auto.
@@ -489,6 +577,7 @@ impl Default for Config {
             font: FontConfig::default(),
             window: WindowConfig::default(),
             render: RenderConfig::default(),
+            theme_preset: ThemePreset::Default,
             theme: ThemeConfig::default(),
             theme_light: ThemeConfig::light(),
             appearance: Appearance::default(),
@@ -673,6 +762,16 @@ impl Config {
                     _ => return Err(format!("window.fullscreen: expected native or notch, got `{value}`")),
                 }
             }
+            "window.start_fullscreen" => self.window.start_fullscreen = parse_bool(value)?,
+            "window.chrome" => {
+                self.window.chrome = match value.to_ascii_lowercase().as_str() {
+                    "glass" | "default" => ChromeStyle::Glass,
+                    "herdr" | "minimal" => ChromeStyle::Herdr,
+                    "terminals" => ChromeStyle::Terminals,
+                    "core" => ChromeStyle::Core,
+                    _ => return Err(format!("window.chrome: expected glass, herdr, terminals or core, got `{value}`")),
+                }
+            }
             "window.layout" => {
                 self.window.title_bar = match value {
                     "edge" | "edge-to-edge" | "edge_to_edge" => false,
@@ -714,6 +813,19 @@ impl Config {
                 self.render.sync_timeout_ms = parse_usize(value, 0, 5000)? as u64
             }
 
+            "theme.preset" => {
+                self.theme_preset = match value.to_ascii_lowercase().as_str() {
+                    "default" | "tachyon" => {
+                        self.theme = ThemeConfig::default();
+                        ThemePreset::Default
+                    }
+                    "obsidian" | "herdr" => {
+                        self.theme = ThemeConfig::obsidian();
+                        ThemePreset::Obsidian
+                    }
+                    _ => return Err(format!("theme.preset: expected default or obsidian, got `{value}`")),
+                }
+            }
             "theme.appearance" => {
                 self.appearance = match value.to_ascii_lowercase().as_str() {
                     "auto" | "system" => Appearance::Auto,
@@ -1131,5 +1243,48 @@ mod contrast_tests {
 
         let bad = Config::parse("host.color.foo = chartreuse\nwindow.host_tint_strength = 9\n");
         assert_eq!(bad.warnings.len(), 2);
+    }
+
+    #[test]
+    fn theme_preset_chrome_and_start_fullscreen_parse_and_validate() {
+        let def = Config::default();
+        assert_eq!(def.theme_preset, ThemePreset::Default);
+        assert_eq!(def.window.chrome, ChromeStyle::Glass);
+        assert!(!def.window.start_fullscreen);
+
+        // Selecting window.fullscreen = notch must not force start_fullscreen = true.
+        let notch_windowed = Config::parse("window.fullscreen = notch\n");
+        assert!(notch_windowed.warnings.is_empty());
+        assert!(notch_windowed.window.notch_full_screen);
+        assert!(!notch_windowed.window.start_fullscreen);
+
+        // Obsidian preset applies Herdr neutral charcoal palette and lets later overrides win.
+        let obsidian = Config::parse(
+            "theme.preset = herdr\n\
+             theme.background = #111214\n\
+             window.chrome = terminals\n\
+             window.start_fullscreen = true\n",
+        );
+        assert!(obsidian.warnings.is_empty(), "{:?}", obsidian.warnings);
+        assert_eq!(obsidian.theme_preset, ThemePreset::Obsidian);
+        assert_eq!(obsidian.theme.background, [0x11, 0x12, 0x14]);
+        assert_eq!(obsidian.theme.foreground, [0xD2, 0xD4, 0xD9]);
+        assert_eq!(obsidian.theme.ansi[1], Some([0xDC, 0x8C, 0x95]));
+        assert_eq!(obsidian.theme.ansi[4], Some([0x96, 0xB2, 0xD7]));
+        assert_eq!(obsidian.window.chrome, ChromeStyle::Terminals);
+        assert!(obsidian.window.start_fullscreen);
+
+        let herdr = Config::parse("theme.preset = obsidian\nwindow.chrome = herdr\n");
+        assert!(herdr.warnings.is_empty());
+        assert_eq!(herdr.theme.background, [0x17, 0x19, 0x1D]);
+        assert_eq!(herdr.window.chrome, ChromeStyle::Herdr);
+
+        let core = Config::parse("window.chrome = core\n");
+        assert!(core.warnings.is_empty());
+        assert_eq!(core.window.chrome, ChromeStyle::Core);
+        assert!(core.window.chrome.is_minimal());
+
+        let bad = Config::parse("theme.preset = neon\nwindow.chrome = Acrylic98\nwindow.start_fullscreen = maybe\n");
+        assert_eq!(bad.warnings.len(), 3);
     }
 }
