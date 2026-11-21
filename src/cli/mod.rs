@@ -1051,6 +1051,8 @@ fn cmd_run(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
 
 fn cmd_send(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let mut block: Option<String> = None;
+    let mut window: Option<String> = None;
+    let mut all = false;
     let mut enter = false;
     let mut parts: Vec<String> = Vec::new();
 
@@ -1064,6 +1066,14 @@ fn cmd_send(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             "-b" | "--block" => {
                 block = Some(args.get(i + 1).ok_or("-b/--block requires an id")?.clone());
                 i += 2;
+            }
+            "-w" | "--window" => {
+                window = Some(args.get(i + 1).ok_or("-w/--window requires an id")?.clone());
+                i += 2;
+            }
+            "--all" | "--broadcast" => {
+                all = true;
+                i += 1;
             }
             "--enter" | "-e" => {
                 enter = true;
@@ -1088,7 +1098,7 @@ fn cmd_send(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     } else if enter {
         Vec::new()
     } else {
-        return Err("usage: tachyon send [-b BLOCK] [--enter] <text | ->".into());
+        return Err("usage: tachyon send [-b BLOCK | --all [-w WINDOW]] [--enter] <text | ->".into());
     };
 
     if enter {
@@ -1096,6 +1106,40 @@ fn cmd_send(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     }
 
     let (_, c) = connect(opts, false)?;
+    if all {
+        let snap = c.state().map_err(|e| e.to_string())?;
+        let win = if let Some(wid) = window.or_else(|| std::env::var("TACHYON_WINDOW").ok().filter(|s| !s.is_empty())) {
+            snap.windows
+                .iter()
+                .find(|w| w.id == wid || w.name.as_deref() == Some(wid.as_str()))
+                .ok_or_else(|| format!("window `{wid}` not found"))?
+        } else if let Some(bid) = block.or_else(|| std::env::var("TACHYON_BLOCK").ok().filter(|s| !s.is_empty())) {
+            snap.windows
+                .iter()
+                .find(|w| w.layout.leaves().iter().any(|l| l == &bid))
+                .ok_or_else(|| format!("window containing block `{bid}` not found"))?
+        } else {
+            snap.windows
+                .last()
+                .ok_or("no active window to broadcast to")?
+        };
+        let leaves = win.layout.leaves();
+        if leaves.is_empty() {
+            return Err(format!("window `{}` has no panes", win.id));
+        }
+        for bid in &leaves {
+            c.send_input(bid, &payload).map_err(|e| e.to_string())?;
+        }
+        if opts.json {
+            print_json(&json!({
+                "window_id": win.id,
+                "blocks": leaves,
+                "bytes": payload.len(),
+            }));
+        }
+        return Ok(0);
+    }
+
     let bid = resolve_block_id(block, &c)?;
     c.send_input(&bid, &payload).map_err(|e| e.to_string())?;
     if opts.json {
@@ -1925,7 +1969,7 @@ Sessions, Windows & Automation:
   tachyon window  ls|new|rename|kill|focus
   tachyon split [--right|--down] [-b B] [-- CMD...]
   tachyon run [--session S] [--split right|down] [--wait] [--capture] -- CMD...
-  tachyon send [-b B] [--enter] <TEXT | ->
+  tachyon send [-b B | --all [-w W]] [--enter] <TEXT | ->
   tachyon capture [-b B] [--lines N] [--ansi]
   tachyon events [-s SESSION] [--json]
 

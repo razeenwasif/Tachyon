@@ -40,6 +40,7 @@ pub enum PaletteAction {
     SplitRight,
     SplitDown,
     ZoomPane,
+    ToggleBroadcast,
     Find,
     RewindBack,
     Neutrino,
@@ -119,6 +120,12 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Toggle focused pane filling the window".into(),
             shortcut: "⌘⇧↩",
             action: PaletteAction::ZoomPane,
+        },
+        PaletteItem {
+            title: "Broadcast Input to All Panes".into(),
+            subtitle: "Toggle sending keystrokes & paste to every split pane at once".into(),
+            shortcut: "⌘⇧I",
+            action: PaletteAction::ToggleBroadcast,
         },
         PaletteItem {
             title: "New Tab / Window".into(),
@@ -818,6 +825,7 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
         PaletteAction::SplitRight => super::split_pane(win_id, panes::Dir::Right),
         PaletteAction::SplitDown => super::split_pane(win_id, panes::Dir::Down),
         PaletteAction::ZoomPane => with_window(win_id, |w| w.toggle_zoom()),
+        PaletteAction::ToggleBroadcast => with_window(win_id, |w| w.toggle_broadcast()),
         PaletteAction::Find => {
             with_window(win_id, |w| w.open_find());
             return;

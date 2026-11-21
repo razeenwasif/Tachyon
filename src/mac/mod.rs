@@ -494,6 +494,11 @@ define_class!(
             with_window(self.id(), |w| w.move_focus(0, 1));
         }
 
+        #[unsafe(method(tachyonBroadcast:))]
+        fn toggle_broadcast(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_broadcast);
+        }
+
         #[unsafe(method(tachyonNotch:))]
         fn toggle_notch(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), TermWindow::toggle_notch);
@@ -1875,6 +1880,8 @@ struct Tab {
     layout: panes::Node,
     /// The focused pane fills the tab for now; the others keep running.
     zoomed: bool,
+    /// Broadcast keyboard & paste input to every split pane in this tab.
+    broadcast: bool,
     dividers: Vec<panes::Divider>,
     /// What the tab is called: the focused pane's running command, folder,
     /// or a title its program set. Refreshed when `Term::title_revision`
@@ -1981,6 +1988,7 @@ impl Tab {
             panes: vec![pane],
             focus: 0,
             zoomed: false,
+            broadcast: false,
             dividers: Vec::new(),
             label: String::new(),
             title_rev: u64::MAX,
@@ -2002,6 +2010,11 @@ impl Tab {
     /// when zoomed.
     fn visible(&self) -> Vec<usize> {
         if self.zoomed { vec![self.focus] } else { (0..self.panes.len()).collect() }
+    }
+
+    /// True when keyboard input should be broadcast to every visible split pane.
+    fn is_broadcasting(&self) -> bool {
+        self.broadcast && self.panes.len() > 1 && !self.zoomed
     }
 
     /// Lay the panes out in a grid of `cols` by `rows`, resizing each whose
@@ -2456,6 +2469,7 @@ impl TermWindow {
             decors.push(decor);
         }
         let blink = self.focused && focus_at.is_some_and(|k| guards[k].cursor_state().blinking) && self.rewound.is_none();
+        let broadcasting = tab.is_broadcasting();
         let empty = Decor::default();
         let frames: Vec<PaneFrame> = visible
             .iter()
@@ -2480,11 +2494,11 @@ impl TermWindow {
                         term: &guards[k],
                         col: rect.col,
                         row: rect.row,
-                        focused: self.focused && focused,
+                        focused: self.focused && (focused || broadcasting),
                         selection: selections[k],
                         cursor_on_layer: focused && blink,
                         decor: &decors[k],
-                        dim: self.focused && !focused,
+                        dim: self.focused && !focused && !broadcasting,
                     },
                 }
             })
@@ -2543,6 +2557,7 @@ impl TermWindow {
             Vec::new()
         };
         let host_accent = self.active_host_accent(&guards[focus_idx]);
+        let broadcast_panes = broadcasting.then_some(tab.panes.len());
         let leftmost = [
             &self.agents_button,
             &self.cheatsheet_button,
@@ -2563,6 +2578,7 @@ impl TermWindow {
             &hints,
             hints_right,
             host_accent.as_ref(),
+            broadcast_panes,
             presented,
         );
         let overlay = match focus_at {
@@ -2574,7 +2590,17 @@ impl TermWindow {
         };
         drop(frames);
         drop(guards);
-        self.sync_host_tint(host_accent.as_ref());
+        let glass_accent = match (&host_accent, broadcast_panes) {
+            (Some(acc), _) if acc.danger => Some(acc.clone()),
+            (_, Some(_)) => Some(renderer::HostAccent {
+                label: "broadcast".into(),
+                rgb: [245, 158, 11],
+                danger: false,
+            }),
+            (Some(acc), None) => Some(acc.clone()),
+            (None, None) => None,
+        };
+        self.sync_host_tint(glass_accent.as_ref());
         self.update_cursor_layer(overlay);
         self.sync_pane_headers();
     }
@@ -3089,6 +3115,10 @@ impl TermWindow {
             return;
         }
         tab.zoomed = !tab.zoomed;
+        if tab.zoomed {
+            // Never broadcast blindly to hidden panes while zoomed.
+            tab.broadcast = false;
+        }
         if let Some((host, _, wid)) = tab.mux_target.clone() {
             let zoomed = tab.zoomed;
             if let Some(client) = mux_client(&host) {
@@ -3101,6 +3131,28 @@ impl TermWindow {
         }
         self.rewind_exit();
         self.layout();
+    }
+
+    /// True when keyboard & paste input in the active tab is broadcast to all split panes.
+    fn is_broadcasting(&self) -> bool {
+        self.tabs[self.active].is_broadcasting()
+    }
+
+    /// ⌘⇧I: toggle broadcasting keystrokes and paste to every split pane in the active tab.
+    fn toggle_broadcast(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        if tab.panes.len() < 2 {
+            tab.broadcast = false;
+            objc2_app_kit::NSBeep();
+            return;
+        }
+        tab.broadcast = !tab.broadcast;
+        if tab.broadcast && tab.zoomed {
+            tab.zoomed = false;
+        }
+        self.rewind_exit();
+        self.layout();
+        self.request_redraw();
     }
 
     /// Close pane `p` of tab `i`: the rest of its split takes its place and,
@@ -3139,6 +3191,9 @@ impl TermWindow {
         let next = tab.layout.remove(tab.panes[p].id);
         tab.zoomed = false;
         let pane = tab.panes.remove(p);
+        if tab.panes.len() < 2 {
+            tab.broadcast = false;
+        }
         let is_mux = pane.pty.is_mux();
         if keep && is_mux {
             pane.kill_on_drop.set(true);
@@ -3272,6 +3327,9 @@ impl TermWindow {
     /// fold), then the everyday ones.
     fn hint_list(&self, term: &Term) -> Vec<(String, String)> {
         let mut out: Vec<(&str, &str)> = Vec::new();
+        if self.is_broadcasting() {
+            out.push(("⌘⇧I", "stop broadcast"));
+        }
         if self.ghost.is_some() {
             out.push(("Tab", "take suggestion"));
         }
@@ -4468,9 +4526,14 @@ impl TermWindow {
             self.renderer.set_strip_band(Some((band * scale).round() as f32));
             self.place_capsule(strip);
         }
-        // The band along the bottom: hints, and footer tool icons at its right.
+        // The band along the bottom: hints, broadcast badge, and footer tool icons at its right.
         self.renderer.set_hints_band(
-            self.hints || self.fairy_socket.is_some() || self.monitor || self.neutrino || !self.quick,
+            self.hints
+                || self.is_broadcasting()
+                || self.fairy_socket.is_some()
+                || self.monitor
+                || self.neutrino
+                || !self.quick,
         );
         self.place_fairy();
         self.place_monitor();
@@ -4903,8 +4966,15 @@ impl TermWindow {
                 _ => None,
             };
             if let Some(text) = take.filter(|t| !t.is_empty()) {
-                self.term.lock().scroll_to_bottom();
-                let _ = self.pty.write(text.as_bytes());
+                if self.is_broadcasting() {
+                    for pane in &self.tabs[self.active].panes {
+                        pane.term.lock().scroll_to_bottom();
+                        let _ = pane.pty.write(text.as_bytes());
+                    }
+                } else {
+                    self.term.lock().scroll_to_bottom();
+                    let _ = self.pty.write(text.as_bytes());
+                }
                 self.stamp_keystroke();
                 self.ghost = None;
                 self.ghost_cache = None;
@@ -4944,17 +5014,40 @@ impl TermWindow {
         if !direct {
             return true;
         }
-        let mode = self.term.lock().mode;
-        if let Some(bytes) = input::encode(event.keyCode(), &chars, &bare, mods, mode, meta) {
-            self.term.lock().scroll_to_bottom();
-            let _ = self.pty.write(&bytes);
-            self.stamp_keystroke();
-            NSCursor::setHiddenUntilMouseMoves(true);
-            if self.selection.take().is_some() {
-                self.request_redraw();
+        if self.is_broadcasting() {
+            let mut sent_any = false;
+            for pane in &self.tabs[self.active].panes {
+                let mode = {
+                    let mut t = pane.term.lock();
+                    t.scroll_to_bottom();
+                    t.mode
+                };
+                if let Some(bytes) = input::encode(event.keyCode(), &chars, &bare, mods, mode, meta) {
+                    let _ = pane.pty.write(&bytes);
+                    sent_any = true;
+                }
             }
-            // Typing restarts the blink in its visible phase.
-            self.cursor_shown = None;
+            if sent_any {
+                self.stamp_keystroke();
+                NSCursor::setHiddenUntilMouseMoves(true);
+                if self.selection.take().is_some() {
+                    self.request_redraw();
+                }
+                self.cursor_shown = None;
+            }
+        } else {
+            let mode = self.term.lock().mode;
+            if let Some(bytes) = input::encode(event.keyCode(), &chars, &bare, mods, mode, meta) {
+                self.term.lock().scroll_to_bottom();
+                let _ = self.pty.write(&bytes);
+                self.stamp_keystroke();
+                NSCursor::setHiddenUntilMouseMoves(true);
+                if self.selection.take().is_some() {
+                    self.request_redraw();
+                }
+                // Typing restarts the blink in its visible phase.
+                self.cursor_shown = None;
+            }
         }
         false
     }
@@ -4967,8 +5060,15 @@ impl TermWindow {
             self.request_redraw();
             return;
         }
-        self.term.lock().scroll_to_bottom();
-        let _ = self.pty.write(text.as_bytes());
+        if self.is_broadcasting() {
+            for pane in &self.tabs[self.active].panes {
+                pane.term.lock().scroll_to_bottom();
+                let _ = pane.pty.write(text.as_bytes());
+            }
+        } else {
+            self.term.lock().scroll_to_bottom();
+            let _ = self.pty.write(text.as_bytes());
+        }
         self.stamp_keystroke();
         NSCursor::setHiddenUntilMouseMoves(true);
         self.selection = None;
@@ -5012,20 +5112,39 @@ impl TermWindow {
         };
         // Terminals send CR for a newline, as if each line were typed.
         let text = text.to_string().replace("\r\n", "\r").replace('\n', "\r");
-        let bracketed = {
-            let mut t = self.term.lock();
-            t.scroll_to_bottom();
-            t.mode.contains(TermMode::BRACKETED_PASTE)
-        };
-        let mut bytes = Vec::with_capacity(text.len() + 12);
-        if bracketed {
-            bytes.extend_from_slice(b"\x1b[200~");
+        if self.is_broadcasting() {
+            for pane in &self.tabs[self.active].panes {
+                let bracketed = {
+                    let mut t = pane.term.lock();
+                    t.scroll_to_bottom();
+                    t.mode.contains(TermMode::BRACKETED_PASTE)
+                };
+                let mut bytes = Vec::with_capacity(text.len() + 12);
+                if bracketed {
+                    bytes.extend_from_slice(b"\x1b[200~");
+                }
+                bytes.extend_from_slice(text.as_bytes());
+                if bracketed {
+                    bytes.extend_from_slice(b"\x1b[201~");
+                }
+                let _ = pane.pty.write(&bytes);
+            }
+        } else {
+            let bracketed = {
+                let mut t = self.term.lock();
+                t.scroll_to_bottom();
+                t.mode.contains(TermMode::BRACKETED_PASTE)
+            };
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            if bracketed {
+                bytes.extend_from_slice(b"\x1b[200~");
+            }
+            bytes.extend_from_slice(text.as_bytes());
+            if bracketed {
+                bytes.extend_from_slice(b"\x1b[201~");
+            }
+            let _ = self.pty.write(&bytes);
         }
-        bytes.extend_from_slice(text.as_bytes());
-        if bracketed {
-            bytes.extend_from_slice(b"\x1b[201~");
-        }
-        let _ = self.pty.write(&bytes);
     }
 
     fn scroll(&mut self, event: &NSEvent) {
@@ -6613,6 +6732,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     }
     item(&window, "Zoom Pane", sel!(tachyonZoomPane:), "\r")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    item(&window, "Broadcast Input to All Panes", sel!(tachyonBroadcast:), "I");
     submenu(&main, &window);
     app.setWindowsMenu(Some(&window));
 
@@ -7794,6 +7914,7 @@ fn build_tab_from_attached(cfg: &Config, data: AttachedWindowData) -> Result<Tab
         focus,
         layout,
         zoomed: data.window.zoomed,
+        broadcast: false,
         dividers: Vec::new(),
         label: data.window.name.unwrap_or_default(),
         title_rev: u64::MAX,

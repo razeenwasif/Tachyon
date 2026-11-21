@@ -14,11 +14,12 @@ fn bin() -> &'static str {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tachyon-cli-test-{tag}-{}-{}",
-        std::process::id(),
-        tachyon::mux::mono_now_ns()
-    ));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    // Keep Unix socket paths well under macOS SUN_LEN (104 bytes).
+    let base = if cfg!(unix) { PathBuf::from("/tmp") } else { std::env::temp_dir() };
+    let dir = base.join(format!("ty-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -528,6 +529,73 @@ fn cli_agents_lists_and_filters_live_osc7501_agents_by_urgency() {
     let arr = attn["agents"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["state"], "blocked");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_send_all_broadcasts_input_to_all_split_panes_in_window() {
+    let dir = temp_dir("broadcast-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let pane_script = "read line; echo BCAST:$line; sleep 15";
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["new", "bcast", "--json", "--", "/bin/sh", "-c", pane_script],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let created: Value = serde_json::from_str(&out).unwrap();
+    let wid = created["window"]["id"].as_str().unwrap().to_string();
+    let b1 = created["block"]["id"].as_str().unwrap().to_string();
+
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["split", "--right", "-b", &b1, "--json", "--", "/bin/sh", "-c", pane_script],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let s2: Value = serde_json::from_str(&out).unwrap();
+    let b2 = s2["block"]["id"].as_str().unwrap().to_string();
+
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["split", "--down", "-b", &b2, "--json", "--", "/bin/sh", "-c", pane_script],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let s3: Value = serde_json::from_str(&out).unwrap();
+    let b3 = s3["block"]["id"].as_str().unwrap().to_string();
+
+    std::thread::sleep(Duration::from_millis(120));
+
+    // Broadcast once to all 3 panes in the window.
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["send", "--all", "-w", &wid, "--enter", "--json", "hello-all"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let sent: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(sent["window_id"], wid);
+    assert_eq!(sent["blocks"].as_array().unwrap().len(), 3);
+
+    std::thread::sleep(Duration::from_millis(150));
+
+    for bid in [&b1, &b2, &b3] {
+        let (code, cap, err) = run_cli(&sock, &hosts, &["capture", "-b", bid, "--lines", "10"]);
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            cap.contains("BCAST:hello-all"),
+            "expected broadcast line in pane {bid}, got: {cap:?}"
+        );
+    }
 
     let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
     assert_eq!(code, 0, "stderr: {err}");
