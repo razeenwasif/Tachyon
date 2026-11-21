@@ -7324,6 +7324,238 @@ fn mux_set_host_color(alias: &str, color: Option<String>) {
     });
 }
 
+fn default_target_win_id(win_id: u64) -> Option<u64> {
+    if win_id != 0 {
+        return Some(win_id);
+    }
+    with_app(|app| {
+        app.windows
+            .iter()
+            .find(|w| w.window.isKeyWindow())
+            .or_else(|| app.windows.first())
+            .map(|w| w.id)
+    })
+    .flatten()
+}
+
+/// Launch (or idempotently reuse) a saved multi-host workspace template in the
+/// background, refresh touched hosts, and switch `win_id` to its focus window.
+fn mux_workspace_up(win_id: u64, name: &str) {
+    let (_, spec) = match crate::mux::workspace::load_workspace(name) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            crate::log::force(&format!("workspace `{name}` load failed: {e}"));
+            return;
+        }
+    };
+    let target_win = default_target_win_id(win_id);
+    let (cols, rows) = target_win
+        .and_then(|id| query_window(id, |w| (w.grid.0.max(40) as u16, w.grid.1.max(12) as u16)))
+        .unwrap_or((120, 32));
+    let mgr = host_mgr();
+    let hosts_touched = spec.hosts();
+    let ws_name = spec.name.clone();
+
+    let _ = std::thread::Builder::new()
+        .name(format!("tachyon-ws-up-{ws_name}"))
+        .spawn(move || {
+            let opts = crate::mux::workspace::WorkspaceUpOptions {
+                recreate: false,
+                dry_run: false,
+                cols,
+                rows,
+            };
+            let report = crate::mux::workspace::workspace_up(&spec, &opts, |alias| {
+                if let Some(c) = mgr.as_ref().and_then(|m| m.client(alias)) {
+                    return Ok(c);
+                }
+                let saved = crate::mux::load_hosts();
+                let selector = if alias == "local" { None } else { Some(alias) };
+                let target =
+                    crate::mux::resolve_target(selector, &saved).map_err(|e| e.to_string())?;
+                crate::mux::client::MuxClient::connect(&target, true, "gui", "Tachyon.app")
+                    .map_err(|e| format!("connect `{alias}` failed: {e}"))
+            });
+
+            if let Some(m) = &mgr {
+                for alias in &hosts_touched {
+                    m.refresh_host(alias);
+                }
+            }
+            for err in &report.errors {
+                crate::log::force(&format!("workspace `{ws_name}` host `{}`: {}", err.host, err.error));
+            }
+
+            let focus = report.focus;
+            DispatchQueue::main().exec_async(move || {
+                if let (Some(wid), Some(f)) = (target_win.or_else(|| default_target_win_id(0)), focus) {
+                    mux_select_window(wid, &f.host, &f.window_id);
+                }
+                settings::refresh_if_open();
+            });
+        });
+}
+
+/// Stop every running session referenced by a saved workspace template.
+fn mux_workspace_down(name: &str) {
+    let (_, spec) = match crate::mux::workspace::load_workspace(name) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            crate::log::force(&format!("workspace `{name}` load failed: {e}"));
+            return;
+        }
+    };
+    let mgr = host_mgr();
+    let hosts_touched = spec.hosts();
+    let ws_name = spec.name.clone();
+
+    let _ = std::thread::Builder::new()
+        .name(format!("tachyon-ws-down-{ws_name}"))
+        .spawn(move || {
+            let report = crate::mux::workspace::workspace_down(&spec, |alias| {
+                if let Some(c) = mgr.as_ref().and_then(|m| m.client(alias)) {
+                    return Ok(c);
+                }
+                let saved = crate::mux::load_hosts();
+                let selector = if alias == "local" { None } else { Some(alias) };
+                let target =
+                    crate::mux::resolve_target(selector, &saved).map_err(|e| e.to_string())?;
+                crate::mux::client::MuxClient::connect(&target, false, "gui", "Tachyon.app")
+                    .map_err(|e| format!("connect `{alias}` failed: {e}"))
+            });
+            if let Some(m) = &mgr {
+                for alias in &hosts_touched {
+                    m.refresh_host(alias);
+                }
+            }
+            for err in &report.errors {
+                crate::log::force(&format!("workspace `{ws_name}` down `{}`: {}", err.host, err.error));
+            }
+            DispatchQueue::main().exec_async(|| {
+                settings::refresh_if_open();
+            });
+        });
+}
+
+/// Snapshot the focused session (or all connected hosts when `all_hosts` is true)
+/// into `~/.config/Tachyon/workspaces/<name>.json`.
+fn mux_workspace_save(win_id: u64, all_hosts: bool) -> Result<(String, std::path::PathBuf), String> {
+    let views = mux_host_views();
+    let active_target: Option<(String, String, String)> = default_target_win_id(win_id)
+        .and_then(|id| query_window(id, |w| w.tabs[w.active].mux_target.clone()))
+        .flatten();
+
+    let (name, desc, snapshots, session_filter, focus) = if all_hosts {
+        let snaps: Vec<(String, crate::mux::model::ServerSnapshot)> = views
+            .into_iter()
+            .filter_map(|h| h.snapshot.map(|s| (h.alias, s)))
+            .collect();
+        let focus = active_target.as_ref().and_then(|(h, sid, wid)| {
+            snaps.iter().find(|(alias, _)| alias == h).and_then(|(_, snap)| {
+                let sname = snap.sessions.iter().find(|s| &s.id == sid).map(|s| s.name.clone());
+                let wname = snap
+                    .windows
+                    .iter()
+                    .find(|w| &w.id == wid)
+                    .and_then(|w| w.name.clone());
+                Some(crate::mux::workspace::WorkspaceFocus {
+                    host: h.clone(),
+                    session: sname,
+                    window: wname,
+                })
+            })
+        });
+        (
+            "multi-host".to_string(),
+            Some("Snapshot of all connected hosts".to_string()),
+            snaps,
+            None,
+            focus,
+        )
+    } else {
+        let (host, sess_id, win_mux_id) = active_target.ok_or_else(|| {
+            "active tab is not attached to a multiplexer session".to_string()
+        })?;
+        let snap = views
+            .into_iter()
+            .find(|h| h.alias == host)
+            .and_then(|h| h.snapshot)
+            .ok_or_else(|| format!("host `{host}` snapshot unavailable"))?;
+        let sess_name = snap
+            .sessions
+            .iter()
+            .find(|s| s.id == sess_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| sess_id.clone());
+        let wname = snap
+            .windows
+            .iter()
+            .find(|w| w.id == win_mux_id)
+            .and_then(|w| w.name.clone());
+        let safe_name: String = sess_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+            .collect();
+        let safe_name = safe_name.trim_matches(|c| c == '-' || c == '.').to_string();
+        let final_name = if safe_name.is_empty() { "workspace".into() } else { safe_name };
+        let focus = Some(crate::mux::workspace::WorkspaceFocus {
+            host: host.clone(),
+            session: Some(sess_name.clone()),
+            window: wname,
+        });
+        (
+            final_name,
+            Some(format!("Saved from `{host}` session `{sess_name}`")),
+            vec![(host, snap)],
+            Some(sess_id),
+            focus,
+        )
+    };
+
+    let spec = crate::mux::workspace::snapshot_workspace(
+        &name,
+        desc,
+        &snapshots,
+        session_filter.as_deref(),
+        focus,
+    )?;
+    let path = crate::mux::workspace::save_workspace(&spec, true)?;
+    settings::refresh_if_open();
+    Ok((spec.name, path))
+}
+
+fn mux_workspace_init_starter() -> Result<(String, std::path::PathBuf), String> {
+    let hosts = crate::mux::load_hosts();
+    let existing = crate::mux::workspace::list_workspaces();
+    let mut name = "starter".to_string();
+    let mut idx = 2usize;
+    while existing.iter().any(|w| w.name == name) {
+        name = format!("starter-{idx}");
+        idx += 1;
+    }
+    let spec = crate::mux::workspace::starter_workspace(&name, &hosts)?;
+    let path = crate::mux::workspace::save_workspace(&spec, false)?;
+    settings::refresh_if_open();
+    Ok((spec.name, path))
+}
+
+fn open_workspaces_folder() {
+    let dir = crate::mux::workspace::workspaces_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if crate::mux::workspace::list_workspaces().is_empty() {
+        let hosts = crate::mux::load_hosts();
+        if let Ok(spec) = crate::mux::workspace::starter_workspace("starter", &hosts) {
+            let _ = crate::mux::workspace::save_workspace(&spec, false);
+        }
+    }
+    let _ = std::process::Command::new("/usr/bin/open").arg(&dir).spawn();
+    settings::refresh_if_open();
+}
+
+fn open_workspace_file(path: &std::path::Path) {
+    let _ = std::process::Command::new("/usr/bin/open").arg(path).spawn();
+}
+
 /// Convert a server `LayoutNode` (keyed by block IDs) into a local `panes::Node`
 /// (keyed by local `Pane::id`), returning `None` if a leaf is missing.
 fn build_panes_tree(

@@ -39,9 +39,9 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 i += 1;
                 continue;
             }
-            "server" | "bridge" | "hosts" | "ls" | "new" | "session" | "window" | "split"
-            | "run" | "send" | "capture" | "events" | "skill" | "status" | "hook" | "help"
-            | "--help" | "-h" => {
+            "server" | "bridge" | "hosts" | "workspace" | "ws" | "ls" | "new" | "session"
+            | "window" | "split" | "run" | "send" | "capture" | "events" | "skill" | "status"
+            | "hook" | "help" | "--help" | "-h" => {
                 return true;
             }
             _ => return false,
@@ -109,6 +109,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "bridge" => cmd_bridge(tail),
         "server" => cmd_server(&opts, tail),
         "hosts" => cmd_hosts(&opts, tail),
+        "workspace" | "ws" => cmd_workspace(&opts, tail),
         "ls" => cmd_ls(&opts),
         "new" => cmd_session_new(&opts, tail),
         "session" => cmd_session(&opts, tail),
@@ -1400,6 +1401,356 @@ fn cmd_hook(args: &[String]) -> Result<i32, String> {
     Ok(crate::integrations::run_hook(agent, event))
 }
 
+// ---------------------------------------------------------------------------
+// workspace (multi-host session templates)
+// ---------------------------------------------------------------------------
+
+fn connect_host_alias(alias: &str, auto_start: bool) -> Result<std::sync::Arc<MuxClient>, String> {
+    let hosts = load_hosts();
+    let selector = if alias == "local" { None } else { Some(alias) };
+    let target = resolve_target(selector, &hosts).map_err(|e| e.to_string())?;
+    MuxClient::connect(&target, auto_start, "cli", "tachyon-cli")
+        .map_err(|e| format!("could not connect to `{alias}` ({}): {e}", target.display_name()))
+}
+
+fn cmd_workspace(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    use crate::mux::workspace::{
+        display_path, list_workspaces, load_workspace, remove_workspace, save_workspace,
+        snapshot_workspace, starter_workspace, workspace_down, workspace_up, workspaces_dir,
+        WorkspaceUpOptions,
+    };
+
+    let sub = args.first().map(String::as_str).unwrap_or("ls");
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+
+    match sub {
+        "ls" | "list" => {
+            let list = list_workspaces();
+            if opts.json {
+                print_json(&json!({
+                    "dir": workspaces_dir().to_string_lossy(),
+                    "workspaces": list.iter().map(|w| w.to_json()).collect::<Vec<_>>(),
+                }));
+            } else if list.is_empty() {
+                println!(
+                    "No workspaces saved in {}. Run `tachyon workspace init <name>` or `tachyon workspace save <name>`.",
+                    display_path(&workspaces_dir())
+                );
+            } else {
+                for w in &list {
+                    let hosts = w.hosts.join(",");
+                    let desc = w
+                        .description
+                        .as_deref()
+                        .map(|d| format!("  — {d}"))
+                        .unwrap_or_default();
+                    println!(
+                        "{:<18} [{}]  {}s/{}w/{}p{}",
+                        w.name, hosts, w.session_count, w.window_count, w.pane_count, desc
+                    );
+                }
+            }
+            Ok(0)
+        }
+        "show" | "cat" => {
+            let target = rest
+                .first()
+                .map(String::as_str)
+                .ok_or("usage: tachyon workspace show <name|path>")?;
+            let (path, spec) = load_workspace(target)?;
+            if opts.json {
+                print_json(&json!({
+                    "path": path.to_string_lossy(),
+                    "workspace": spec.to_json(),
+                }));
+            } else {
+                print_json(&spec.to_json());
+            }
+            Ok(0)
+        }
+        "init" => {
+            let mut name: Option<String> = None;
+            let mut force = false;
+            for a in rest {
+                match a.as_str() {
+                    "--force" | "-f" => force = true,
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown workspace init option `{other}`"));
+                    }
+                    other => {
+                        if name.is_none() {
+                            name = Some(other.to_string());
+                        } else {
+                            return Err(format!("unexpected argument `{other}`"));
+                        }
+                    }
+                }
+            }
+            let name = name.ok_or("usage: tachyon workspace init <name> [--force]")?;
+            let hosts = load_hosts();
+            let spec = starter_workspace(&name, &hosts)?;
+            let path = save_workspace(&spec, force)?;
+            if opts.json {
+                print_json(&json!({
+                    "name": spec.name,
+                    "path": path.to_string_lossy(),
+                    "hosts": spec.hosts(),
+                }));
+            } else {
+                println!(
+                    "Created workspace `{}` at {} ({} host(s): {})",
+                    spec.name,
+                    display_path(&path),
+                    spec.hosts().len(),
+                    spec.hosts().join(", ")
+                );
+            }
+            Ok(0)
+        }
+        "rm" | "remove" | "delete" => {
+            let name = rest
+                .first()
+                .map(String::as_str)
+                .ok_or("usage: tachyon workspace rm <name>")?;
+            let path = remove_workspace(name)?;
+            if opts.json {
+                print_json(&json!({ "removed": name, "path": path.to_string_lossy() }));
+            } else {
+                println!("Removed workspace `{name}` ({})", display_path(&path));
+            }
+            Ok(0)
+        }
+        "up" | "start" | "launch" => {
+            let mut target: Option<String> = None;
+            let mut up_opts = WorkspaceUpOptions::default();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--recreate" | "--force" => {
+                        up_opts.recreate = true;
+                        i += 1;
+                    }
+                    "--dry-run" => {
+                        up_opts.dry_run = true;
+                        i += 1;
+                    }
+                    "--cols" => {
+                        let v = rest.get(i + 1).ok_or("--cols requires a number")?;
+                        up_opts.cols = v.parse::<u16>().map_err(|_| format!("invalid --cols `{v}`"))?;
+                        i += 2;
+                    }
+                    "--rows" => {
+                        let v = rest.get(i + 1).ok_or("--rows requires a number")?;
+                        up_opts.rows = v.parse::<u16>().map_err(|_| format!("invalid --rows `{v}`"))?;
+                        i += 2;
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown workspace up option `{other}`"));
+                    }
+                    other => {
+                        if target.is_none() {
+                            target = Some(other.to_string());
+                        } else {
+                            return Err(format!("unexpected argument `{other}`"));
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            let target = target.ok_or(
+                "usage: tachyon workspace up <name|path> [--recreate] [--dry-run]",
+            )?;
+            let (_path, spec) = load_workspace(&target)?;
+            let report = workspace_up(&spec, &up_opts, |alias| connect_host_alias(alias, true));
+            if opts.json {
+                print_json(&report.to_json());
+            } else {
+                let verb = if report.dry_run { "Plan" } else { "Workspace" };
+                println!("{verb} `{}`:", report.name);
+                for s in &report.sessions {
+                    let state = if report.dry_run {
+                        "would create"
+                    } else if s.reused {
+                        "reused"
+                    } else {
+                        "created"
+                    };
+                    let panes: usize = s.windows.iter().map(|w| w.blocks.len()).sum();
+                    println!(
+                        "  {:14} session `{}` ({}) — {} ({} window(s), {} pane(s))",
+                        s.host,
+                        s.session_name,
+                        s.session_id,
+                        state,
+                        s.windows.len(),
+                        panes
+                    );
+                }
+                for e in &report.errors {
+                    eprintln!("  {:14} ERROR: {}", e.host, e.error);
+                }
+            }
+            Ok(if report.errors.is_empty() { 0 } else { 1 })
+        }
+        "down" | "stop" => {
+            let target = rest
+                .first()
+                .map(String::as_str)
+                .ok_or("usage: tachyon workspace down <name|path>")?;
+            let (_path, spec) = load_workspace(target)?;
+            let report = workspace_down(&spec, |alias| connect_host_alias(alias, false));
+            if opts.json {
+                print_json(&report.to_json());
+            } else {
+                println!("Workspace `{}` down:", report.name);
+                for s in &report.stopped {
+                    println!(
+                        "  {:14} stopped session `{}` ({})",
+                        s.host,
+                        s.session_name,
+                        s.session_id.as_deref().unwrap_or("")
+                    );
+                }
+                for s in &report.not_found {
+                    println!("  {:14} session `{}` not running", s.host, s.session_name);
+                }
+                for e in &report.errors {
+                    eprintln!("  {:14} ERROR: {}", e.host, e.error);
+                }
+            }
+            Ok(if report.errors.is_empty() { 0 } else { 1 })
+        }
+        "save" | "snapshot" => {
+            let mut name: Option<String> = None;
+            let mut hosts_arg: Option<Vec<String>> = None;
+            let mut all_hosts = false;
+            let mut session_filter: Option<String> = None;
+            let mut description: Option<String> = None;
+            let mut force = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--hosts" => {
+                        let v = rest.get(i + 1).ok_or("--hosts requires comma-separated aliases")?;
+                        hosts_arg = Some(
+                            v.split(',')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect(),
+                        );
+                        i += 2;
+                    }
+                    "--all-hosts" => {
+                        all_hosts = true;
+                        i += 1;
+                    }
+                    "-s" | "--session" => {
+                        session_filter = Some(
+                            rest.get(i + 1).ok_or("--session requires a name or id")?.clone(),
+                        );
+                        i += 2;
+                    }
+                    "-d" | "--description" => {
+                        description =
+                            Some(rest.get(i + 1).ok_or("--description requires text")?.clone());
+                        i += 2;
+                    }
+                    "--force" | "-f" => {
+                        force = true;
+                        i += 1;
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown workspace save option `{other}`"));
+                    }
+                    other => {
+                        if name.is_none() {
+                            name = Some(other.to_string());
+                        } else {
+                            return Err(format!("unexpected argument `{other}`"));
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            let name = name.ok_or(
+                "usage: tachyon workspace save <name> [--hosts local,kagutsuchi | --all-hosts] [--session S] [--description TEXT] [--force]",
+            )?;
+
+            let target_hosts: Vec<String> = if let Some(list) = hosts_arg {
+                list
+            } else if all_hosts {
+                let mut list = vec!["local".to_string()];
+                for h in load_hosts() {
+                    if h.alias != "local" {
+                        list.push(h.alias);
+                    }
+                }
+                list
+            } else if let Some(s) = &opts.server {
+                vec![s.clone()]
+            } else {
+                vec!["local".to_string()]
+            };
+
+            let mut snapshots = Vec::new();
+            let mut errs = Vec::new();
+            for alias in &target_hosts {
+                match connect_host_alias(alias, false).and_then(|c| {
+                    c.state().map_err(|e| format!("state failed on `{alias}`: {e}"))
+                }) {
+                    Ok(snap) => snapshots.push((alias.clone(), snap)),
+                    Err(e) => errs.push((alias.clone(), e)),
+                }
+            }
+            if snapshots.is_empty() {
+                let reason = errs
+                    .into_iter()
+                    .map(|(h, e)| format!("{h}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!("could not read any host state ({reason})"));
+            }
+
+            let spec = snapshot_workspace(
+                &name,
+                description,
+                &snapshots,
+                session_filter.as_deref(),
+                None,
+            )?;
+            let path = save_workspace(&spec, force)?;
+            if opts.json {
+                print_json(&json!({
+                    "name": spec.name,
+                    "path": path.to_string_lossy(),
+                    "hosts": spec.hosts(),
+                    "sessions": spec.sessions.len(),
+                    "windows": spec.window_count(),
+                    "panes": spec.pane_count(),
+                    "skipped_hosts": errs.into_iter().map(|(h, e)| json!({ "host": h, "error": e })).collect::<Vec<_>>(),
+                }));
+            } else {
+                println!(
+                    "Saved workspace `{}` to {} ({} session(s), {} window(s), {} pane(s))",
+                    spec.name,
+                    display_path(&path),
+                    spec.sessions.len(),
+                    spec.window_count(),
+                    spec.pane_count()
+                );
+                for (h, e) in errs {
+                    eprintln!("  skipped `{h}`: {e}");
+                }
+            }
+            Ok(0)
+        }
+        other => Err(format!(
+            "unknown workspace subcommand `{other}` (expected ls|up|down|save|init|show|rm)"
+        )),
+    }
+}
+
 const HELP: &str = "\
 Tachyon — GPU-accelerated multi-host multiplexer terminal
 
@@ -1421,6 +1772,16 @@ Server & Hosts:
                                             set accent or danger colour for a saved host
   tachyon hosts remove <alias>              remove a saved host
   tachyon hosts test <alias>                verify SSH/TCP transport, server version & RTT
+
+Workspaces (Multi-host Templates):
+  tachyon workspace ls                      list saved templates in ~/.config/Tachyon/workspaces/
+  tachyon workspace up <name|path> [--recreate] [--dry-run]
+                                            launch (or idempotently reuse) sessions & splits across hosts
+  tachyon workspace down <name|path>        stop sessions belonging to a workspace
+  tachyon workspace save <name> [--hosts H1,H2 | --all-hosts] [--session S] [--force]
+                                            snapshot live sessions & split trees into a template
+  tachyon workspace init <name> [--force]   create a starter multi-host template from saved hosts
+  tachyon workspace show|rm <name>          inspect or remove a saved template
 
 Sessions, Windows & Automation:
   tachyon ls                                list sessions, windows & blocks

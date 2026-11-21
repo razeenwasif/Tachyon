@@ -676,8 +676,17 @@ impl ServerState {
 
         let cols = cols.max(2);
         let rows = rows.max(1);
-        let pty = HostPty::spawn(cols, rows, &program, &args, login, &extra_env, cwd)
-            .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
+        let expanded_cwd = cwd.map(expand_tilde);
+        let pty = HostPty::spawn(
+            cols,
+            rows,
+            &program,
+            &args,
+            login,
+            &extra_env,
+            expanded_cwd.as_deref(),
+        )
+        .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
 
         let block = Arc::new(Block {
             id: block_id.clone(),
@@ -1487,4 +1496,24 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
             }));
         }
     }
+}
+
+/// Expand leading `~` or `~/` / `~\` against this host's home directory so
+/// portable multi-host workspace `cwd` values work identically on macOS, Linux,
+/// and Windows.
+fn expand_tilde(path: &str) -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .filter(|h| !h.is_empty());
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    if path == "~" {
+        return home;
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix(r"~\")) {
+        return std::path::PathBuf::from(home).join(rest).to_string_lossy().into_owned();
+    }
+    path.to_string()
 }

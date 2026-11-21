@@ -5,6 +5,7 @@ pub mod client;
 pub mod model;
 pub mod proto;
 pub mod transport;
+pub mod workspace;
 
 use std::fs;
 use std::io;
