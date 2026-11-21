@@ -94,6 +94,7 @@ struct TreeState {
     window: Cell<u64>,
     hosts: RefCell<Vec<HostView>>,
     filter: RefCell<String>,
+    agents_only: Cell<bool>,
     active_target: RefCell<Option<(String, String)>>, // (host, window_id)
     rows: RefCell<Vec<(f64, f64, TreeRow)>>,          // (y_top, height, row) in flipped coords
     content_h: Cell<f64>,
@@ -382,6 +383,7 @@ impl SidebarTreeView {
             y += hh;
 
             if let Some(snap) = &h.snapshot {
+                let agents_only = self.ivars().agents_only.get();
                 let mut shown_any = false;
                 for sess in &snap.sessions {
                     let sess_matches = filter.is_empty()
@@ -412,6 +414,14 @@ impl SidebarTreeView {
                                 .filter(|b| leaves.contains(&b.id))
                                 .filter_map(|b| b.status.as_ref()),
                         );
+                        let has_agent = status.is_some()
+                            || snap.blocks.iter().any(|b| {
+                                leaves.contains(&b.id)
+                                    && crate::mux::model::infer_agent_from_block(b).is_some()
+                            });
+                        if agents_only && !has_agent {
+                            continue;
+                        }
 
                         if !sess_matches && !title.to_ascii_lowercase().contains(&filter) {
                             continue;
@@ -431,7 +441,7 @@ impl SidebarTreeView {
                         });
                     }
 
-                    if !win_rows.is_empty() || (sess_matches && sess.windows.is_empty()) {
+                    if !win_rows.is_empty() || (!agents_only && sess_matches && sess.windows.is_empty()) {
                         shown_any = true;
                         let srow = TreeRow::Session {
                             host: h.alias.clone(),
@@ -451,12 +461,14 @@ impl SidebarTreeView {
                 if !shown_any && filter.is_empty() {
                     let note = TreeRow::Note {
                         host: h.alias.clone(),
-                        text: if connected {
+                        text: if agents_only {
+                            "No active agents".into()
+                        } else if connected {
                             "No sessions — click + to start".into()
                         } else {
                             "Offline — click to reconnect".into()
                         },
-                        reconnectable: !connected,
+                        reconnectable: !connected && !agents_only,
                     };
                     let nh = note.height();
                     rows.push((y, nh, note));
@@ -974,6 +986,11 @@ define_class!(
             super::open_settings();
         }
 
+        #[unsafe(method(sidebarAgentsFilter:))]
+        fn sidebar_agents_filter(&self, _sender: Option<&AnyObject>) {
+            with_window(self.ivars().window.get(), |w| w.toggle_sidebar_agents_filter());
+        }
+
         #[unsafe(method(sidebarHostsMenu:))]
         fn sidebar_hosts_menu(&self, sender: Option<&AnyObject>) {
             let Some(mtm) = MainThreadMarker::new() else { return };
@@ -1127,6 +1144,7 @@ pub struct Sidebar {
     refresh_btn: Retained<NSButton>,
     new_btn: Retained<NSButton>,
     filter: Retained<NSSearchField>,
+    agents_btn: Retained<NSButton>,
     settings_btn: Retained<NSButton>,
     hosts_btn: Retained<NSButton>,
     server_btn: Retained<NSButton>,
@@ -1148,6 +1166,13 @@ impl Sidebar {
         let palette_btn = symbol_button(mtm, "command", "Command Palette (⌘⇧P)", target, sel!(sidebarPalette:));
         let refresh_btn = symbol_button(mtm, "arrow.clockwise", "Refresh Hosts", target, sel!(sidebarRefresh:));
         let new_btn = symbol_button(mtm, "plus", "New Session", target, sel!(sidebarNewSession:));
+        let agents_btn = symbol_button(
+            mtm,
+            "sparkles",
+            "Filter Sidebar to Coding Agents (⌘⇧A for Mission Control)",
+            target,
+            sel!(sidebarAgentsFilter:),
+        );
         let settings_btn = symbol_button(mtm, "gearshape", "Settings (⌘,)", target, sel!(sidebarSettings:));
         let hosts_btn = symbol_button(mtm, "globe", "Remote Hosts", target, sel!(sidebarHostsMenu:));
         let server_btn = symbol_button(mtm, "server.rack", "Server Status", target, sel!(sidebarSettings:));
@@ -1162,6 +1187,7 @@ impl Sidebar {
         root_view.addSubview(&refresh_btn);
         root_view.addSubview(&new_btn);
         root_view.addSubview(&filter);
+        root_view.addSubview(&agents_btn);
         root_view.addSubview(&settings_btn);
         root_view.addSubview(&hosts_btn);
         root_view.addSubview(&server_btn);
@@ -1178,6 +1204,7 @@ impl Sidebar {
             refresh_btn,
             new_btn,
             filter,
+            agents_btn,
             settings_btn,
             hosts_btn,
             server_btn,
@@ -1201,13 +1228,14 @@ impl Sidebar {
         let tree_h = (h - TOP_BAR_H - FOOTER_H).max(0.0);
         self.tree.setFrame(NSRect::new(NSPoint::new(0.0, FOOTER_H), NSSize::new(w, tree_h)));
 
-        // Bottom footer: Filter box + settings, server & hosts buttons.
+        // Bottom footer: Filter box + agents filter, settings, server & hosts buttons.
         let fy = (FOOTER_H - 22.0) / 2.0;
-        let filter_w = (w - 92.0).max(52.0);
+        let filter_w = (w - 116.0).max(52.0);
         self.filter.setFrame(NSRect::new(NSPoint::new(8.0, fy), NSSize::new(filter_w, 22.0)));
-        self.settings_btn.setFrame(NSRect::new(NSPoint::new((w - 76.0).max(66.0), fy), NSSize::new(22.0, 22.0)));
-        self.server_btn.setFrame(NSRect::new(NSPoint::new((w - 52.0).max(90.0), fy), NSSize::new(22.0, 22.0)));
-        self.hosts_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(114.0), fy), NSSize::new(22.0, 22.0)));
+        self.agents_btn.setFrame(NSRect::new(NSPoint::new((w - 100.0).max(64.0), fy), NSSize::new(22.0, 22.0)));
+        self.settings_btn.setFrame(NSRect::new(NSPoint::new((w - 76.0).max(86.0), fy), NSSize::new(22.0, 22.0)));
+        self.server_btn.setFrame(NSRect::new(NSPoint::new((w - 52.0).max(108.0), fy), NSSize::new(22.0, 22.0)));
+        self.hosts_btn.setFrame(NSRect::new(NSPoint::new((w - 28.0).max(130.0), fy), NSSize::new(22.0, 22.0)));
 
         self.tree.rebuild_rows();
     }
@@ -1250,7 +1278,41 @@ impl Sidebar {
 
         *self.tree.ivars().hosts.borrow_mut() = hosts;
         *self.tree.ivars().active_target.borrow_mut() = active;
+        self.update_agents_filter_button();
         self.tree.rebuild_rows();
+    }
+
+    pub fn toggle_agents_only(&self) {
+        let next = !self.tree.ivars().agents_only.get();
+        self.tree.ivars().agents_only.set(next);
+        self.tree.ivars().scroll_y.set(0.0);
+        self.update_agents_filter_button();
+        self.tree.rebuild_rows();
+    }
+
+    fn update_agents_filter_button(&self) {
+        let on = self.tree.ivars().agents_only.get();
+        let hosts = self.tree.ivars().hosts.borrow();
+        let entries = super::agents::collect_from_host_views(&hosts, &[]);
+        let counts = crate::mux::model::AgentCounts::from_entries(&entries);
+        let color = if counts.blocked > 0 {
+            NSColor::systemOrangeColor()
+        } else if counts.error > 0 {
+            NSColor::systemRedColor()
+        } else if on || counts.working > 0 {
+            NSColor::controlAccentColor()
+        } else if counts.done > 0 {
+            NSColor::systemGreenColor()
+        } else {
+            NSColor::secondaryLabelColor()
+        };
+        self.agents_btn.setContentTintColor(Some(&color));
+        let mode = if on { "Agents filter: ON" } else { "Filter sidebar to agents" };
+        let tip = format!(
+            "{mode} ({} · ⌘⇧A for Mission Control)",
+            super::agents::summary_line(counts)
+        );
+        self.agents_btn.setToolTip(Some(&NSString::from_str(&tip)));
     }
 
     pub fn set_filter(&self, query: String) {

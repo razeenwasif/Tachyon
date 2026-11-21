@@ -30,6 +30,7 @@ use super::{panes, with_window};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     OpenCheatsheet,
+    OpenAgents,
     OpenSettings,
     ToggleSidebar,
     NewTab,
@@ -62,6 +63,7 @@ pub enum PaletteAction {
     OpenWorkspacesFolder,
     NewSessionOnHost(String),
     SwitchWindow { host: String, window_id: String },
+    SwitchBlock { host: String, window_id: String, block_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +78,12 @@ pub struct PaletteItem {
 /// with live multi-host sessions and windows from `HostManager`.
 pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
     let mut items = vec![
+        PaletteItem {
+            title: "Agent Mission Control".into(),
+            subtitle: "Live cross-host coding-agent inbox (blocked, working & finished)".into(),
+            shortcut: "⌘⇧A",
+            action: PaletteAction::OpenAgents,
+        },
         PaletteItem {
             title: "Keyboard Cheatsheet".into(),
             subtitle: "Open floating shortcuts, tools & CLI reference pane".into(),
@@ -251,6 +259,32 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             action: PaletteAction::OpenWorkspacesFolder,
         },
     ];
+
+    // Surface active coding agents (blocked/error first) for 1-keystroke jump.
+    for ag in super::agents::collect_from_host_views(hosts, &[]) {
+        let msg = ag
+            .message
+            .as_deref()
+            .map(|m| format!(" — {m}"))
+            .unwrap_or_default();
+        items.push(PaletteItem {
+            title: format!(
+                "{} {} [{}]: {} / {}",
+                ag.glyph,
+                ag.agent_name,
+                ag.state.as_str(),
+                ag.session_name,
+                ag.window_name
+            ),
+            subtitle: format!("{} ({}){}", ag.host_display, ag.host, msg),
+            shortcut: "",
+            action: PaletteAction::SwitchBlock {
+                host: ag.host,
+                window_id: ag.window_id,
+                block_id: ag.block_id,
+            },
+        });
+    }
 
     for ws in crate::mux::workspace::list_workspaces() {
         let running = workspace_is_running(&ws, hosts);
@@ -768,6 +802,10 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
             with_window(win_id, |w| w.open_cheatsheet());
             return;
         }
+        PaletteAction::OpenAgents => {
+            with_window(win_id, |w| w.open_agents_card());
+            return;
+        }
         PaletteAction::OpenSettings => {
             super::open_settings();
             return;
@@ -830,6 +868,9 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
         PaletteAction::NewSessionOnHost(host) => super::mux_new_session(win_id, &host),
         PaletteAction::SwitchWindow { host, window_id } => {
             super::mux_select_window(win_id, &host, &window_id);
+        }
+        PaletteAction::SwitchBlock { host, window_id, block_id } => {
+            super::mux_select_window_and_block(win_id, &host, &window_id, Some(&block_id));
         }
     }
     with_window(win_id, |w| w.focus_terminal());

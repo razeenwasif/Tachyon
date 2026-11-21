@@ -39,9 +39,9 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 i += 1;
                 continue;
             }
-            "server" | "bridge" | "hosts" | "workspace" | "ws" | "ls" | "new" | "session"
-            | "window" | "split" | "run" | "send" | "capture" | "events" | "skill" | "status"
-            | "hook" | "help" | "--help" | "-h" => {
+            "server" | "bridge" | "hosts" | "workspace" | "ws" | "agents" | "agent" | "ls"
+            | "new" | "session" | "window" | "split" | "run" | "send" | "capture" | "events"
+            | "skill" | "status" | "hook" | "help" | "--help" | "-h" => {
                 return true;
             }
             _ => return false,
@@ -110,6 +110,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "server" => cmd_server(&opts, tail),
         "hosts" => cmd_hosts(&opts, tail),
         "workspace" | "ws" => cmd_workspace(&opts, tail),
+        "agents" | "agent" => cmd_agents(&opts, tail),
         "ls" => cmd_ls(&opts),
         "new" => cmd_session_new(&opts, tail),
         "session" => cmd_session(&opts, tail),
@@ -1751,6 +1752,140 @@ fn cmd_workspace(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// agents (cross-host Agent Mission Control CLI)
+// ---------------------------------------------------------------------------
+
+fn cmd_agents(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    use crate::mux::model::{collect_agent_entries, AgentCounts, AgentFilter};
+
+    let mut hosts_arg: Option<Vec<String>> = None;
+    let mut all_hosts = false;
+    let mut filter = AgentFilter::All;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--all-hosts" | "-a" => {
+                all_hosts = true;
+                i += 1;
+            }
+            "--hosts" => {
+                let v = args.get(i + 1).ok_or("--hosts requires comma-separated aliases")?;
+                hosts_arg = Some(
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                );
+                i += 2;
+            }
+            "--state" | "--filter" => {
+                let v = args.get(i + 1).ok_or("--state requires all|attention|working|done")?;
+                filter = AgentFilter::parse(v)
+                    .ok_or_else(|| format!("invalid agent filter `{v}` (expected all|attention|working|done)"))?;
+                i += 2;
+            }
+            other => {
+                if let Some(f) = AgentFilter::parse(other) {
+                    filter = f;
+                    i += 1;
+                } else {
+                    return Err(format!("unknown agents option `{other}`"));
+                }
+            }
+        }
+    }
+
+    let target_hosts: Vec<String> = if let Some(list) = hosts_arg {
+        list
+    } else if all_hosts {
+        let mut list = vec!["local".to_string()];
+        for h in load_hosts() {
+            if h.alias != "local" {
+                list.push(h.alias);
+            }
+        }
+        list
+    } else if let Some(s) = &opts.server {
+        vec![s.clone()]
+    } else {
+        vec!["local".to_string()]
+    };
+
+    let mut snaps = Vec::new();
+    let mut errors = Vec::new();
+    for alias in &target_hosts {
+        match connect_host_alias(alias, false)
+            .and_then(|c| c.state().map_err(|e| format!("state failed: {e}")))
+        {
+            Ok(snap) => {
+                let display = if alias == "local" {
+                    "This Mac".to_string()
+                } else {
+                    alias.clone()
+                };
+                snaps.push((alias.clone(), display, snap));
+            }
+            Err(e) => errors.push((alias.clone(), e)),
+        }
+    }
+
+    let refs: Vec<_> = snaps
+        .iter()
+        .map(|(a, d, s)| (a.clone(), d.clone(), None, s))
+        .collect();
+    let all_entries = collect_agent_entries(&refs);
+    let counts = AgentCounts::from_entries(&all_entries);
+    let entries: Vec<_> = all_entries
+        .into_iter()
+        .filter(|e| filter.matches(e.state))
+        .collect();
+
+    if opts.json {
+        print_json(&json!({
+            "counts": {
+                "total": counts.total,
+                "blocked": counts.blocked,
+                "error": counts.error,
+                "working": counts.working,
+                "done": counts.done,
+                "idle": counts.idle,
+            },
+            "agents": entries.iter().map(|e| e.to_json()).collect::<Vec<_>>(),
+            "errors": errors.iter().map(|(h, e)| json!({ "host": h, "error": e })).collect::<Vec<_>>(),
+        }));
+    } else if entries.is_empty() {
+        println!("No matching coding agents active.");
+        for (h, e) in &errors {
+            eprintln!("  skipped `{h}`: {e}");
+        }
+    } else {
+        for e in &entries {
+            let msg = e
+                .message
+                .as_deref()
+                .map(|m| format!("  — {m}"))
+                .unwrap_or_default();
+            println!(
+                "{:<9} {} {:<12} {:<12} {}/{} ({}){}",
+                e.state.as_str().to_uppercase(),
+                e.glyph,
+                e.agent_name,
+                e.host,
+                e.session_name,
+                e.window_name,
+                e.block_id,
+                msg
+            );
+        }
+        for (h, e) in &errors {
+            eprintln!("  skipped `{h}`: {e}");
+        }
+    }
+    Ok(0)
+}
+
 const HELP: &str = "\
 Tachyon — GPU-accelerated multi-host multiplexer terminal
 
@@ -1795,6 +1930,7 @@ Sessions, Windows & Automation:
   tachyon events [-s SESSION] [--json]
 
 Coding Agents & Live Status (OSC 7501):
+  tachyon agents [--all-hosts] [--state S]  list live & blocked coding agents across hosts
   tachyon skill status|setup|remove         manage Claude Code, Antigravity, Codex, OpenCode & Pi skills/hooks
   tachyon status --state S [--app A] [--msg M] [--tty]
   tachyon hook <agent> <event>              internal hook entrypoint for coding agents

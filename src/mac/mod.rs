@@ -15,6 +15,7 @@
 //! shell; closing one ends only that shell; the app keeps running with no
 //! windows, and clicking the Dock icon opens a fresh one.
 
+mod agents;
 mod boxdraw;
 mod chart;
 mod cheatsheet;
@@ -529,6 +530,11 @@ define_class!(
         #[unsafe(method(tachyonCheatsheet:))]
         fn toggle_cheatsheet(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), TermWindow::toggle_cheatsheet);
+        }
+
+        #[unsafe(method(tachyonAgents:))]
+        fn toggle_agents(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_agents_card);
         }
 
         #[unsafe(method(tachyonMonitor:))]
@@ -2276,6 +2282,9 @@ struct TermWindow {
     /// Floating keyboard/CLI cheatsheet card (⌘/, Command Palette, or footer icon).
     cheatsheet_card: Option<cheatsheet::CheatsheetCard>,
     cheatsheet_button: Option<Retained<objc2_app_kit::NSButton>>,
+    /// Floating Liquid Glass Agent Mission Control inbox (⌘⇧A, Palette, or footer icon).
+    agents_card: Option<agents::AgentsCard>,
+    agents_button: Option<Retained<objc2_app_kit::NSButton>>,
     /// Floating Liquid Glass Command Palette (⌘⇧P).
     palette_card: Option<palette::PaletteCard>,
     /// The quick terminal: borderless, dropping from the screen's top, and
@@ -2535,6 +2544,7 @@ impl TermWindow {
         };
         let host_accent = self.active_host_accent(&guards[focus_idx]);
         let leftmost = [
+            &self.agents_button,
             &self.cheatsheet_button,
             &self.neutrino_button,
             &self.monitor_button,
@@ -3388,6 +3398,7 @@ impl TermWindow {
             self.toggle_fairy();
         }
         self.close_cheatsheet();
+        self.close_agents_card();
         self.close_palette();
         if self.monitor_card.is_none() {
             self.monitor_card = Some(MonitorCard::new(mtm, &self.view));
@@ -3522,6 +3533,7 @@ impl TermWindow {
         }
         let Some(mtm) = MainThreadMarker::new() else { return };
         self.close_palette();
+        self.close_agents_card();
         if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_fairy();
         }
@@ -3563,6 +3575,147 @@ impl TermWindow {
         }
     }
 
+    /// Put the Agent Mission Control (`sparkles`) icon in the bottom-right footer
+    /// band (left of Cheatsheet) and position its floating inbox card.
+    fn place_agents(&mut self) {
+        if self.quick {
+            return;
+        }
+        if self.agents_button.is_none() {
+            if let (Some(mtm), Some(icon)) = (
+                MainThreadMarker::new(),
+                objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str("sparkles"),
+                    Some(&NSString::from_str("Agent Mission Control")),
+                ),
+            ) {
+                let target: &AnyObject = self.view.as_ref();
+                let button = unsafe {
+                    objc2_app_kit::NSButton::buttonWithImage_target_action(
+                        &icon,
+                        Some(target),
+                        Some(sel!(tachyonAgents:)),
+                        mtm,
+                    )
+                };
+                button.setBordered(false);
+                button.setToolTip(Some(&NSString::from_str("Agent Mission Control (⌘⇧A)")));
+                self.view.addSubview(&button);
+                self.agents_button = Some(button);
+            }
+        }
+        let scale = self.scale();
+        let size = self.view.bounds().size;
+        let (y0, h) = self.renderer.hints_rect();
+        let band_bottom = (size.height * scale - (y0 + h) as f64).max(0.0) / scale;
+        let band_h = h as f64 / scale;
+        if let Some(b) = &self.agents_button {
+            let pad_x = self.renderer.padding().0 as f64 / scale;
+            let right = [
+                &self.cheatsheet_button,
+                &self.neutrino_button,
+                &self.monitor_button,
+                &self.fairy_button,
+            ]
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .map(|b| b.frame().origin.x - 10.0)
+            .fold(size.width - pad_x, f64::min);
+            let side = 20.0;
+            b.setFrame(NSRect::new(
+                NSPoint::new(right - side, band_bottom + (band_h - side) / 2.0),
+                NSSize::new(side, side),
+            ));
+        }
+        if let Some(card) = &self.agents_card {
+            card.place(size, self.title_bar_height());
+        }
+        self.refresh_agents_ui();
+    }
+
+    fn refresh_agents_ui(&self) {
+        let hosts = mux_host_views();
+        let entries = agents::collect_from_host_views(&hosts, &self.host_colors);
+        let counts = crate::mux::model::AgentCounts::from_entries(&entries);
+        let open = self.agents_card.as_ref().is_some_and(|c| !c.host.isHidden());
+
+        if let Some(b) = &self.agents_button {
+            let tint = if open {
+                NSColor::controlAccentColor()
+            } else if counts.blocked > 0 {
+                NSColor::systemOrangeColor()
+            } else if counts.error > 0 {
+                NSColor::systemRedColor()
+            } else if counts.working > 0 {
+                NSColor::controlAccentColor()
+            } else if counts.done > 0 {
+                NSColor::systemGreenColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            b.setContentTintColor(Some(&tint));
+            let tip = format!(
+                "Agent Mission Control (⌘⇧A) — {}",
+                agents::summary_line(counts)
+            );
+            b.setToolTip(Some(&NSString::from_str(&tip)));
+        }
+
+        if open {
+            if let Some(card) = &self.agents_card {
+                card.refresh(&hosts, &self.host_colors, false);
+            }
+        }
+    }
+
+    fn open_agents_card(&mut self) {
+        if self.quick {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        self.close_palette();
+        self.close_cheatsheet();
+        if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_fairy();
+        }
+        if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_monitor();
+        }
+        if self.neutrino_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_neutrino();
+        }
+        if self.agents_card.is_none() {
+            self.agents_card = Some(agents::AgentsCard::new(mtm, &self.view, self.id));
+        }
+        let hosts = mux_host_views();
+        if let Some(card) = &self.agents_card {
+            card.refresh(&hosts, &self.host_colors, true);
+            card.host.setHidden(false);
+        }
+        self.place_agents();
+        if let Some(card) = &self.agents_card {
+            self.window.makeFirstResponder(Some(&card.search));
+        }
+    }
+
+    fn close_agents_card(&mut self) {
+        if let Some(card) = &self.agents_card {
+            if !card.host.isHidden() {
+                card.host.setHidden(true);
+                self.refresh_agents_ui();
+            }
+        }
+    }
+
+    fn toggle_agents_card(&mut self) {
+        if self.agents_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.close_agents_card();
+            self.focus_terminal();
+        } else {
+            self.open_agents_card();
+        }
+    }
+
     fn place_palette(&self) {
         if let Some(card) = &self.palette_card {
             card.place(self.view.bounds().size, self.title_bar_height());
@@ -3588,6 +3741,7 @@ impl TermWindow {
             return;
         }
         self.close_cheatsheet();
+        self.close_agents_card();
         if self.palette_card.is_none() {
             self.palette_card = Some(palette::PaletteCard::new(mtm, &self.view, self.id));
         }
@@ -3649,6 +3803,7 @@ impl TermWindow {
             self.toggle_fairy();
         }
         self.close_cheatsheet();
+        self.close_agents_card();
         self.close_palette();
         if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_monitor();
@@ -3763,6 +3918,7 @@ impl TermWindow {
             self.toggle_monitor();
         }
         self.close_cheatsheet();
+        self.close_agents_card();
         self.close_palette();
         if self.fairy_card.is_none() {
             self.fairy_card = Some(FairyCard::new(mtm, &self.view));
@@ -4209,6 +4365,12 @@ impl TermWindow {
         }
     }
 
+    fn toggle_sidebar_agents_filter(&mut self) {
+        if let Some(sb) = &self.sidebar {
+            sb.toggle_agents_only();
+        }
+    }
+
     fn sync_sidebar(&self) {
         if let Some(sb) = &self.sidebar {
             let active = self
@@ -4314,6 +4476,7 @@ impl TermWindow {
         self.place_monitor();
         self.place_neutrino();
         self.place_cheatsheet();
+        self.place_agents();
         self.place_palette();
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
@@ -4710,6 +4873,11 @@ impl TermWindow {
                 self.focus_terminal();
                 return false;
             }
+            if self.agents_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+                self.close_agents_card();
+                self.focus_terminal();
+                return false;
+            }
             if self.chart.is_some() {
                 self.chart = None;
                 self.request_redraw();
@@ -4989,6 +5157,10 @@ impl TermWindow {
     fn mouse_down(&mut self, event: &NSEvent, button: MouseButton) {
         if self.palette_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.close_palette();
+            self.focus_terminal();
+        }
+        if self.agents_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.close_agents_card();
             self.focus_terminal();
         }
         // Rewound: Option-click tells where a cell came from; other clicks
@@ -5825,6 +5997,8 @@ impl App {
             neutrino: neutrino::installed(),
             cheatsheet_card: None,
             cheatsheet_button: None,
+            agents_card: None,
+            agents_button: None,
             palette_card: None,
             quick: false,
             quick_shown: false,
@@ -6395,6 +6569,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     view.addItem(&NSMenuItem::separatorItem(mtm));
     item(&view, "Toggle Sidebar", sel!(tachyonToggleSidebar:), "b");
     item(&view, "Command Palette…", sel!(tachyonPalette:), "P");
+    item(&view, "Agent Mission Control", sel!(tachyonAgents:), "A");
     item(&view, "Keyboard Cheatsheet", sel!(tachyonCheatsheet:), "/");
     item(&view, "Show Title Bar", sel!(tachyonTitleBar:), "");
     item(&view, "Full Screen Around the Notch", sel!(tachyonNotch:), "f")
@@ -7094,6 +7269,7 @@ fn sync_all_sidebars() {
         for w in &mut app.windows {
             w.sync_sidebar();
             w.sync_pane_headers();
+            w.refresh_agents_ui();
             w.request_redraw();
         }
     });
@@ -7686,6 +7862,18 @@ fn restore_mux_local_window(mtm: MainThreadMarker) -> bool {
 /// Switch `win_id` to `(host, window_id)`, attaching its blocks over Mux v2 if
 /// not already open in this window.
 fn mux_select_window(win_id: u64, host: &str, window_id: &str) {
+    mux_select_window_and_block(win_id, host, window_id, None);
+}
+
+/// Switch `win_id` to `(host, window_id)` and optionally focus a specific
+/// `focus_block` pane once attached (used by Agent Mission Control & notifications).
+fn mux_select_window_and_block(
+    win_id: u64,
+    host: &str,
+    window_id: &str,
+    focus_block: Option<&str>,
+) {
+    let focus_owned = focus_block.map(str::to_string);
     // Fast path: already open as a tab in this window.
     let switched = query_window(win_id, |w| {
         if let Some(i) = w
@@ -7694,6 +7882,16 @@ fn mux_select_window(win_id: u64, host: &str, window_id: &str) {
             .position(|t| t.mux_target.as_ref().is_some_and(|(h, _, wid)| h == host && wid == window_id))
         {
             w.switch_to(i);
+            if let Some(bid) = focus_owned.as_deref() {
+                if let Some(pid) = w.tabs[w.active]
+                    .panes
+                    .iter()
+                    .find(|p| p.pty.mux_meta().is_some_and(|m| m.block_id == bid))
+                    .map(|p| p.id)
+                {
+                    w.focus_pane_by_id(pid);
+                }
+            }
             w.focus_terminal();
             return true;
         }
@@ -7746,11 +7944,31 @@ fn mux_select_window(win_id: u64, host: &str, window_id: &str) {
                             .is_some_and(|(h, _, wid)| h == &data.host && wid == &data.window.id)
                     }) {
                         w.switch_to(i);
+                        if let Some(bid) = focus_owned.as_deref() {
+                            if let Some(pid) = w.tabs[w.active]
+                                .panes
+                                .iter()
+                                .find(|p| p.pty.mux_meta().is_some_and(|m| m.block_id == bid))
+                                .map(|p| p.id)
+                            {
+                                w.focus_pane_by_id(pid);
+                            }
+                        }
                         w.focus_terminal();
                         return Some(());
                     }
                     if let Ok(tab) = build_tab_from_attached(&cfg, data) {
                         w.add_tab(tab);
+                        if let Some(bid) = focus_owned.as_deref() {
+                            if let Some(pid) = w.tabs[w.active]
+                                .panes
+                                .iter()
+                                .find(|p| p.pty.mux_meta().is_some_and(|m| m.block_id == bid))
+                                .map(|p| p.id)
+                            {
+                                w.focus_pane_by_id(pid);
+                            }
+                        }
                         w.focus_terminal();
                     }
                     Some(())

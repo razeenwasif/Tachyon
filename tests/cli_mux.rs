@@ -464,3 +464,72 @@ fn cli_workspace_init_up_idempotent_save_recreate_down_and_rm() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_agents_lists_and_filters_live_osc7501_agents_by_urgency() {
+    let dir = temp_dir("agents-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let cmd_done = format!(
+        "'{}' status --state done --app claude --msg 'Build green' && sleep 15",
+        bin()
+    );
+    let cmd_blocked = format!(
+        "'{}' status --state blocked --app antigravity --msg 'Approve push' && sleep 15",
+        bin()
+    );
+
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &["new", "done-sess", "--", "/bin/sh", "-c", &cmd_done],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &["new", "blocked-sess", "--", "/bin/sh", "-c", &cmd_blocked],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // Wait briefly for both OSC 7501 sequences to be parsed by the server.
+    let mut ready = false;
+    for _ in 0..25 {
+        std::thread::sleep(Duration::from_millis(60));
+        let (c, out, _) = run_cli(&sock, &hosts, &["agents", "--json"]);
+        if c == 0 {
+            let v: Value = serde_json::from_str(&out).unwrap();
+            if v["counts"]["total"] == 2
+                && v["counts"]["blocked"] == 1
+                && v["counts"]["done"] == 1
+            {
+                let agents = v["agents"].as_array().unwrap();
+                // Blocked agent must rank ahead of Done agent.
+                assert_eq!(agents[0]["state"], "blocked");
+                assert_eq!(agents[0]["agent"], "Antigravity");
+                assert_eq!(agents[0]["message"], "Approve push");
+                assert_eq!(agents[1]["state"], "done");
+                assert_eq!(agents[1]["agent"], "Claude Code");
+                ready = true;
+                break;
+            }
+        }
+    }
+    assert!(ready, "expected both live OSC 7501 agents in `tachyon agents --json`");
+
+    // `--state attention` filters down to only the blocked agent.
+    let (code, out, err) = run_cli(&sock, &hosts, &["agents", "--state", "attention", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let attn: Value = serde_json::from_str(&out).unwrap();
+    let arr = attn["agents"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["state"], "blocked");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
