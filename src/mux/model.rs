@@ -444,6 +444,169 @@ impl ServerSnapshot {
     }
 }
 
+/// Accent or danger colour assigned to a remote or SSH host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostColor {
+    pub rgb: [u8; 3],
+    /// True for warning / production / danger presets (`amber`, `orange`, `red`,
+    /// `danger`, `warn`, `prod`, or `danger:#RRGGBB`), which use stronger tinting
+    /// and a warning badge (`▲ host`).
+    pub danger: bool,
+}
+
+/// Curated host colour presets offered in the sidebar menu, Settings UI, and CLI.
+pub const HOST_COLOR_PRESETS: &[(&str, &str)] = &[
+    ("auto", "Auto (by OS)"),
+    ("blue", "Blue"),
+    ("purple", "Purple"),
+    ("teal", "Teal"),
+    ("green", "Green"),
+    ("amber", "Amber (Warning)"),
+    ("orange", "Orange (Caution)"),
+    ("red", "Red (Danger)"),
+    ("pink", "Pink"),
+    ("none", "None"),
+];
+
+impl HostColor {
+    /// Parse a host colour spec into:
+    /// - `Some(Some(color))` for a named preset or `#RRGGBB` / `danger:#RRGGBB`
+    /// - `Some(None)` for explicit opt-out (`none` / `off` / `clear`)
+    /// - `None` if unrecognised (note: `"auto"` should be handled by caller as fallthrough)
+    pub fn parse(spec: &str) -> Option<Option<Self>> {
+        let s = spec.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let lower = s.to_ascii_lowercase();
+        let out = match lower.as_str() {
+            "none" | "off" | "clear" => return Some(None),
+            "blue" | "sapphire" => Self { rgb: [66, 153, 255], danger: false },
+            "purple" | "violet" => Self { rgb: [168, 118, 255], danger: false },
+            "teal" | "cyan" => Self { rgb: [45, 200, 195], danger: false },
+            "green" | "emerald" => Self { rgb: [56, 204, 118], danger: false },
+            "pink" | "rose" => Self { rgb: [245, 110, 170], danger: false },
+            "amber" | "yellow" | "warn" | "warning" => Self { rgb: [245, 178, 45], danger: true },
+            "orange" | "caution" => Self { rgb: [250, 132, 48], danger: true },
+            "red" | "danger" | "crimson" | "prod" => Self { rgb: [242, 74, 74], danger: true },
+            _ => {
+                if let Some(hex) = lower.strip_prefix("danger:") {
+                    Self { rgb: parse_hex_rgb(hex.trim())?, danger: true }
+                } else {
+                    Self { rgb: parse_hex_rgb(&lower)?, danger: false }
+                }
+            }
+        };
+        Some(Some(out))
+    }
+
+    /// True if `spec` is a valid host colour setting (including `"auto"` and `"none"`).
+    pub fn is_valid_spec(spec: &str) -> bool {
+        let s = spec.trim();
+        s.eq_ignore_ascii_case("auto") || Self::parse(s).is_some()
+    }
+}
+
+fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
+/// Tasteful default accent colour for connected remote hosts by OS.
+pub fn default_os_host_color(os: &str) -> Option<HostColor> {
+    match os.to_ascii_lowercase().as_str() {
+        "macos" => Some(HostColor { rgb: [66, 153, 255], danger: false }),
+        "windows" => Some(HostColor { rgb: [168, 118, 255], danger: false }),
+        "linux" => Some(HostColor { rgb: [45, 200, 195], danger: false }),
+        _ => None,
+    }
+}
+
+/// Case-insensitive glob matcher supporting `*` wildcards for `host.color.<pattern>`.
+pub fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    let p: Vec<u8> = pattern.trim().to_ascii_lowercase().into_bytes();
+    let h: Vec<u8> = host.trim().to_ascii_lowercase().into_bytes();
+    if p.is_empty() {
+        return false;
+    }
+    let (mut pi, mut hi) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_hi: usize = 0;
+    while hi < h.len() {
+        if pi < p.len() && p[pi] == h[hi] {
+            pi += 1;
+            hi += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_hi = hi;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_hi += 1;
+            hi = star_hi;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Resolve the effective accent/danger colour for `host`:
+/// 1. Explicit `entry_color` on the `HostEntry` (`hosts.json`), unless `"auto"`
+/// 2. Matching `host.color.<pattern>` rule in `tachyon.conf` (exact match beats glob)
+/// 3. For non-local hosts, automatic OS default (`macos` blue, `windows` purple, `linux` teal)
+pub fn resolve_host_color(
+    host: &str,
+    host_os: Option<&str>,
+    entry_color: Option<&str>,
+    config_rules: &[(String, String)],
+) -> Option<HostColor> {
+    let host_clean = host.trim();
+    if host_clean.is_empty() {
+        return None;
+    }
+    if let Some(spec) = entry_color.map(str::trim).filter(|s| !s.is_empty()) {
+        if !spec.eq_ignore_ascii_case("auto") {
+            if let Some(parsed) = HostColor::parse(spec) {
+                return parsed;
+            }
+        }
+    }
+    if let Some((_, val)) = config_rules
+        .iter()
+        .find(|(pat, _)| !pat.contains('*') && pat.eq_ignore_ascii_case(host_clean))
+    {
+        if !val.trim().eq_ignore_ascii_case("auto") {
+            if let Some(parsed) = HostColor::parse(val) {
+                return parsed;
+            }
+        }
+    }
+    if let Some((_, val)) = config_rules
+        .iter()
+        .find(|(pat, _)| pat.contains('*') && host_pattern_matches(pat, host_clean))
+    {
+        if !val.trim().eq_ignore_ascii_case("auto") {
+            if let Some(parsed) = HostColor::parse(val) {
+                return parsed;
+            }
+        }
+    }
+    if host_clean.eq_ignore_ascii_case("local") {
+        return None;
+    }
+    host_os.and_then(default_os_host_color)
+}
+
 /// Configured remote host entry persisted in `~/.config/Tachyon/hosts.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostEntry {
@@ -455,6 +618,9 @@ pub struct HostEntry {
     pub remote_bin: Option<String>,
     /// Optional bearer auth token for direct `tcp://` (Tailscale) targets.
     pub token: Option<String>,
+    /// Optional accent / danger colour preset (`blue`, `amber`, `red`, `danger`,
+    /// `#RRGGBB`, `none`, or `auto`).
+    pub color: Option<String>,
 }
 
 impl HostEntry {
@@ -469,6 +635,9 @@ impl HostEntry {
         if let Some(tok) = &self.token {
             obj["token"] = json!(tok);
         }
+        if let Some(col) = &self.color {
+            obj["color"] = json!(col);
+        }
         obj
     }
 
@@ -478,6 +647,7 @@ impl HostEntry {
             uri: v.get("uri")?.as_str()?.to_string(),
             remote_bin: v.get("remote_bin").and_then(Value::as_str).map(str::to_string),
             token: v.get("token").and_then(Value::as_str).map(str::to_string),
+            color: v.get("color").and_then(Value::as_str).map(str::to_string),
         })
     }
 }
@@ -563,5 +733,41 @@ mod tests {
         assert!(first.contains('-'));
         let second = generate_session_name(1, |name| name == first);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn host_color_parsing_globs_and_precedence() {
+        assert_eq!(HostColor::parse("none"), Some(None));
+        let red = HostColor::parse("danger").unwrap().unwrap();
+        assert!(red.danger);
+        let hex = HostColor::parse("#112233").unwrap().unwrap();
+        assert_eq!(hex.rgb, [0x11, 0x22, 0x33]);
+        assert!(!hex.danger);
+        let dhex = HostColor::parse("danger:#ff0044").unwrap().unwrap();
+        assert_eq!(dhex.rgb, [0xff, 0x00, 0x44]);
+        assert!(dhex.danger);
+        assert_eq!(HostColor::parse("not-a-color"), None);
+
+        assert!(host_pattern_matches("prod*", "prod-us-east"));
+        assert!(host_pattern_matches("*.cluster.local", "gpu01.cluster.local"));
+        assert!(!host_pattern_matches("prod*", "staging-1"));
+
+        let rules = vec![
+            ("prod*".into(), "red".into()),
+            ("prod-safe".into(), "green".into()),
+        ];
+        // Exact match beats glob.
+        let safe = resolve_host_color("prod-safe", Some("linux"), None, &rules).unwrap();
+        assert!(!safe.danger);
+        let prod = resolve_host_color("prod-01", Some("linux"), None, &rules).unwrap();
+        assert!(prod.danger);
+        // Entry color overrides config rule; "none" disables tinting completely.
+        assert_eq!(resolve_host_color("prod-01", Some("linux"), Some("none"), &rules), None);
+        // Local stays neutral by default; remote hosts inherit OS colour.
+        assert_eq!(resolve_host_color("local", Some("macos"), None, &rules), None);
+        assert_eq!(
+            resolve_host_color("amaterasu", Some("windows"), None, &rules),
+            default_os_host_color("windows")
+        );
     }
 }

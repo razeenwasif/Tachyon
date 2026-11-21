@@ -2234,6 +2234,14 @@ struct TermWindow {
     rewound: Option<Rewound>,
     rewind_badge: Option<RewindBadge>,
     glass_tint: f32,
+    /// Per-host accent & danger colour settings (`window.host_tint`,
+    /// `window.host_tint_strength`, `host.color.*`) and cached glass state.
+    host_tint: bool,
+    host_tint_strength: f32,
+    host_colors: Vec<(String, String)>,
+    base_glass_bg: [u8; 3],
+    base_glass_alpha: f64,
+    applied_host_tint: Option<crate::mux::model::HostColor>,
     /// A divider being dragged to resize the panes beside it.
     dragging_divider: Option<panes::Divider>,
     /// When the key being handled was pressed.
@@ -2519,12 +2527,13 @@ impl TermWindow {
                 }
             }) as Box<dyn Fn(f64)>
         });
+        let focus_idx = focus_at.unwrap_or(0);
         let hints = if self.hints {
-            let k = focus_at.unwrap_or(0);
-            self.hint_list(&guards[k])
+            self.hint_list(&guards[focus_idx])
         } else {
             Vec::new()
         };
+        let host_accent = self.active_host_accent(&guards[focus_idx]);
         let leftmost = [
             &self.cheatsheet_button,
             &self.neutrino_button,
@@ -2536,7 +2545,16 @@ impl TermWindow {
         .map(|b| b.frame().origin.x)
         .fold(f64::INFINITY, f64::min);
         let hints_right = if leftmost.is_finite() { (leftmost * self.scale()) as f32 - 12.0 } else { self.renderer.padding_right_edge() };
-        self.renderer.draw_frame(&frames, strip.as_ref(), &dividers, panel.as_ref(), &hints, hints_right, presented);
+        self.renderer.draw_frame(
+            &frames,
+            strip.as_ref(),
+            &dividers,
+            panel.as_ref(),
+            &hints,
+            hints_right,
+            host_accent.as_ref(),
+            presented,
+        );
         let overlay = match focus_at {
             Some(k) if blink => {
                 let rect = tab.panes[tab.focus].rect;
@@ -2546,6 +2564,7 @@ impl TermWindow {
         };
         drop(frames);
         drop(guards);
+        self.sync_host_tint(host_accent.as_ref());
         self.update_cursor_layer(overlay);
         self.sync_pane_headers();
     }
@@ -2653,17 +2672,104 @@ impl TermWindow {
         if !self.glass {
             self.window.setBackgroundColor(Some(&srgb_color(theme.background, 1.0)));
         }
+        let alpha = if high { 1.0 } else { self.glass_tint as f64 };
+        self.base_glass_bg = theme.background;
+        self.base_glass_alpha = alpha;
+        self.applied_host_tint = None;
         if let Some(glass) = &self.host_glass {
             // Increase Contrast: the glass keeps its shape and edge, but the
             // text sits on a solid background, as macOS does with its own
             // materials.
-            let alpha = if high { 1.0 } else { self.glass_tint as f64 };
             let tint = (alpha > 0.0).then(|| srgb_color(theme.background, alpha));
             glass.setTintColor(tint.as_deref());
+        }
+        if let Some(cap) = &self.capsule {
+            cap.set_tint(None);
         }
         self.renderer.set_theme(&theme);
         self.cursor_shown = None;
         self.request_redraw();
+    }
+
+    /// Resolve the active pane's host accent / danger colour (covering both
+    /// Mux remote hosts and plain `ssh <host>` sessions inside local shells).
+    fn active_host_accent(&self, focused_term: &Term) -> Option<renderer::HostAccent> {
+        if !self.host_tint || self.quick {
+            return None;
+        }
+        let pane = self.tabs[self.active].pane();
+        let hosts = mux_host_views();
+        if let Some(meta) = pane.pty.mux_meta() {
+            if meta.host != "local" {
+                let hv = hosts.iter().find(|h| h.alias == meta.host);
+                let host_os = hv.and_then(|h| match &h.status {
+                    host_mgr::HostStatus::Connected { info, .. } => Some(info.os.as_str()),
+                    _ => None,
+                });
+                let entry_color = hv.and_then(|h| h.color.as_deref());
+                let col = crate::mux::model::resolve_host_color(
+                    &meta.host,
+                    host_os,
+                    entry_color,
+                    &self.host_colors,
+                )?;
+                return Some(renderer::HostAccent {
+                    label: meta.host.clone(),
+                    rgb: col.rgb,
+                    danger: col.danger,
+                });
+            }
+        }
+        // Plain `ssh <dest>` inside a local shell: apply matching `host.color.*`
+        // config rules or saved host colours.
+        if let Some(ssh_host) = focused_term.ssh_command().and_then(ssh_target_host) {
+            let hv = hosts.iter().find(|h| h.alias.eq_ignore_ascii_case(&ssh_host));
+            let entry_color = hv.and_then(|h| h.color.as_deref());
+            let col = crate::mux::model::resolve_host_color(
+                &ssh_host,
+                None,
+                entry_color,
+                &self.host_colors,
+            )?;
+            return Some(renderer::HostAccent {
+                label: ssh_host,
+                rgb: col.rgb,
+                danger: col.danger,
+            });
+        }
+        None
+    }
+
+    /// Blend the active host's accent/danger colour subtly into Liquid Glass
+    /// (and the floating tab capsule when collapsed). Only touches AppKit when
+    /// the resolved host colour actually changes.
+    fn sync_host_tint(&mut self, accent: Option<&renderer::HostAccent>) {
+        let want = accent.map(|a| crate::mux::model::HostColor { rgb: a.rgb, danger: a.danger });
+        if want == self.applied_host_tint {
+            return;
+        }
+        self.applied_host_tint = want;
+        let strength = self.host_tint_strength.clamp(0.0, 2.0);
+        if let Some(glass) = &self.host_glass {
+            let alpha = self.base_glass_alpha;
+            let tinted_bg = match want {
+                Some(hc) if strength > 0.0 => {
+                    let base_mix = if hc.danger { 0.14 } else { 0.07 };
+                    let t = (base_mix * strength).clamp(0.0, 0.30);
+                    mix_rgb(self.base_glass_bg, hc.rgb, t)
+                }
+                _ => self.base_glass_bg,
+            };
+            let tint = (alpha > 0.0).then(|| srgb_color(tinted_bg, alpha));
+            glass.setTintColor(tint.as_deref());
+        }
+        if let Some(cap) = &self.capsule {
+            let cap_tint = want.filter(|_| strength > 0.0).map(|hc| {
+                let a = (if hc.danger { 0.24 } else { 0.12 } * strength as f64).clamp(0.0, 0.38);
+                srgb_color(hc.rgb, a)
+            });
+            cap.set_tint(cap_tint.as_deref());
+        }
     }
 
     /// Turn Secure Keyboard Entry on while this window is in front and its
@@ -5690,6 +5796,12 @@ impl App {
             notch_timer: None,
             host_glass,
             glass_tint: cfg.window.glass_tint,
+            host_tint: cfg.window.host_tint,
+            host_tint_strength: cfg.window.host_tint_strength,
+            host_colors: cfg.host_colors.clone(),
+            base_glass_bg: cfg.theme.background,
+            base_glass_alpha: cfg.window.glass_tint as f64,
+            applied_host_tint: None,
             followed: Vec::new(),
             tooltip: None,
             rewound: None,
@@ -6979,9 +7091,10 @@ fn mux_host_views() -> Vec<host_mgr::HostView> {
 
 fn sync_all_sidebars() {
     with_app(|app| {
-        for w in &app.windows {
+        for w in &mut app.windows {
             w.sync_sidebar();
             w.sync_pane_headers();
+            w.request_redraw();
         }
     });
     settings::refresh_if_open();
@@ -7048,6 +7161,53 @@ fn apply_interface_hints(show: bool) {
             w.layout();
         }
     });
+}
+
+fn apply_interface_host_tint(on: bool) {
+    with_app(|app| {
+        app.cfg.window.host_tint = on;
+        for w in &mut app.windows {
+            w.host_tint = on;
+            w.applied_host_tint = None;
+            w.apply_appearance();
+            w.sync_sidebar();
+            w.request_redraw();
+        }
+    });
+}
+
+/// Extract the hostname from an `ssh ... [user@]host ...` or `mosh` command line.
+fn ssh_target_host(cmd: &str) -> Option<String> {
+    let mut parts = cmd.split_whitespace();
+    let first = parts.next()?;
+    if !matches!(first.rsplit('/').next(), Some("ssh" | "mosh")) {
+        return None;
+    }
+    let mut skip_next = false;
+    for tok in parts {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if let Some(flag) = tok.strip_prefix('-') {
+            if flag.len() == 1
+                && matches!(
+                    flag.as_bytes()[0],
+                    b'B' | b'b' | b'c' | b'D' | b'E' | b'e' | b'F' | b'I' | b'i' | b'J' | b'L'
+                        | b'l' | b'm' | b'O' | b'o' | b'p' | b'Q' | b'R' | b'S' | b'W' | b'w'
+                )
+            {
+                skip_next = true;
+            }
+            continue;
+        }
+        let host = tok.rsplit_once('@').map_or(tok, |(_, h)| h);
+        let clean = host.trim_matches(|c| c == '[' || c == ']');
+        if !clean.is_empty() {
+            return Some(clean.to_string());
+        }
+    }
+    None
 }
 
 fn send_test_agent_notification() {
@@ -7147,6 +7307,21 @@ fn mux_remove_host(alias: &str) {
             crate::log::force(&format!("could not remove host: {e}"));
         }
     }
+}
+
+fn mux_set_host_color(alias: &str, color: Option<String>) {
+    if let Some(m) = host_mgr() {
+        if let Err(e) = m.set_host_color(alias, color) {
+            crate::log::force(&format!("could not set host colour: {e}"));
+        }
+    }
+    with_app(|app| {
+        for w in &mut app.windows {
+            w.applied_host_tint = None;
+            w.sync_sidebar();
+            w.request_redraw();
+        }
+    });
 }
 
 /// Convert a server `LayoutNode` (keyed by block IDs) into a local `panes::Node`
@@ -7740,5 +7915,17 @@ mod tests {
         let partial: HashMap<String, u64> = [("b1".into(), 10), ("b3".into(), 30)].into();
         let collapsed = build_panes_tree(&tree, &partial).expect("partial layout collapses");
         assert_eq!(collapsed.leaves(), vec![10, 30]);
+    }
+
+    #[test]
+    fn ssh_target_host_parses_flags_and_user_prefix() {
+        use super::ssh_target_host;
+
+        assert_eq!(ssh_target_host("ssh prod-01"), Some("prod-01".into()));
+        assert_eq!(ssh_target_host("ssh -p 2222 -i ~/.ssh/id_ed25519 deploy@prod-db.internal"), Some("prod-db.internal".into()));
+        assert_eq!(ssh_target_host("ssh -At -J jump-box root@staging-02 ls"), Some("staging-02".into()));
+        assert_eq!(ssh_target_host("mosh user@kagutsuchi"), Some("kagutsuchi".into()));
+        assert_eq!(ssh_target_host("cargo test"), None);
+        assert_eq!(ssh_target_host("ssh -V"), None);
     }
 }

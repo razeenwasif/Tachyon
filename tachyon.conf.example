@@ -194,6 +194,16 @@ theme.bold_is_bright = false
 # let coding agents rename auto-generated sessions after the task they're doing.
 # agents.auto_name_sessions = true
 
+# Per-host accent & danger colours (subtle Liquid Glass tint, top edge hairline,
+# bottom badge & sidebar icon tint). Works for both Mux remote hosts and plain
+# `ssh <host>` sessions (`*` glob wildcards supported).
+# Presets: auto | blue | purple | teal | green | amber | orange | red | danger | pink | none | #RRGGBB
+# window.host_tint = true
+# window.host_tint_strength = 1.0
+# host.color.kagutsuchi = blue
+# host.color.amaterasu = purple
+# host.color.prod* = danger
+
 # ---------------------------------------------------------------------------
 # Shell
 # ---------------------------------------------------------------------------

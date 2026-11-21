@@ -563,12 +563,14 @@ mod tests {
                 uri: "ssh://razeen@kagutsuchi:2222".into(),
                 remote_bin: Some("/opt/bin/tachyon".into()),
                 token: None,
+                color: Some("blue".into()),
             },
             HostEntry {
                 alias: "winpc".into(),
                 uri: "tcp://100.88.12.34".into(),
                 remote_bin: None,
                 token: Some("secret-tok".into()),
+                color: None,
             },
         ];
 
@@ -630,18 +632,21 @@ mod tests {
                 uri: "ssh://kagutsuchi".into(),
                 remote_bin: None,
                 token: None,
+                color: Some("blue".into()),
             },
             HostEntry {
                 alias: "forge".into(),
                 uri: "ssh://forge".into(),
                 remote_bin: Some("~/.local/bin/tachyon".into()),
                 token: None,
+                color: Some("amber".into()),
             },
             HostEntry {
                 alias: "amaterasu".into(),
                 uri: "tcp://100.64.0.9:7501".into(),
                 remote_bin: None,
                 token: Some("deadbeef".into()),
+                color: Some("purple".into()),
             },
         ];
         save_hosts_to(&path, &list).unwrap();

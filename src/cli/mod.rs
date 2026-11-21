@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::mux::client::MuxClient;
-use crate::mux::model::{HostEntry, SplitDir};
+use crate::mux::model::{HostColor, HostEntry, SplitDir};
 use crate::mux::{
     default_local_uri, default_socket_path, default_token_path, generate_auth_token, load_hosts,
     load_or_create_token, resolve_target, save_hosts, transport, write_token_file, Target,
@@ -372,6 +372,9 @@ fn cmd_hosts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                     if h.token.is_some() {
                         notes.push("token ✓".into());
                     }
+                    if let Some(c) = &h.color {
+                        notes.push(format!("color: {c}"));
+                    }
                     if notes.is_empty() {
                         println!("{:<18} {}", h.alias, h.uri);
                     } else {
@@ -382,11 +385,12 @@ fn cmd_hosts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "add" => {
-            let usage = "usage: tachyon hosts add <alias> <uri> [--bin PATH] [--token TOKEN]";
+            let usage = "usage: tachyon hosts add <alias> <uri> [--bin PATH] [--token TOKEN] [--color COLOR]";
             let alias = rest.first().ok_or(usage)?;
             let uri = rest.get(1).ok_or(usage)?;
             let mut remote_bin = None;
             let mut token = None;
+            let mut color = None;
             let mut i = 2;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -398,19 +402,33 @@ fn cmd_hosts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                         token = Some(rest.get(i + 1).ok_or("--token requires a bearer token")?.clone());
                         i += 2;
                     }
+                    "--color" => {
+                        let c = rest.get(i + 1).ok_or("--color requires a colour preset or #RRGGBB")?;
+                        if !HostColor::is_valid_spec(c) {
+                            return Err(format!("invalid host colour `{c}` (expected blue|purple|teal|green|amber|orange|red|danger|pink|none|auto or #RRGGBB)"));
+                        }
+                        color = (!c.eq_ignore_ascii_case("auto")).then(|| c.clone());
+                        i += 2;
+                    }
                     other => return Err(format!("unknown hosts add flag `{other}`")),
                 }
             }
+            let mut hosts = load_hosts();
+            // Preserve existing colour if updating an existing host without `--color`.
+            let preserved_color = hosts
+                .iter()
+                .find(|h| h.alias == *alias)
+                .and_then(|h| h.color.clone());
             // Validate URI syntax up front.
             let entry = HostEntry {
                 alias: alias.clone(),
                 uri: uri.clone(),
                 remote_bin,
                 token,
+                color: color.or(preserved_color),
             };
             let _ = resolve_target(Some(&entry.alias), std::slice::from_ref(&entry))
                 .map_err(|e| e.to_string())?;
-            let mut hosts = load_hosts();
             if let Some(existing) = hosts.iter_mut().find(|h| h.alias == *alias) {
                 *existing = entry.clone();
             } else {
@@ -421,6 +439,33 @@ fn cmd_hosts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                 print_json(&entry.to_json());
             } else {
                 println!("saved host `{}` -> {}", entry.alias, entry.uri);
+            }
+            Ok(0)
+        }
+        "color" | "colour" => {
+            let usage = "usage: tachyon hosts color <alias> <blue|purple|teal|green|amber|orange|red|danger|pink|none|auto|#RRGGBB>";
+            let alias = rest.first().ok_or(usage)?;
+            let spec = rest.get(1).ok_or(usage)?;
+            if !HostColor::is_valid_spec(spec) {
+                return Err(format!(
+                    "invalid host colour `{spec}` (expected blue|purple|teal|green|amber|orange|red|danger|pink|none|auto or #RRGGBB)"
+                ));
+            }
+            let mut hosts = load_hosts();
+            let Some(entry) = hosts.iter_mut().find(|h| h.alias == *alias) else {
+                return Err(format!("no configured host `{alias}`"));
+            };
+            entry.color = if spec.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                Some(spec.trim().to_string())
+            };
+            let out_json = entry.to_json();
+            save_hosts(&hosts).map_err(|e| e.to_string())?;
+            if opts.json {
+                print_json(&out_json);
+            } else {
+                println!("set colour for `{alias}` -> {}", spec.trim());
             }
             Ok(0)
         }
@@ -1370,8 +1415,10 @@ Server & Hosts:
   tachyon server uninstall-service          remove the user service
   tachyon bridge                            stdio <-> local socket/pipe bridge (invoked over SSH)
   tachyon hosts ls                          list local & configured remote hosts
-  tachyon hosts add <alias> <uri> [--bin P] [--token T]
+  tachyon hosts add <alias> <uri> [--bin P] [--token T] [--color C]
                                             save an ssh:// or direct tcp:// remote host
+  tachyon hosts color <alias> <color|auto|none>
+                                            set accent or danger colour for a saved host
   tachyon hosts remove <alias>              remove a saved host
   tachyon hosts test <alias>                verify SSH/TCP transport, server version & RTT
 

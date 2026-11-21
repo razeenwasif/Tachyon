@@ -271,3 +271,57 @@ fn cli_end_to_end_tcp_listener_with_bearer_token_auth() {
     let _ = srv.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_hosts_color_sets_lists_and_resets_color() {
+    let dir = temp_dir("hosts-color");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+
+    // 1. Add a host with an explicit danger color.
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &["hosts", "add", "prod-api", "ssh://prod-api", "--color", "red"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let (code, out, err) = run_cli(&sock, &hosts, &["hosts", "ls", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let list: Value = serde_json::from_str(&out).unwrap();
+    let prod = list["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["alias"] == "prod-api")
+        .expect("prod-api listed");
+    assert_eq!(prod["color"], "red");
+
+    // 2. Update color via `tachyon hosts color` to a custom danger hex.
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "color", "prod-api", "danger:#ef4444"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, out, err) = run_cli(&sock, &hosts, &["hosts", "ls"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("danger:#ef4444"), "ls output: {out}");
+
+    // 3. Invalid color is rejected cleanly.
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "color", "prod-api", "not-a-color"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("invalid host colour"), "stderr: {err}");
+
+    // 4. Reset to `auto` clears explicit color back to null/omitted.
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "color", "prod-api", "auto"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, out, err) = run_cli(&sock, &hosts, &["hosts", "ls", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let list: Value = serde_json::from_str(&out).unwrap();
+    let prod = list["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["alias"] == "prod-api")
+        .expect("prod-api listed");
+    assert!(prod.get("color").is_none() || prod["color"].is_null(), "prod: {prod}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
