@@ -6,21 +6,24 @@
 //! host-agnostic means the whole test suite runs anywhere, including under WSL
 //! while cross-building.
 
+pub mod cli;
 pub mod config;
 pub mod log;
+pub mod mux;
+pub mod server;
 pub mod term;
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 pub mod input;
 #[cfg(windows)]
 pub mod pty;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 pub mod render;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 pub mod win;
 
-/// macOS backend: AppKit, Metal, Core Text and a Unix PTY.
-#[cfg(target_os = "macos")]
+/// macOS GUI backend: AppKit, Metal, Core Text and a Unix PTY.
+#[cfg(all(target_os = "macos", feature = "gui"))]
 pub mod mac;
 
 /// Identity used for taskbar grouping and jump lists. Must match the

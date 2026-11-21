@@ -1,0 +1,1609 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Tachyon Status &amp; Plan</title>
+<!-- Editable Antigravity artifact; synced local repo mirror at docs/status.html (updated 2026-11-21) -->
+<style>
+  /* Layout: one reading column under a sticky section bar, like the other Status & Plan pages.
+     Tachyon's own look: graphite glass, the icon's white block cursor and its fading trail,
+     with Cherenkov blue as the one accent. */
+  :root {
+    --ground: #0a0c0f;
+    --glow-a: rgba(80, 170, 255, 0.13);
+    --glow-b: rgba(40, 70, 110, 0.32);
+    --paper: #15181d;
+    --paper-2: #0e1014;
+    --raise: #242830;
+    --ink: #eef0f4;
+    --dim: #c3c8d2;
+    --mute: #959ba8;
+    --line: rgba(190, 210, 235, 0.10);
+    --line-strong: rgba(190, 210, 235, 0.22);
+    --accent: #7cc8ff;
+    --cursor: #f2f4f8;
+    --on-cursor: #0a0c0f;
+    --trail: linear-gradient(90deg, rgba(242, 244, 248, 0), rgba(242, 244, 248, 0.08) 60%, rgba(242, 244, 248, 0.32) 88%, var(--cursor) 88%);
+    --ok: #8fdcb4;
+    --ok-soft: rgba(143, 220, 180, 0.12);
+    --doing: #7cc8ff;
+    --doing-soft: rgba(124, 200, 255, 0.13);
+    --warn: #eec583;
+    --warn-soft: rgba(238, 197, 131, 0.12);
+    --crit: #f29aa6;
+    --crit-soft: rgba(242, 154, 166, 0.12);
+    --depth: inset 0 1px 0 rgba(255, 255, 255, 0.05), inset 0 -30px 40px -32px rgba(0, 0, 0, 0.6);
+    --shadow: 0 3px 6px -2px rgba(0, 0, 0, 0.45), 0 16px 26px -12px rgba(0, 0, 0, 0.65), 0 38px 64px -30px rgba(0, 0, 0, 0.85);
+    --lift: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 6px 14px -8px rgba(0, 0, 0, 0.7);
+    --well: inset 0 1px 2px rgba(0, 0, 0, 0.6), inset 0 -1px 0 rgba(255, 255, 255, 0.03);
+    --legend-rim: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 -3px 8px -3px rgba(0, 0, 0, 0.6);
+    --bar-bg: rgba(10, 12, 15, 0.97);
+    --icon-bg: #16191e;
+    --mark: #f2f4f8;
+    --display: "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    --body: "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    --mono: "SF Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --ground: #eef1f5; --glow-a: rgba(60, 140, 220, 0.12); --glow-b: rgba(140, 180, 220, 0.2);
+      --paper: #fdfdfe; --paper-2: #eff2f6; --raise: #e2e6ec;
+      --ink: #12151b; --dim: #3a404c; --mute: #5d6370;
+      --line: rgba(20, 40, 70, 0.11); --line-strong: rgba(20, 40, 70, 0.22);
+      --accent: #0f6cbd; --cursor: #16191e; --on-cursor: #ffffff;
+      --trail: linear-gradient(90deg, rgba(22, 25, 30, 0), rgba(22, 25, 30, 0.08) 60%, rgba(22, 25, 30, 0.3) 88%, var(--cursor) 88%);
+      --ok: #1b7a4e; --ok-soft: rgba(27, 122, 78, 0.1); --doing: #0f6cbd; --doing-soft: rgba(15, 108, 189, 0.1);
+      --warn: #85570a; --warn-soft: rgba(133, 87, 10, 0.1); --crit: #b02a49; --crit-soft: rgba(176, 42, 73, 0.1);
+      --depth: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+      --shadow: 0 1px 2px rgba(20, 30, 50, 0.08), 0 10px 24px -12px rgba(20, 30, 50, 0.2), 0 30px 50px -30px rgba(20, 30, 50, 0.22);
+      --lift: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 4px 10px -6px rgba(20, 30, 50, 0.28);
+      --well: inset 0 1px 2px rgba(20, 30, 50, 0.14);
+      --legend-rim: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 -3px 8px -4px rgba(20, 30, 50, 0.14);
+      --bar-bg: rgba(238, 241, 245, 0.97);
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #eef1f5; --glow-a: rgba(60, 140, 220, 0.12); --glow-b: rgba(140, 180, 220, 0.2);
+    --paper: #fdfdfe; --paper-2: #eff2f6; --raise: #e2e6ec;
+    --ink: #12151b; --dim: #3a404c; --mute: #5d6370;
+    --line: rgba(20, 40, 70, 0.11); --line-strong: rgba(20, 40, 70, 0.22);
+    --accent: #0f6cbd; --cursor: #16191e; --on-cursor: #ffffff;
+    --trail: linear-gradient(90deg, rgba(22, 25, 30, 0), rgba(22, 25, 30, 0.08) 60%, rgba(22, 25, 30, 0.3) 88%, var(--cursor) 88%);
+    --ok: #1b7a4e; --ok-soft: rgba(27, 122, 78, 0.1); --doing: #0f6cbd; --doing-soft: rgba(15, 108, 189, 0.1);
+    --warn: #85570a; --warn-soft: rgba(133, 87, 10, 0.1); --crit: #b02a49; --crit-soft: rgba(176, 42, 73, 0.1);
+    --depth: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    --shadow: 0 1px 2px rgba(20, 30, 50, 0.08), 0 10px 24px -12px rgba(20, 30, 50, 0.2), 0 30px 50px -30px rgba(20, 30, 50, 0.22);
+    --lift: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 4px 10px -6px rgba(20, 30, 50, 0.28);
+    --well: inset 0 1px 2px rgba(20, 30, 50, 0.14);
+    --legend-rim: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 -3px 8px -4px rgba(20, 30, 50, 0.14);
+    --bar-bg: rgba(238, 241, 245, 0.97);
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-padding-top: calc(env(safe-area-inset-top, 0px) + 72px); }
+  body {
+    background:
+      radial-gradient(1100px 640px at 10% -8%, var(--glow-a), transparent 62%),
+      radial-gradient(900px 700px at 100% 40%, var(--glow-b), transparent 60%),
+      var(--ground);
+    background-attachment: fixed;
+    color: var(--ink);
+    font: 15px/1.6 var(--body);
+    -webkit-font-smoothing: antialiased;
+  }
+  body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 30; background: var(--bar-bg); }
+  .gutter { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  .column { max-width: 1080px; margin: 0 auto; display: grid; gap: 64px; min-width: 0; grid-template-columns: minmax(0, 1fr); }
+  h1, h2, h3, h4, h5 { margin: 0; text-wrap: balance; }
+  p { margin: 0; }
+  ul, ol { margin: 0; padding: 0; list-style: none; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  code { font-family: var(--mono); font-size: 0.86em; overflow-wrap: anywhere; }
+  .mono { font-family: var(--mono); font-size: 0.92em; }
+  .tab-num { font-variant-numeric: tabular-nums; }
+  .eyebrow { font-size: 11.5px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--mute); }
+  .display { font-family: var(--display); font-weight: 600; letter-spacing: -0.03em; }
+  .mark { display: block; flex: none; }
+  .mark .sq { fill: var(--icon-bg); stroke: var(--line-strong); }
+
+  .paper { position: relative; background: var(--paper); border-radius: 18px; box-shadow: var(--depth), var(--shadow); }
+  .legend { position: absolute; top: -10px; left: 20px; max-width: calc(100% - 40px); display: inline-flex; align-items: center; gap: 8px; padding: 0 10px; background: var(--paper); border-radius: 8px 8px 0 0; box-shadow: var(--legend-rim); font-size: 11px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink); }
+
+  /* Section bar */
+  .bar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; background: var(--bar-bg); backdrop-filter: blur(16px) saturate(140%); -webkit-backdrop-filter: blur(16px) saturate(140%); border-bottom: 1px solid var(--line); }
+  .bar-inner { display: flex; align-items: center; gap: 18px; min-height: 58px; max-width: 1080px; margin: 0 auto; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; color: var(--ink); flex: none; }
+  .brand b { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spacing: -0.025em; }
+  .sections { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; min-width: 0; padding: 6px 2px; }
+  .sections::-webkit-scrollbar { display: none; }
+  .sections a { flex: none; text-decoration: none; color: var(--dim); font-weight: 600; font-size: 13.5px; padding: 7px 14px; border-radius: 999px; white-space: nowrap; }
+  .sections a:hover { color: var(--ink); background: var(--raise); }
+  .sections a[aria-current="true"] { color: var(--ink); background: var(--raise); box-shadow: var(--lift); }
+  .sections a[aria-current="true"]::after { content: ""; display: block; height: 2px; margin-top: 3px; border-radius: 2px; background: var(--trail); }
+  .sync-mini { margin-left: auto; font-size: 12px; color: var(--mute); white-space: nowrap; flex: none; }
+
+  main { padding-block: 40px 72px; }
+  .part { display: grid; gap: 28px; min-width: 0; scroll-margin-top: 72px; grid-template-columns: minmax(0, 1fr); }
+  .part-head { display: grid; gap: 10px; max-width: 72ch; }
+  .part-head h2 { font-size: clamp(28px, 4vw, 40px); line-height: 1.1; }
+  .part-head p { color: var(--dim); }
+  .kicker { display: inline-flex; align-items: center; gap: 10px; }
+  .kicker::before { content: ""; width: 34px; height: 8px; border-radius: 1px; background: var(--trail); }
+
+  /* Header */
+  header.hero { display: grid; gap: 16px; }
+  .hero-title { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  header.hero h1 { font-size: clamp(38px, 6vw, 60px); line-height: 1.02; }
+  header.hero h1 .amp { color: var(--accent); }
+  .lede { color: var(--dim); max-width: 66ch; font-size: 16.5px; }
+  .facts { display: flex; flex-wrap: wrap; gap: 6px 20px; color: var(--mute); font-size: 13px; }
+  .facts b { color: var(--dim); font-weight: 600; }
+  .vitals { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 10px; align-items: start; }
+  .vital { padding: 22px 18px 18px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+  .vital .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .vital .big { font-family: var(--display); font-size: 24px; font-weight: 600; letter-spacing: -0.025em; line-height: 1.15; }
+  .vital p { color: var(--dim); font-size: 13px; line-height: 1.45; }
+  .vital .when { font-size: 11.5px; color: var(--mute); }
+  .pill { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 11.5px; font-weight: 650; padding: 2px 9px; border-radius: 999px; }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: var(--ok); background: var(--ok-soft); }
+  .pill.crit { color: var(--crit); background: var(--crit-soft); }
+  .pill.warn { color: var(--warn); background: var(--warn-soft); }
+  .pill.info { color: var(--doing); background: var(--doing-soft); }
+  .pill.muted { color: var(--dim); background: var(--paper-2); box-shadow: var(--well); }
+
+  /* Run order */
+  .plan-head { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 16px 28px; }
+  .progress { display: grid; gap: 6px; width: 300px; max-width: 100%; flex: none; }
+  .progress .label { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; font-size: 13px; color: var(--dim); }
+  .progress .track { height: 6px; border-radius: 3px; background: var(--paper-2); box-shadow: var(--well); overflow: hidden; display: flex; }
+  .progress .track i { display: block; height: 100%; }
+  .p-done { background: var(--ok); }
+  .p-doing { background: var(--doing); }
+  .sync { font-size: 12px; color: var(--mute); }
+  .sync.err { color: var(--crit); }
+  .sizes { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--mute); }
+  .sizes b { color: var(--dim); font-weight: 600; font-family: var(--mono); }
+  #phases { display: grid; gap: 44px; grid-template-columns: minmax(0, 1fr); }
+  .phase { display: grid; gap: 22px; grid-template-columns: minmax(0, 1fr); }
+  .phase-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+  .phase-head h3 { font-family: var(--display); font-size: 23px; font-weight: 600; letter-spacing: -0.025em; }
+  .phase-sub { color: var(--mute); font-size: 13.5px; }
+  .phase-count { margin-left: auto; color: var(--mute); font-size: 12.5px; }
+  .steps { display: grid; gap: 24px; grid-template-columns: minmax(0, 1fr); }
+  .step { display: grid; grid-template-columns: minmax(0, 1fr) 184px; gap: 6px 20px; padding: 24px 20px 18px; scroll-margin-top: 80px; }
+  .step.is-next { box-shadow: var(--depth), var(--shadow), 0 0 0 1.5px var(--accent); }
+  .step.is-done .title, .step.is-skipped .title { color: var(--dim); }
+  .step.is-skipped .title { text-decoration: line-through; text-decoration-color: var(--mute); }
+  .step.is-done .legend::after { content: "✓"; color: var(--ok); letter-spacing: 0; }
+  .step-body { display: grid; gap: 9px; min-width: 0; }
+  .title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  .title { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.35; }
+  .next-tag { font-size: 10.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--on-cursor); background: var(--cursor); padding: 2px 8px; border-radius: 3px; }
+  .why { color: var(--dim); font-size: 14.5px; max-width: 80ch; overflow-wrap: anywhere; }
+  .covers { display: grid; gap: 4px; font-size: 13.5px; color: var(--dim); max-width: 80ch; }
+  .covers li { position: relative; padding-left: 18px; overflow-wrap: anywhere; }
+  .covers li::before { content: "–"; color: var(--mute); position: absolute; left: 0; }
+  .done-when { font-size: 13.5px; color: var(--dim); max-width: 80ch; }
+  .done-when span { color: var(--ink); font-weight: 650; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12px; color: var(--mute); }
+  .tag { font-family: var(--mono); font-size: 11.5px; color: var(--dim); line-height: 1.5; background: var(--paper-2); box-shadow: var(--well); border-radius: 6px; padding: 1px 7px; overflow-wrap: anywhere; }
+  .tag.who { font-family: var(--body); font-weight: 600; }
+  .tag.who.you { color: var(--warn); }
+  .note { font-size: 13px; color: var(--ink); background: var(--paper-2); box-shadow: var(--well); border-radius: 10px; padding: 9px 12px; }
+  .note::before { content: "Note  "; color: var(--mute); font-weight: 650; }
+  .ctl { display: grid; gap: 6px; align-content: start; }
+  .state { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 650; padding: 6px 11px; border-radius: 10px; color: var(--mute); background: var(--paper-2); box-shadow: var(--well); }
+  .state::before { content: ""; width: 7px; height: 11px; border-radius: 1.5px; border: 1.5px solid currentColor; flex: none; }
+  .state.s-doing { color: var(--doing); background: var(--doing-soft); box-shadow: none; }
+  .state.s-doing::before { background: currentColor; animation: blink 1.06s steps(1, end) infinite; }
+  .state.s-done { color: var(--ok); background: var(--ok-soft); box-shadow: none; }
+  .state.s-done::before { background: currentColor; }
+  .state.s-skipped { box-shadow: none; outline: 1px dashed var(--line-strong); outline-offset: -1px; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .ctl label { font-size: 11.5px; color: var(--mute); }
+  .ctl select { font: inherit; font-size: 13px; color: var(--ink); background: var(--raise); border: 0; box-shadow: var(--lift); border-radius: 10px; padding: 6px 9px; width: 100%; }
+  .ctl select:disabled { opacity: 0.55; }
+  .ctl time { font-size: 11.5px; color: var(--mute); }
+  .plan-foot { color: var(--mute); font-size: 12.5px; border-top: 1px solid var(--line); padding-top: 16px; }
+
+  /* Filters */
+  .filters { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; }
+  .count { font-size: 13px; color: var(--mute); }
+  .search { font: 500 14.5px var(--body); color: var(--ink); background: var(--paper-2); box-shadow: var(--well); border: 0; border-radius: 999px; padding: 10px 18px; width: min(100%, 380px); }
+  .search::placeholder { color: var(--mute); }
+  .empty { color: var(--mute); font-size: 14px; }
+
+  /* Backlog */
+  .bl-grid { columns: 2 440px; column-gap: 18px; }
+  .bl-cell { display: inline-block; width: 100%; vertical-align: top; break-inside: avoid; padding-top: 30px; }
+  .bl-group { padding: 22px 20px 8px; }
+  .bl-intro { font-size: 13px; color: var(--mute); padding-bottom: 6px; }
+  .bl-list { display: grid; }
+  .bl-item { padding: 12px 0; border-top: 1px solid var(--line); display: grid; gap: 6px; min-width: 0; }
+  .bl-item.firstv { border-top: 0; }
+  .bl-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 9px; }
+  .bl-head h5 { margin: 0; flex: 1 1 220px; font-size: 15px; font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
+  .bl-text { font-size: 13.5px; color: var(--dim); overflow-wrap: anywhere; }
+
+  /* Guide */
+  kbd { display: inline-block; font-family: var(--mono); font-size: 0.8em; line-height: 1.5; font-weight: 500; padding: 0 6px; border-radius: 6px; color: var(--ink); background: var(--raise); box-shadow: var(--lift); white-space: nowrap; vertical-align: 0.06em; }
+  .g-toc { display: flex; flex-wrap: wrap; gap: 6px; }
+  .g-toc a { font-size: 13px; font-weight: 600; text-decoration: none; color: var(--dim); padding: 5px 12px; border-radius: 999px; background: var(--paper-2); box-shadow: var(--well); }
+  .g-toc a:hover { color: var(--ink); }
+  .guide { display: grid; gap: 52px; grid-template-columns: minmax(0, 1fr); }
+  .g-block { display: grid; gap: 18px; min-width: 0; scroll-margin-top: 80px; grid-template-columns: minmax(0, 1fr); }
+  .g-block > h3 { font-family: var(--display); font-weight: 600; font-size: 25px; letter-spacing: -0.025em; }
+  .g-block > p { color: var(--dim); max-width: 72ch; }
+  .g-start { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 26px 16px; counter-reset: start; }
+  .g-start li { padding: 24px 18px 18px; display: grid; gap: 6px; align-content: start; min-width: 0; counter-increment: start; }
+  .g-start li::before { content: counter(start); font-family: var(--mono); font-size: 26px; line-height: 1; color: var(--accent); }
+  .g-start b { font-size: 15.5px; }
+  .g-start p { color: var(--dim); font-size: 14px; }
+  .g-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 30px 18px; }
+  .g-card { padding: 24px 20px 18px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+  .g-card > p { color: var(--dim); font-size: 14.5px; }
+  .g-card ul { padding-left: 18px; list-style: disc; display: grid; gap: 7px; font-size: 14px; color: var(--dim); }
+  .g-card li::marker { color: var(--accent); }
+  .g-card li b, .g-card > p b { color: var(--ink); font-weight: 650; }
+  .g-diagram { padding: 30px 16px 18px; display: grid; gap: 20px; }
+  .g-diagram .scroll { overflow-x: auto; border-radius: 12px; }
+  .g-diagram svg { display: block; width: 100%; height: auto; min-width: 620px; }
+  .dg-win { fill: var(--ground); stroke: var(--line-strong); }
+  .dg-row { fill: var(--paper-2); }
+  .dg-bar { fill: var(--line-strong); }
+  .dg-ok { fill: var(--ok); }
+  .dg-crit { fill: var(--crit); }
+  .dg-cur { fill: var(--cursor); }
+  .dg-acc { fill: var(--accent); }
+  .dg-zone { fill: none; stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 4 3; }
+  .dg-light { fill: var(--raise); }
+  .dg-txt { fill: var(--dim); font: 500 11px var(--body); }
+  .dg-mono { fill: var(--ink); font: 400 11.5px var(--mono); }
+  .dg-monod { fill: var(--mute); font: 400 11.5px var(--mono); }
+  .dg-n circle { fill: var(--ink); }
+  .dg-n text { fill: var(--paper); font: 700 11px var(--body); text-anchor: middle; dominant-baseline: central; }
+  figure.g-diagram { margin: 0; }
+  .g-diagram figcaption { color: var(--dim); font-size: 13.5px; max-width: 80ch; padding-inline: 6px; }
+  .g-diagram figcaption b { color: var(--ink); font-weight: 650; }
+  .dg-box { fill: var(--paper-2); stroke: var(--line-strong); }
+  .dg-q { fill: var(--paper-2); stroke: var(--accent); stroke-width: 1.2; }
+  .dg-out { fill: var(--raise); }
+  .dg-wire { fill: none; stroke: var(--mute); stroke-width: 1.3; }
+  .dg-head-fill { fill: var(--mute); }
+  .dg-built { fill: var(--paper-2); stroke: var(--ok); stroke-width: 1.5; }
+  .dg-part { fill: var(--paper-2); stroke: var(--accent); stroke-width: 1.5; }
+  .dg-plan { fill: var(--paper-2); stroke: var(--mute); stroke-width: 1.3; stroke-dasharray: 4 3; }
+  .dg-snap { fill: var(--accent); }
+  .dg-seek { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.2; }
+  .dg-band { fill: var(--paper-2); }
+  .dg-ground { fill: var(--ground); }
+  .dg-hd { fill: var(--ink); font: 600 12px var(--body); }
+  .dg-hdm { fill: var(--ink); font: 600 12px var(--body); text-anchor: middle; }
+  .dg-sm { fill: var(--mute); font: 500 10.5px var(--body); }
+  .dg-smm { fill: var(--mute); font: 500 10.5px var(--body); text-anchor: middle; }
+  .dg-txtm { fill: var(--dim); font: 500 11px var(--body); text-anchor: middle; }
+  .dg-yes { fill: var(--ok); font: 600 10.5px var(--body); text-anchor: middle; }
+  .dg-no { fill: var(--mute); font: 600 10.5px var(--body); }
+  .dg-okt { fill: var(--ok); font: 400 11.5px var(--mono); }
+  .dg-crt { fill: var(--crit); font: 400 11.5px var(--mono); }
+  .dg-act { fill: var(--accent); font: 600 11.5px var(--body); }
+  .g-key { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px 24px; padding-inline: 6px; }
+  .g-key li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 2px 10px; font-size: 13.5px; color: var(--dim); align-content: start; }
+  .g-key li > span { grid-row: span 2; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; background: var(--ink); color: var(--paper); font-size: 11.5px; font-weight: 700; }
+  .g-key b { color: var(--ink); font-weight: 650; }
+
+  /* Concept */
+  .c-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 30px 18px; }
+  .c-card { padding: 24px 20px 18px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+  .c-card .bl-head h5 { font-size: 16px; }
+  .c-card > p { color: var(--dim); font-size: 14px; }
+  .c-card > p b { color: var(--ink); font-weight: 650; }
+  .how { font: 12px/1.6 var(--mono); color: var(--dim); background: var(--paper-2); box-shadow: var(--well); border-radius: 10px; padding: 9px 12px; overflow-x: auto; white-space: pre; }
+  .how .v { color: var(--ink); } .how .a { color: var(--accent); } .how .o { color: var(--ok); } .how .w { color: var(--warn); }
+  .closest { font-size: 13px; color: var(--mute); border-top: 1px solid var(--line); padding-top: 10px; }
+  .closest b { color: var(--dim); font-weight: 650; }
+  .flows { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 26px 16px; }
+  .flow { padding: 24px 18px 18px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+  .flow .moment { color: var(--ink); font-size: 14.5px; font-weight: 500; }
+  .flow ul { display: grid; gap: 7px; }
+  .flow li { font-size: 13.5px; color: var(--dim); }
+  .flow li b { color: var(--ink); font-weight: 650; }
+  .s-b, .s-p, .s-n { font-size: 11px; font-weight: 650; white-space: nowrap; }
+  .s-b { color: var(--ok); } .s-p { color: var(--doing); } .s-n { color: var(--mute); }
+  .c-sub { display: grid; gap: 18px; min-width: 0; grid-template-columns: minmax(0, 1fr); }
+  .c-sub > h3 { font-family: var(--display); font-weight: 600; font-size: 25px; letter-spacing: -0.025em; }
+  .c-sub > p { color: var(--dim); max-width: 72ch; }
+  .c-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--mute); }
+  .budget-table { min-width: 640px; }
+  .budget-table td:first-child { color: var(--ink); font-weight: 600; }
+  .budget-table td.n { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .icon-row { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+  .icon-row svg { flex: none; }
+
+  /* Tables */
+  .table-card { padding: 22px 0 6px; min-width: 0; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; vertical-align: top; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  th { font-size: 11.5px; font-weight: 650; letter-spacing: 0.1em; text-transform: uppercase; color: var(--mute); }
+  td { color: var(--dim); }
+  tr:last-child td { border-bottom: 0; }
+  .perf-table { min-width: 560px; }
+  .perf-table td:first-child { font-weight: 650; color: var(--ink); }
+  .perf-table td.n { font-family: var(--mono); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .perf-table td.gain { color: var(--ok); }
+
+  /* Cheatsheet */
+  .cheat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 18px; align-items: start; }
+  .cheat-col { display: grid; gap: 30px; padding-top: 10px; min-width: 0; grid-template-columns: minmax(0, 1fr); align-content: start; }
+  .cheat { padding: 22px 0 6px; min-width: 0; }
+  .cheat table { font-size: 13.5px; }
+  .cheat td { padding: 7px 16px; }
+  .cheat td.k { width: 42%; color: var(--ink); }
+  .cheat td.k code { color: var(--ink); background: var(--paper-2); box-shadow: var(--well); border-radius: 6px; padding: 1px 6px; overflow-wrap: break-word; }
+  .cheat tr.lastv td { border-bottom: 0; }
+
+  @media (max-width: 900px) { .vitals { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 860px) { .cheat-grid { grid-template-columns: minmax(0, 1fr); gap: 30px; } }
+  @media (max-width: 760px) { .bl-grid { columns: 1; } }
+  @media (max-width: 640px) {
+    main { padding-block: 28px 56px; }
+    .column { gap: 52px; }
+    .bar-inner { gap: 10px; min-height: 52px; }
+    .brand b, .sync-mini { display: none; }
+    .vitals { grid-template-columns: minmax(0, 1fr); }
+    .step { grid-template-columns: minmax(0, 1fr); padding: 22px 16px 16px; }
+    .ctl { grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px 10px; }
+    .ctl label { display: none; }
+    .ctl time { grid-column: 1 / -1; }
+    .progress { width: 100%; }
+    .g-card, .g-start li, .bl-group { padding: 22px 16px 16px; }
+    .cheat td { padding: 7px 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .state.s-doing::before { animation: none; } }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } .sections a { transition: background 0.15s ease, color 0.15s ease; } }
+</style>
+</head>
+<body>
+
+<nav class="bar gutter" aria-label="Sections">
+  <div class="bar-inner">
+    <a class="brand" href="#top">
+      <svg class="mark" width="28" height="28" viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="tr-s" x1="0" x2="1"><stop offset="0" stop-color="var(--mark)" stop-opacity="0"/><stop offset=".7" stop-color="var(--mark)" stop-opacity=".08"/><stop offset="1" stop-color="var(--mark)" stop-opacity=".32"/></linearGradient></defs><rect class="sq" x="1" y="1" width="98" height="98" rx="24"/><rect x="21" y="38" width="38" height="25" fill="url(#tr-s)"/><rect x="57" y="38" width="15" height="25" rx="2" fill="var(--mark)"/></svg>
+      <b>Tachyon</b>
+    </a>
+    <div class="sections">
+      <a href="#plan" data-spy="plan">Plan</a>
+      <a href="#concept" data-spy="concept">Concept</a>
+      <a href="#backlog" data-spy="backlog">Backlog</a>
+      <a href="#guide" data-spy="guide">Guide</a>
+      <a href="#cheatsheet" data-spy="cheatsheet">Cheatsheet</a>
+    </div>
+    <span class="sync-mini" id="sync-mini" aria-hidden="true"></span>
+  </div>
+</nav>
+
+<main class="gutter" id="top">
+  <div class="column">
+
+  <header class="hero">
+    <span class="eyebrow">Tachyon · status, plan and guide</span>
+    <div class="hero-title">
+      <svg class="mark" width="80" height="80" viewBox="0 0 100 100" role="img" aria-label="Tachyon's icon: a block cursor with a fading trail"><defs><linearGradient id="tr-l" x1="0" x2="1"><stop offset="0" stop-color="var(--mark)" stop-opacity="0"/><stop offset=".7" stop-color="var(--mark)" stop-opacity=".08"/><stop offset="1" stop-color="var(--mark)" stop-opacity=".32"/></linearGradient></defs><rect class="sq" x="1" y="1" width="98" height="98" rx="24"/><rect x="21" y="38" width="38" height="25" fill="url(#tr-l)"/><rect x="57" y="38" width="15" height="25" rx="2" fill="var(--mark)"/></svg>
+      <h1 class="display">Tachyon Status <span class="amp">&amp;</span> Plan</h1>
+    </div>
+    <p class="lede">Where Tachyon stands on your MacBook, the order we work through what's left, the concept behind it, the backlog after it, and how to use the terminal day to day. Each step's status updates here as it lands.</p>
+    <div class="facts">
+      <span>main <b class="mono">05bc679</b> · 10 Nov</span>
+      <span>Nothing unpushed</span>
+      <span>Apple silicon only · M2 Pro</span>
+      <span>Updated <b>9 Nov</b>, after every piece of work</span>
+    </div>
+    <section class="vitals" aria-label="Vitals">
+      <div class="vital paper">
+        <span class="legend">Neutrino &amp; GitHub</span>
+        <div class="head"><span class="big tab-num">39 merged</span><span class="pill ok">Up to date</span></div>
+        <p>Thirty-nine pull requests are merged into main, which ends at <code>afa5a24</code> (<code>origin</code> now lives on Neutrino on atlas/Kagutsuchi, with GitHub as a mirror). Neutrino PR #1 brought the Neutrino card (⌘⇧N), bottom-band button and SSH machines on 20 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/38">#38</a> brought job notifications with Tachyon closed, <a href="https://github.com/razeenwasif/Tachyon/pull/37">#37</a> the system monitor card and <a href="https://github.com/razeenwasif/Tachyon/pull/36">#36</a> the quick terminal, on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/35">#35</a> brought tracebacks opening in your editor and <a href="https://github.com/razeenwasif/Tachyon/pull/34">#34</a> Ask Fairy and shortcut hints, on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/33">#33</a> brought command blocks on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/32">#32</a> brought reopening a closed tab (⌥⌘T) on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/31">#31</a> made Tab take a showing suggestion on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/30">#30</a> brought the training chart on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/29">#29</a> brought images and suggestions inside tmux on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/28">#28</a> brought inline images (iTerm2 and kitty protocols) on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/27">#27</a> made the find bar's regex switch a labelled checkbox on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/26">#26</a> added ⌘F find in scrollback on 10 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/25">#25</a> fixed ⌥⌘F working only once and added <code>window.fullscreen = notch</code> on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/24">#24</a> added full screen around the notch on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/23">#23</a> added the standard layout with a title bar on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/22">#22</a> brought inline suggestions and smaller scrollback on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/21">#21</a> brought high-contrast themes for Increase Contrast on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/20">#20</a> put receipts beside right prompts and checked GPU memory in the footprint on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/19">#19</a> fitted Nerd Font icons to the cell on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/18">#18</a> cut keystroke-to-screen latency by a quarter on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/17">#17</a> finished the core steps on 9 Nov: the bulk write path, ligatures and emoji sequences, and the latency ledger; <a href="https://github.com/razeenwasif/Tachyon/pull/16">#16</a> brought the session host and keep-awake on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/15">#15</a> brought split panes on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/14">#14</a> brought Rewind on 9 Nov: older output on disk, a scrub slider, and ⌥-click cell provenance; <a href="https://github.com/razeenwasif/Tachyon/pull/13">#13</a> brought rerun diff on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/12">#12</a> brought job tabs on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/11">#11</a> tinted the glass itself and <a href="https://github.com/razeenwasif/Tachyon/pull/10">#10</a> brought the metric lens, on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/9">#9</a> brought a clearer glass window and the floating glass tab capsule on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/8">#8</a> brought Liquid Glass and Light/Dark Mode themes on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/7">#7</a> brought bash and fish integration and a parser fix for strings ended by ST on 9 Nov; <a href="https://github.com/razeenwasif/Tachyon/pull/6">#6</a> brought notifications, ⌘-click and Secure Keyboard Entry on 9 Nov. <a href="https://github.com/razeenwasif/Tachyon/pull/5">#5</a> brought tabs on 9 Nov. <a href="https://github.com/razeenwasif/Tachyon/pull/1">#1</a> brought the concept, the icon, the macOS backend and multiple windows; <a href="https://github.com/razeenwasif/Tachyon/pull/2">#2</a> selection, the mouse and everyday keys; <a href="https://github.com/razeenwasif/Tachyon/pull/3">#3</a> the NEON scanner and packed scrollback; <a href="https://github.com/razeenwasif/Tachyon/pull/4">#4</a> shell integration, receipts and input methods. The branches macos-everyday, perf-apple-silicon, shell-integration, tabs, mac-details, bash-fish, liquid-glass, glass-depth, metric-lens, glass-tint, job-tabs, rerun-diff, rewind, split-panes, session-host, keep-awake, core-steps, display-latency, nerd-font-icons, receipts-gpu, increase-contrast, scrollback-memory, suggestions, titlebar-layout, notch-full-screen, notch-fixes, find, find-regex-label, inline-images, tmux-images, training-charts, suggestion-tab, reopen-tab, command-blocks, fairy-hints, editor-links, quick-terminal, system-monitor, job-notify and neutrino-panel are kept, as you asked.</p>
+        <span class="when">As of 21 Nov</span>
+      </div>
+      <div class="vital paper">
+        <span class="legend">Installed app</span>
+        <div class="head"><span class="big">Up to date</span><span class="pill ok">Installed</span></div>
+        <p><b>Installed 21 Nov:</b> Milestone 1 (branch <code>mux-server</code>, not merged yet): portable Mux v2 server, <code>tachyon</code> CLI linked at <code>~/.local/bin/tachyon</code>, and 1.1 MB headless server deployed to Mac mini (<code>kagutsuchi</code>) as a <code>launchd</code> service (<code>dev.tachyon.server</code>, 2.8–7.9 ms RTT over SSH bridge, 22 µs median local echo). <b>Installed 20 Nov:</b> afa5a24, the Neutrino card (⌘⇧N), bottom-band branch button and SSH machines from <code>~/.ssh/config</code> (merged in Neutrino PR #1). <b>Installed 10 Nov:</b> 91f1f7f, job notifications with Tachyon closed (merged in #38). ec4c692, the system monitor card (merged in #37). a3faf7e, the quick terminal as a non-activating panel (merged in #36). 9e56d06, tracebacks open in your editor (merged in #35). fa74bd9, Ask Fairy and shortcut hints (merged in #34), with Fairy rebuilt from Lyra's <code>tachyon-link</code>. c340407, command blocks (merged in #33). cbb1e51, reopen a closed tab with ⌥⌘T (merged in #32). a6b28fd, Tab takes a showing suggestion (merged in #31). 499ff0a, the training chart (merged in #30). 0caec5c, suggestions in tmux, and be55247, images through tmux (merged in #29). 6746b50, inline images (merged in #28). da548cb, the find bar's Regex checkbox. <b>9 Nov at 23:15:</b> 50f7e8b, ⌘F find in scrollback. <b>22:30:</b> e03b0b7, ⌥⌘F works every time, and with <code>window.fullscreen = notch</code> (now in your config) the green button goes around the notch and Tachyon opens that way. <b>22:00:</b> a6646ee, full screen around the notch (⌥⌘F). <b>21:50:</b> d4e1205, View > Show Title Bar. <b>21:25:</b> 60baab7, inline suggestions from history (→ takes one) and about half the memory per scrollback line. <b>20:10:</b> 964f20a, high-contrast themes with Increase Contrast. <b>19:45:</b> 1e88c76, receipts sit beside a right prompt instead of hiding behind it. <b>19:20:</b> cfad3d0, Nerd Font icons fit the cell (Starship's branch symbol no longer pokes out). <b>19:00:</b> d95c5da, keystrokes reach the screen about a quarter sooner (median 33–35 → 23–25 ms). <b>17:55:</b> f04d5a6, the last core steps: plain text at 2.3 GiB/s, ligatures and emoji sequences, and the latency ledger (⌥⌘L). <b>17:05:</b> 93689e3, keep-awake: ⌥⌘A keeps the Mac awake while a pane's command runs, even with Tachyon closed. <b>16:45:</b> 99f43ed, the session host: shells outlive the app. Reopen Tachyon to start using it; from then on ⌘Q keeps your shells running and ⌥⌘Q ends them. <b>15:50:</b> ef92711, split panes. <b>15:05:</b> 1bbfd9d, Rewind finished: older output on disk, a scrub slider, and ⌥-click provenance. <b>14:10:</b> Rewind's first version. <b>13:54:</b> rerun diff. <b>13:41:</b> job tabs. <b>13:25:</b> the glass itself tinted, darker with more refraction. <b>13:19:</b> the metric lens. <b>12:55:</b> more glass (25% background, rounded like the window) and the tabs in a floating glass capsule. <b>12:42:</b> Liquid Glass and the light theme. <b>12:27:</b> bash and fish integration and the fix for stray backslashes after ST-ended escape sequences. <b>11:37:</b> notifications, ⌘-click and Secure Keyboard Entry. Quit Tachyon and open it again to get them. The first long command that finishes while you're elsewhere makes macOS ask whether Tachyon may notify; allow it to get receipts as notifications. <b>09:57:</b> tabs. It's a signed arm64 bundle, <code>dev.tachyon.terminal</code>, built by <code>scripts/bundle-macos.sh --install</code>, with the zsh integration in its Resources.</p>
+        <span class="when">Installed 21 Nov</span>
+      </div>
+      <div class="vital paper">
+        <span class="legend">Tests</span>
+        <div class="head"><span class="big tab-num">199 of 199</span><span class="pill ok">All pass</span></div>
+        <p>One at 21:50: <code>window.layout</code> parses, edge by default. Seven at 21:25: what's typed at a prompt read from the screen (with a right prompt, a wrapped line, the cursor moved back), suggestions newest first and same folder first, hidden and multi-line commands kept out, zsh (metafied), bash and fish history files parsed, ⌥→ one word at a time, and scrollback blocks evicting and reusing. Two at 20:10: both derived high-contrast themes reach 7:1 for every ANSI colour (4.5:1 for the dim slot) with hues kept, and <code>theme.contrast</code> parses. One at 19:45: a note goes at the right, or just left of a right prompt, or nowhere when it would cover text; plus an ignored check that GPU memory (a Metal buffer, PyTorch MPS) is in the footprint. One at 19:20: Nerd Font icons from the fallback stay inside the cell, and a Powerline arrow is as tall as the cell. Five at 17:55 for the last core steps: a stream fed in big chunks (the bulk path) and in 16-byte ones leaving the same terminal, with content before and between and with scrollback full; emoji sequences shaping to one colour glyph and ligatures only in fonts that have them; and a keystroke splitting into stages, with no entry when the display gives no time. Three at 17:05 for keep-awake: it lasts one command (the running one, or the next from a prompt) and can be taken back; the assertion is held while any command asks and listed by <code>pmset</code> under the commands' names; and the host holds it for a command armed at a prompt with no app attached, letting go when the command ends. Six at 16:45 for the session host: the terminal written back out as escape sequences and parsed again comes back the same (text, colours, wide characters, scrollback, wrapped lines, the alternate screen and modes, command marks and exit codes, with no made-up times), a shell outliving its app and returning with its screen while keys still reach it, and split trees written down and read back. Three ignored benchmarks measure what the host costs. Six at 15:50 for split panes: one pane filling the tab, splits on whole cells with a divider between (every cell a pane's or a divider's, once), closing a pane giving its area back, dragging a divider while keeping panes at least two cells, tiny windows, and moving focus to the pane beside. Two more at 15:05 for Rewind: older output spilling to disk and replaying from there (with provenance checks), and without a folder, old output being dropped; the benchmark now times seeks too. Three at 14:10 for Rewind: replaying an alternate screen frame by frame, staying within the budget while replaying from snapshots, and replaying resizes; plus an ignored benchmark of its cost. Five at 13:54 for rerun diff: line shapes, changed and new lines, a different line in place, and a learning-rate rerun marking rows with the old text. Three at 13:41 for job tabs: Nexus ids only from submissions (chained lines too), Slurm submissions anywhere, and a job submitted over ssh remembering that ssh until the shell is home. Six at 13:19 for the metric lens: training logs, Keras and Hugging Face output, tqdm bars, rates, the line splitter over escapes and <code>\r</code>, sparklines and short numbers. Two at 12:42 for the glass default and the light theme's keys, including <code>accent</code> going to both themes. One at 12:27 for strings ended by ST (<code>ESC \</code>) leaving no backslash on screen, which fish 4 showed. Two at 12:21: how each shell is started with the integration, and a prompt or command marked twice (fish 4 marks its own) counting as one. Four at 11:37: what a ⌘-click resolves to (URLs, paths from the tab's folder and home, compiler <code>file:line:col</code> suffixes, punctuation) and notification ids carrying their tab. Six for tabs before that: how a tab is named (folder, command line, a program's title and dropping it when the program exits), reading OSC 7 folders, and fitting labels into a tab. The rest cover the scanner against a reference and a fuzzer, reflow during Stage Manager's animated resize, packed rows, selection, box drawing, key and mouse encoding, OSC 133 marks, and the receipt struct's layout and units, plus tests for Neutrino/SSH machines, detached job notifications, system monitor sampling, quick terminal hotkeys, Fairy link, editor tracebacks, command blocks, inline images and training charts, plus 10 Mux v2 / server / CLI tests covering binary framing, LZ4 snapshots, multi-client attach/restore, split/wait/capture, env injection and stdio bridge (195 unit + 4 integration; 16 ignored benchmarks/hardware checks; headless <code>--no-default-features</code> also passes 120/120).</p>
+        <span class="when">Run 21 Nov</span>
+      </div>
+      <div class="vital paper">
+        <span class="legend">Speed on the M2 Pro</span>
+        <div class="head"><span class="big tab-num">2.3 GiB/s</span><span class="pill ok">Plain ASCII</span></div>
+        <p>Up from 660 MiB/s: a flood of plain lines now goes to the scrollback straight from its bytes, and only the last screenful becomes cells (about 440 MiB/s before the NEON scanner and packed rows). A build log runs at about 293 MiB/s and a TUI redraw at 245 MiB/s. 100k lines of scrollback take 78 MiB instead of 420 MiB, and an idle window uses 0.0% CPU with no wake-ups.</p>
+        <span class="when">Measured 9 Nov</span>
+      </div>
+    </section>
+  </header>
+
+  <section class="part" id="plan" aria-labelledby="plan-h">
+    <div class="plan-head">
+      <div class="part-head">
+        <span class="eyebrow kicker">Plan</span>
+        <h2 class="display" id="plan-h">Run order</h2>
+        <p>What has landed, then tabs and the rest of the Mac basics, the features for ML and HPC work, and the deeper core changes. The order follows the build order in <code>docs/NEXT.md</code>. The first unfinished step is marked Next.</p>
+      </div>
+      <div class="progress" aria-live="polite">
+        <div class="label"><span id="progress-text">— done</span><span id="sync" class="sync">Loading statuses…</span></div>
+        <div class="track"><i class="p-done" id="bar-done" style="width:0%"></i><i class="p-doing" id="bar-doing" style="width:0%"></i></div>
+      </div>
+    </div>
+    <div class="sizes">
+      <span><b>S</b> an hour or two</span><span><b>M</b> about a session</span><span><b>L</b> several sessions</span>
+      <span>Sizes are rough. Short codes are the commits a step comes from.</span>
+    </div>
+    <div id="phases"></div>
+    <p class="plan-foot">Built from the git log, <code>docs/NEXT.md</code>, the Tachyon Next concept and this week's sessions. Statuses are shared: anyone who can edit this page can change them, and Claude updates them as steps land.</p>
+  </section>
+
+  <section class="part" id="concept" aria-labelledby="concept-h">
+    <div class="part-head">
+      <span class="eyebrow kicker">Concept · Tachyon Next</span>
+      <h2 class="display" id="concept-h">What Tachyon is for</h2>
+      <p>The Tachyon Next concept from 8 Nov, merged in here and kept current. A terminal for ML, AI, systems and HPC work from a MacBook, built on Metal, Core Text and Core Animation. It draws only what changed, does nothing at all when idle, and adds features other terminals don't have. Each part is marked against the installed app and the measurements on your M2 Pro.</p>
+    </div>
+    <div class="c-legend"><span><span class="s-b">Built</span> in the installed app</span><span><span class="s-p">Partly built</span> some of it works</span><span><span class="s-n">Planned</span> in the run order above</span></div>
+    <nav class="g-toc" aria-label="Concept sections">
+      <a href="#c-features">Features</a><a href="#c-work">Your work</a><a href="#c-look">Look</a><a href="#c-pipeline">Pipeline</a><a href="#c-budgets">Budgets</a>
+    </nav>
+
+    <div class="c-sub" id="c-features">
+      <h3>What other terminals don't do</h3>
+      <p>Seven features, each built on something Tachyon already has (a parser fast enough to replay gigabytes, a per-row damage map) plus what macOS exposes: per-process energy and P-core accounting, Core Animation and display links. “Closest today” is as far as we know, from the public docs of Terminal.app, iTerm2, Ghostty, WezTerm, kitty, Alacritty and Warp. Ghostty is the closest relative on the Mac; these features and the measured efficiency are Tachyon's argument.</p>
+      <div class="c-grid">
+        <article class="c-card paper"><span class="legend">ML · HPC · Systems</span>
+          <div class="bl-head"><h5>Run receipts, with energy</h5><span class="pill ok">Built</span></div>
+          <p>Every command gets a receipt on its prompt line: exit code, wall time, CPU time and its share on performance cores, energy, and peak memory footprint. On unified memory, the footprint decides whether the next batch fits.</p>
+<div class="how"><span class="o">✓</span> <span class="v">3m52s</span> · cpu <span class="v">11m40s</span> (P <span class="v">88%</span>) · <span class="w">2.3 Wh</span> · <span class="v">9.4 GB</span></div>
+          <p>Command boundaries come from OSC 133. CPU is exact, from the shell's child accounting; the rest is sampled every half second with <code>proc_pid_rusage</code>. A long command that finishes while you're elsewhere posts a notification with its receipt. Works in zsh, bash and fish. <b>Still to do:</b> kqueue exits for very short children.</p>
+          <p class="closest"><b>Closest today:</b> exit status and sometimes duration. Energy and P-core share per command are new.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">ML · AI</span>
+          <div class="bl-head"><h5>Metric lens</h5><span class="pill ok">Built</span></div>
+          <p>Numbers in output that look like metrics (<code>loss=</code>, <code>acc</code>, <code>it/s</code>, <code>tok/s</code>, tqdm's <code>45%|</code>) become a readout on the prompt line, with a sparkline of the loss. A tqdm bar drives a progress bar on the Dock icon. The output stream is read as lines, so tqdm's in-place redraws count; floods are only sampled.</p>
+<div class="how">❯ python train.py    <span class="a">loss 0.398 ▇▆▅▄▃▂</span> · 48.2 it/s · 45% · running 3m</div>
+          <p class="closest"><b>Closest today:</b> TensorBoard or W&amp;B, outside the terminal. Some terminals honour OSC 9;4, which tqdm doesn't send.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">ML · Systems · HPC</span>
+          <div class="bl-head"><h5>Rerun diff</h5><span class="pill ok">Built</span></div>
+          <p>Run a command again and lines that differ from the last run get a gutter mark; hover one to see the old line. Compare two learning rates or two benchmark runs without leaving the terminal. Matched by structure first, then a Myers diff on lines.</p>
+<div class="how"><span class="w">~</span> <span class="v">epoch 2  train 3.902  val 3.807  acc 12.4%</span>
+  was     train 3.704  val 3.640  acc 15.6%</div>
+          <p class="closest"><b>Closest today:</b> copying both outputs into a diff tool by hand.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">HPC · ML</span>
+          <div class="bl-head"><h5>Job tabs</h5><span class="pill ok">Built</span></div>
+          <p>The MacBook submits; forge and atlas run. When output contains a job ID (a detached Nexus job, or Slurm's <code>Submitted batch job N</code>), Tachyon offers to open it as a tab that follows the log. Its name shows its state (<code>nexus j-1a2b3c4d · running on forge</code>), and when it ends its receipt and notification say how. Slurm jobs submitted over ssh are followed through the same ssh. Diagram below.</p>
+          <p class="closest"><b>Closest today:</b> <code>nexus logs</code> or <code>squeue</code> plus <code>tail -f</code>, by hand.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">ML · HPC</span>
+          <div class="bl-head"><h5>Runs that outlive the window</h5><span class="pill ok">Built</span></div>
+          <p><b>Built:</b> the host (the app's own binary, started on demand) owns the shells and keeps their screens; quitting, a crash or an update leaves runs going, and reopening puts windows, tabs and splits back. <b>Also built:</b> keep-awake per command (⌥⌘A), held by the host. <b>Still to do:</b> Rewind history across a restart. <b>Planned:</b> <code>tachyon-host</code> owns the shells and Rewind logs; the app is a client. Quitting, crashing or updating it leaves runs going. Opt in per command and the host keeps the Mac awake while it runs, releasing that when the receipt closes.</p>
+          <p class="closest"><b>Closest today:</b> tmux or WezTerm's mux server, plus <code>caffeinate -i</code> by hand.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">Systems · AI</span>
+          <div class="bl-head"><h5>Latency ledger</h5><span class="pill ok">Built</span></div>
+          <p>Every keystroke is timed through its whole path and the delay split between the shell, ssh and the terminal. Each stage is also an <code>os_signpost</code> interval, so Instruments shows Tachyon's own frames.</p>
+<div class="how">key→pty <span class="v">0.1</span>  echo <span class="w">1.4</span>  parse <span class="v">0.02</span>  draw <span class="v">0.4</span>  on glass <span class="a">2.2</span> ms</div>
+          <p class="closest"><b>Closest today:</b> Typometer, or filming the screen with a high-speed camera.</p>
+        </article>
+      </div>
+
+      <figure class="g-diagram paper">
+        <span class="legend">Rewind · built</span>
+        <div class="scroll">
+          <svg viewBox="0 0 660 150" role="img" aria-label="Rewind keeps each tab's raw output in a log with a screen snapshot every 8 MiB on disk, so seeking to any moment replays at most 8 MiB from the nearest snapshot">
+            <text class="dg-hd" x="20" y="22">One tab's raw output, kept on disk</text>
+            <rect class="dg-box" x="20" y="38" width="620" height="30" rx="5"/>
+            <rect class="dg-seek" x="407.5" y="38" width="58" height="30"/>
+            <g class="dg-snap">
+              <rect x="20" y="32" width="2.5" height="42"/><rect x="97.5" y="32" width="2.5" height="42"/><rect x="175" y="32" width="2.5" height="42"/><rect x="252.5" y="32" width="2.5" height="42"/><rect x="330" y="32" width="2.5" height="42"/><rect x="407.5" y="32" width="2.5" height="42"/><rect x="485" y="32" width="2.5" height="42"/><rect x="562.5" y="32" width="2.5" height="42"/>
+            </g>
+            <polygon class="dg-head-fill" points="465.5,30 460,22 471,22"/>
+            <text class="dg-sm" x="476" y="25">the moment you scrub to</text>
+            <text class="dg-sm" x="20" y="88">0</text><text class="dg-smm" x="175" y="88">16 MiB</text><text class="dg-smm" x="330" y="88">32 MiB</text><text class="dg-smm" x="485" y="88">48 MiB</text><text class="dg-sm" x="640" y="88" text-anchor="end">64 MiB</text>
+            <rect class="dg-snap" x="20" y="108" width="10" height="10" rx="2"/><text class="dg-txt" x="38" y="117">a snapshot of the screen per 8 MiB segment on disk; every 2 MiB in the newest 32 MiB</text>
+            <rect class="dg-seek" x="20" y="128" width="10" height="10" rx="2"/><text class="dg-txt" x="38" y="137">a seek loads the snapshot before it and replays the rest: 15.8 ms on disk, 3.9 ms in memory</text>
+          </svg>
+        </div>
+        <figcaption><b>Built:</b> the newest 32 MiB of a tab stay in memory; up to 512 MiB more go to <code>~/Library/Caches/Tachyon/Rewind</code>, LZ4-compressed by a background thread and deleted when the tab closes. The badge has a slider over every frame, and the wheel steps them. <b>Rewind</b> scrubs the screen back to any moment, including the alternate screen where htop, nvtop, vim and agent UIs draw and which scrollback never keeps. The stream is the one <code>TACHYON_DUMP</code> already records. Option-click a cell in a rewound frame for <b>cell provenance</b>: the escape sequence and byte offset that last wrote it. Keys: <kbd>⌘[</kbd> back, <kbd>⌘]</kbd> to live.</figcaption>
+      </figure>
+
+      <figure class="g-diagram paper">
+        <span class="legend">Job tabs · built</span>
+        <div class="scroll">
+          <svg viewBox="0 0 660 176" role="img" aria-label="Job tabs: Tachyon on the MacBook submits a detached job to Nexus, which runs it on forge or atlas; the job's tab follows its log and state back through Nexus">
+            <defs><marker id="ah-job" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="dg-head-fill" d="M0,0 L8,4 L0,8 z"/></marker></defs>
+            <rect class="dg-q" x="20" y="58" width="180" height="62" rx="10"/>
+            <text class="dg-hd" x="34" y="83">Tachyon on the MacBook</text>
+            <text class="dg-sm" x="34" y="102">one tab per job ID it sees</text>
+            <rect class="dg-box" x="270" y="58" width="130" height="62" rx="10"/>
+            <text class="dg-hd" x="284" y="83">Nexus</text>
+            <text class="dg-sm" x="284" y="102">tickets you accept</text>
+            <rect class="dg-box" x="480" y="18" width="160" height="50" rx="10"/>
+            <text class="dg-hd" x="494" y="40">forge</text><text class="dg-sm" x="494" y="57">RTX 4090 · GPU jobs</text>
+            <rect class="dg-box" x="480" y="110" width="160" height="50" rx="10"/>
+            <text class="dg-hd" x="494" y="132">atlas</text><text class="dg-sm" x="494" y="149">Mac mini · CPU jobs</text>
+            <line class="dg-wire" x1="200" y1="76" x2="268" y2="76" marker-end="url(#ah-job)"/>
+            <text class="dg-smm" x="235" y="69">submit</text>
+            <line class="dg-wire" x1="270" y1="104" x2="202" y2="104" marker-end="url(#ah-job)"/>
+            <text class="dg-smm" x="235" y="122">log + state</text>
+            <line class="dg-wire" x1="400" y1="74" x2="478" y2="48" marker-end="url(#ah-job)"/>
+            <line class="dg-wire" x1="400" y1="104" x2="478" y2="130" marker-end="url(#ah-job)"/>
+            <text class="dg-sm" x="420" y="92">runs</text>
+          </svg>
+        </div>
+        <figcaption>When output shows a job ID, Tachyon offers a tab for it. The tab follows the log through <code>nexus logs</code>, and its name reads <b>queued</b>, <b>running</b> or <b>done</b>, with a dot when it ends, like the tabs you have now. Slurm comes after Nexus as a second adapter.</figcaption>
+      </figure>
+    </div>
+
+    <div class="c-sub" id="c-work">
+      <h3>The moments it's built for</h3>
+      <p>The MacBook is where you edit, smoke-test and watch; forge and atlas do the heavy lifting.</p>
+      <div class="flows">
+        <div class="flow paper"><span class="legend">ML</span>
+          <p class="moment">The smoke test runs on MPS here; the real 30-epoch run goes to forge and dies at epoch 17.</p>
+          <ul>
+            <li><b>Receipts</b> show the local run's peak footprint and energy <span class="s-b">Built</span></li>
+            <li><b>Tabs</b> keep the editor, the run and the logs together <span class="s-b">Built</span></li>
+            <li><b>Job tab</b> follows the forge run through Nexus <span class="s-b">Built</span></li>
+            <li><b>Rewind</b> to the GPU monitor in the minute before the crash <span class="s-b">Built</span></li>
+          </ul>
+        </div>
+        <div class="flow paper"><span class="legend">AI</span>
+          <p class="moment">MLX or llama.cpp serving on the M2 Pro while an agent CLI redraws its screen for an hour.</p>
+          <ul>
+            <li><b>Packed scrollback</b>: every GB the terminal holds is one the model can't use <span class="s-b">Built</span></li>
+            <li><b>Metric lens</b> picks up tok/s from server logs <span class="s-b">Built</span></li>
+            <li><b>Rewind</b> to what the agent UI showed before it redrew <span class="s-b">Built</span></li>
+            <li><b>Two clocks</b>: a token flood draws at 30 fps, not 120 <span class="s-n">Planned</span></li>
+          </ul>
+        </div>
+        <div class="flow paper"><span class="legend">Systems</span>
+          <p class="moment">Is the lag your shell, ssh or the terminal? And why does this TUI draw garbage?</p>
+          <ul>
+            <li><b>Receipts</b> compare energy across two builds <span class="s-b">Built</span></li>
+            <li><b>Latency ledger</b> splits shell, ssh and terminal delay <span class="s-b">Built</span></li>
+            <li><b>Cell provenance</b> traces a bad cell to its escape sequence <span class="s-b">Built</span></li>
+            <li><b>Signposts</b> put Tachyon's frames in Instruments <span class="s-n">Planned</span></li>
+          </ul>
+        </div>
+        <div class="flow paper"><span class="legend">HPC</span>
+          <p class="moment"><code>sbatch</code> over ssh, then wait. Then a 2 GiB log you need to search.</p>
+          <ul>
+            <li><b>Packed scrollback</b>: 100k lines in 78 MiB, measured <span class="s-b">Built</span></li>
+            <li><b>Job tabs</b> follow Slurm and Nexus jobs by ID <span class="s-b">Built</span></li>
+            <li><b>Rewind</b> seeks anywhere in the log in under 40 ms <span class="s-b">Built</span></li>
+            <li><b>Session host</b> keeps ssh sessions alive across restarts <span class="s-b">Built</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="c-sub" id="c-look">
+      <h3>Native where macOS is native, cells everywhere else</h3>
+      <p>The window, menus and shortcuts are Apple's own, so Tachyon behaves like every other Mac app. Inside the window, everything Tachyon adds sits on the same cell grid as the text.</p>
+      <div class="c-grid">
+        <article class="c-card paper"><span class="legend">Chrome</span>
+          <div class="bl-head"><h5>Apple's chrome, or none</h5><span class="pill ok">Built</span></div>
+          <p>A real <code>NSWindow</code> with the standard menu bar, ⌘ shortcuts and Stage Manager, on <b>Liquid Glass</b>. You use <b>edge-to-edge</b>: no title bar, buttons on hover in the top-left corner, tabs along the bottom. A <b>standard</b> layout puts a title bar on the glass with the tabs in it (View > Show Title Bar). <b>Full screen around the notch</b> (⌥⌘F) puts the tabs left of the notch and a status line right of it.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">Appearance</span>
+          <div class="bl-head"><h5>Follows the system</h5><span class="pill ok">Built</span></div>
+          <p><b>Built:</b> paired light and dark palettes that switch with Light and Dark Mode, the system accent colour for the cursor and selection with <code>accent</code>, an opaque window with Reduce Transparency, and with Increase Contrast, high-contrast themes derived from yours (every ANSI colour at 7:1) on solid glass.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">Layout</span>
+          <div class="bl-head"><h5>The grid is the layout</h5><span class="pill ok">Built</span></div>
+          <p>Command bars, receipts and the tab strip are drawn in cells, aligned to the text, and the window resizes in whole cells so there's never a sliver. A command is marked by a one-cell gutter bar, not a card, so copying gets exactly what the program wrote. Split panes will land on cell boundaries too.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">Type</span>
+          <div class="bl-head"><h5>Fonts rendered the Mac way</h5><span class="pill info">Partly built</span></div>
+          <p>Glyphs are rasterised by Core Text at the display's backing scale with grayscale antialiasing, and fallback comes from <code>CTFontCreateForString</code>. The concept proposed SF Mono; you chose <b>Cascadia Mono</b>, with SF Mono as the fallback. <b>Still to do:</b> ligatures and emoji sequences through Core Text shaping.</p>
+        </article>
+        <article class="c-card paper"><span class="legend">Icon</span>
+          <div class="bl-head"><h5>One cursor, moving faster than it should</h5><span class="pill ok">Built</span></div>
+          <div class="icon-row">
+            <svg width="64" height="64" viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="tr-c" x1="0" x2="1"><stop offset="0" stop-color="var(--mark)" stop-opacity="0"/><stop offset=".7" stop-color="var(--mark)" stop-opacity=".08"/><stop offset="1" stop-color="var(--mark)" stop-opacity=".32"/></linearGradient></defs><rect class="sq" x="1" y="1" width="98" height="98" rx="24" style="fill:var(--icon-bg);stroke:var(--line-strong)"/><rect x="21" y="38" width="38" height="25" fill="url(#tr-c)"/><rect x="57" y="38" width="15" height="25" rx="2" fill="var(--mark)"/></svg>
+            <p style="color:var(--dim);font-size:14px;flex:1 1 200px">Most terminal icons are a <code>&gt;_</code> prompt. Tachyon's is the block cursor on a dark squircle with a trail behind it. Below 32 pt the trail is dropped and the cursor grows. It ships as two Icon Composer layers so macOS can make the Clear and Tinted looks.</p>
+          </div>
+        </article>
+        <article class="c-card paper"><span class="legend">Mac details</span>
+          <div class="bl-head"><h5>Expected on a Mac</h5><span class="pill ok">Built</span></div>
+          <p><kbd>⌘↑</kbd>/<kbd>⌘↓</kbd> between commands, left and right Option set to Meta independently, Quick Look on ⌘-click of a path, ⌘-click to open a URL, and Secure Keyboard Entry that turns on by itself while a password prompt has echo off.</p>
+        </article>
+      </div>
+    </div>
+
+    <div class="c-sub" id="c-pipeline">
+      <h3>The pipeline on Apple silicon</h3>
+      <p>Output takes seven stages from the shell to the screen. The terminal core in <code>src/term</code> is portable and ran on the Mac unchanged; the window, PTY and renderer are new for macOS.</p>
+      <figure class="g-diagram paper">
+        <span class="legend">From PTY bytes to pixels</span>
+        <div class="scroll">
+          <svg viewBox="0 0 700 172" role="img" aria-label="The seven stages from the shell's bytes to the screen: read, scan, build, draw and compose are built; apply and present are partly built">
+            <defs><marker id="ah-pipe" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="dg-head-fill" d="M0,0 L8,4 L0,8 z"/></marker></defs>
+            <text class="dg-sm" x="13" y="24">the shell's bytes in</text>
+            <text class="dg-sm" x="687" y="24" text-anchor="end">pixels on screen</text>
+            <rect class="dg-built" x="13" y="36" width="86" height="46" rx="8"/><text class="dg-hdm" x="56" y="64">Read</text>
+            <rect class="dg-built" x="111" y="36" width="86" height="46" rx="8"/><text class="dg-hdm" x="154" y="64">Scan</text>
+            <rect class="dg-part" x="209" y="36" width="86" height="46" rx="8"/><text class="dg-hdm" x="252" y="64">Apply</text>
+            <rect class="dg-built" x="307" y="36" width="86" height="46" rx="8"/><text class="dg-hdm" x="350" y="64">Build</text>
+            <rect class="dg-built" x="405" y="36" width="86" height="46" rx="8"/><text class="dg-hdm" x="448" y="64">Draw</text>
+            <rect class="dg-part" x="503" y="36" width="86" height="46" rx="8"/><text class="dg-hdm" x="546" y="64">Present</text>
+            <rect class="dg-built" x="601" y="36" width="86" height="46" rx="8"/><text class="dg-hdm" x="644" y="64">Compose</text>
+            <g class="dg-wire" marker-end="url(#ah-pipe)">
+              <line x1="99" y1="59" x2="109" y2="59" marker-end="url(#ah-pipe)"/><line x1="197" y1="59" x2="207" y2="59" marker-end="url(#ah-pipe)"/><line x1="295" y1="59" x2="305" y2="59" marker-end="url(#ah-pipe)"/><line x1="393" y1="59" x2="403" y2="59" marker-end="url(#ah-pipe)"/><line x1="491" y1="59" x2="501" y2="59" marker-end="url(#ah-pipe)"/><line x1="589" y1="59" x2="599" y2="59" marker-end="url(#ah-pipe)"/>
+            </g>
+            <text class="dg-smm" x="56" y="100">forkpty reader,</text><text class="dg-smm" x="56" y="114">128 KiB reads</text>
+            <text class="dg-smm" x="154" y="100">NEON scanner,</text><text class="dg-smm" x="154" y="114">≈ 14 GiB/s</text>
+            <text class="dg-smm" x="252" y="100">packed history;</text><text class="dg-smm" x="252" y="114">screen is cells</text>
+            <text class="dg-smm" x="350" y="100">shared buffers,</text><text class="dg-smm" x="350" y="114">ring of three</text>
+            <text class="dg-smm" x="448" y="100">three passes,</text><text class="dg-smm" x="448" y="114">Core Text atlas</text>
+            <text class="dg-smm" x="546" y="100">pauses when idle;</text><text class="dg-smm" x="546" y="114">two clocks: to do</text>
+            <text class="dg-smm" x="644" y="100">cursor layer;</text><text class="dg-smm" x="644" y="114">Liquid Glass</text>
+            <rect class="dg-built" x="13" y="146" width="16" height="12" rx="3"/><text class="dg-txt" x="36" y="156">Built</text>
+            <rect class="dg-part" x="86" y="146" width="16" height="12" rx="3"/><text class="dg-txt" x="109" y="156">Partly built</text>
+          </svg>
+        </div>
+        <figcaption>Every stage is native to the Mac now. Two of the concept's ideas aren't built yet: <b>two clocks</b> (120 Hz for keystrokes, 30 fps for floods of output) and a <b>persistent screen texture</b> where scrolling is a blit. Measure the second against full redraws first: on a tile-based GPU a full redraw may already be cheap enough.</figcaption>
+      </figure>
+      <div class="table-card paper"><span class="legend">Stage by stage</span>
+        <div class="table-wrap"><table class="budget-table">
+          <thead><tr><th>Stage</th><th>On the Mac now</th><th>Still to do</th></tr></thead>
+          <tbody>
+            <tr><td>Read</td><td>forkpty with a login shell; a reader thread per tab with 128 KiB reads, so keystrokes never wait on output</td><td>Lower the reader's priority when the window is hidden, so macOS can move it to the efficiency cores; tee into the Rewind log</td></tr>
+            <tr><td>Scan</td><td>NEON: two 16-byte vectors per step, about 14 GiB/s, up from 8.3 with the portable scanner</td><td>Keep valid UTF-8 like tqdm's █▊ bars on the fast path; target ≥ 20 GiB/s</td></tr>
+            <tr><td>Apply</td><td>Scrollback rows packed as bytes plus style runs: 100k lines in 78 MiB instead of 420 MiB</td><td>The writes into on-screen cells now limit throughput; that's the path toward 1 GiB/s</td></tr>
+            <tr><td>Build</td><td>Only dirty rows become instances, written straight into shared-memory Metal buffers, no upload</td><td>Nothing planned</td></tr>
+            <tr><td>Draw</td><td>Three instanced passes ported to Metal shaders; Core Text atlas at 2× with grayscale coverage; colour emoji</td><td>Ligatures and emoji sequences through shaping</td></tr>
+            <tr><td>Present</td><td>A display link that pauses after three idle refreshes; two drawables</td><td>Two clocks on ProMotion; a persistent screen texture, if it measures faster</td></tr>
+            <tr><td>Compose</td><td>The blinking cursor is its own Core Animation layer, so blinking costs no frames. Liquid Glass behind a clear Metal layer, with only the default background translucent</td><td>Nothing planned</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <div class="c-sub" id="c-budgets">
+      <h3>Numbers the Mac version has to hit</h3>
+      <p>Each feature has to fit these budgets before it ships. If one can't, it waits. “Now” is measured on your M2 Pro unless it says otherwise.</p>
+      <div class="table-card paper"><span class="legend">Budgets</span>
+        <div class="table-wrap"><table class="budget-table">
+          <thead><tr><th>Budget</th><th>At the concept</th><th>Now</th><th>Target</th><th></th></tr></thead>
+          <tbody>
+            <tr><td>CPU while idle</td><td class="n">1.9 redraws/s</td><td class="n">0.0%, no wake-ups</td><td class="n">0.0</td><td><span class="pill ok">Met</span></td></tr>
+            <tr><td>App bundle</td><td class="n">740 KB (Windows)</td><td class="n">803 KB binary</td><td class="n">≤ 2 MB</td><td><span class="pill ok">Met</span></td></tr>
+            <tr><td>Scanner</td><td class="n">8.28 GiB/s</td><td class="n">13.8–14.2 GiB/s</td><td class="n">≥ 20 GiB/s</td><td><span class="pill info">Closer</span></td></tr>
+            <tr><td>Plain text, end to end</td><td class="n">448 MiB/s</td><td class="n">2.3 GiB/s</td><td class="n">≥ 1 GiB/s</td><td><span class="pill ok">Met</span></td></tr>
+            <tr><td>Build logs and TUI redraws</td><td class="n">223 MiB/s</td><td class="n">244–296 MiB/s</td><td class="n">≥ 400 MiB/s</td><td><span class="pill info">Closer</span></td></tr>
+            <tr><td>Scrollback, 100k lines</td><td class="n">420 MiB</td><td class="n">78 MiB</td><td class="n">≤ 16 MiB</td><td><span class="pill info">Closer</span></td></tr>
+            <tr><td>Keystroke to screen, Tachyon's share</td><td class="n">33–35 ms total</td><td class="n">23–25 ms total; frame wait 1–2 ms, display 17–18 ms (two refreshes)</td><td class="n">≤ 1 ms + next refresh</td><td><span class="pill info">Closer</span></td></tr>
+            <tr><td>Window hidden</td><td class="n">—</td><td class="n">not measured</td><td class="n">0 fps, efficiency cores</td><td><span class="pill muted">To measure</span></td></tr>
+            <tr><td>Rewind seek</td><td class="n">—</td><td class="n">3.9–15.8 ms</td><td class="n">≤ 40 ms</td><td><span class="pill ok">Met</span></td></tr>
+            <tr><td>Launch to first prompt</td><td class="n">—</td><td class="n">not measured</td><td class="n">≤ 150 ms warm</td><td><span class="pill muted">To measure</span></td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="part" id="backlog" aria-labelledby="backlog-h">
+    <div class="part-head">
+      <span class="eyebrow kicker">Backlog</span>
+      <h2 class="display" id="backlog-h">What's left after the plan</h2>
+      <p>The known limits of what shipped, and ideas that aren't scheduled. Items leave here when they land. Thirteen ideas were added on 9 Nov, after the plan finished; find in scrollback is first.</p>
+    </div>
+    <div class="filters">
+      <input class="search" id="bl-filter" type="search" placeholder="Filter: try “find”, “cluster” or “notch”" aria-label="Filter the backlog" autocomplete="off" spellcheck="false">
+      <span class="count" id="bl-count" aria-live="polite"></span>
+    </div>
+    <p class="empty" id="bl-empty" hidden>Nothing open matches.</p>
+    <div class="bl-grid" id="bl-grid">
+      <div class="bl-cell"><div class="bl-group paper"><span class="legend">Known gaps</span><p class="bl-intro">Rough edges in the installed app.</p><ul class="bl-list">
+        <li class="bl-item"><div class="bl-head"><h5>Emoji sequences</h5><span class="pill ok">Fixed</span></div><p class="bl-text">Skin tones, ZWJ families and flags now draw as one glyph, shaped by Core Text. Cells keep the widths the shell counts, so a family emoji leaves blank cells after it.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Display latency</h5><span class="pill ok">Fixed</span></div><p class="bl-text">Median keystroke to screen went from 33–35 ms to 23–25 ms, measured against the previous build under the same load. An idle window draws the echo at once; in a window, frames go to the compositor without waiting for vsync (<code>render.low_latency</code>); the link asks for 120 Hz and drops to 60 Hz while output streams. What's left is about two refreshes in the compositor.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Nerd Font branch icon</h5><span class="pill ok">Fixed</span></div><p class="bl-text">The branch symbol spanned 35 px in a 28 px cell: Powerline glyphs fill their own font's line, which is taller than Cascadia Mono's. The Nerd Font fallback is now sized so its line is the cell's and placed on the cell's box; icons sit inside the cell and Powerline arrows fill it exactly.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Increase Contrast palette</h5><span class="pill ok">Built</span></div><p class="bl-text">With Increase Contrast on, both themes switch to high-contrast versions derived from them: black or white background, every ANSI colour at 7:1 (4.5:1 for the dim suggestion slot), a solid selection, and the glass tinted solid. Follows the setting live; <code>theme.contrast</code> fixes it. Checked with <code>theme.contrast = high</code>; flipping the system setting is yours to try.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Receipts and right prompts</h5><span class="pill ok">Fixed</span></div><p class="bl-text">A receipt now sits just left of a right prompt (conda's <code>(base)</code> in fish, zsh's RPROMPT), keeping two blank cells from the command; checked side by side with the previous build, where it was hidden.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Packed lines still about 550 B each</h5><span class="pill ok">Fixed</span></div><p class="bl-text">Scrollback lines now share 64 KiB blocks with a 24-byte index entry each, instead of an allocation per line. Footprint per line, main vs now: build log 195 → 128 B, full and evicting 320 → 140 B, short lines 153 → 79 B, so a full 100,000-line scrollback of build output is about 13 MiB instead of 31. Throughput unchanged.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Receipts sample short children</h5><span class="pill muted">By design</span></div><p class="bl-text">CPU time is exact. P-core share, energy and peak footprint are sampled every half second, so a child that lives less than that can be missed. kqueue <code>NOTE_EXIT</code> would close that gap.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>MPS and MLX memory in the footprint</h5><span class="pill ok">Checked</span></div><p class="bl-text">GPU memory is in the receipt's footprint. Two 2 GiB PyTorch MPS tensors (4.00 GiB per MPS) read 4.14 GiB, the same as macOS's <code>footprint</code> tool; a touched 2 GiB Metal buffer, how MLX allocates, reads 2.01 GiB in both. MLX itself isn't installed, so it was checked through Metal. Safe to use for batch sizing.</p></li>
+      </ul></div></div>
+      <div class="bl-cell"><div class="bl-group paper"><span class="legend">Window layouts</span><p class="bl-intro">From the concept's <code>window.chrome</code> options. Edge-to-edge is built.</p><ul class="bl-list">
+        <li class="bl-item"><div class="bl-head"><h5>Edge-to-edge</h5><span class="pill ok">Built</span></div><p class="bl-text">The grid starts at the top edge, and the window buttons appear when the pointer reaches the top-left corner. This is the layout you use.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Standard layout with a title bar</h5><span class="pill ok">Built</span></div><p class="bl-text">View > Show Title Bar (or <code>window.layout = standard</code>): a title bar on the glass with the buttons and the tab's name; with two or more tabs, the glass capsule moves into the title bar. Costs three rows. The tabs are Tachyon's own in the capsule rather than AppKit's window tabs, which would make each tab a window of its own and lose splits and restore.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Full screen around the notch</h5><span class="pill ok">Built</span></div><p class="bl-text">⌥⌘F (View > Full Screen Around the Notch): borderless over the whole screen with the menu bar and Dock hidden while Tachyon is in front; tabs left of the notch, the running command (or folder) and the time right of it. <code>window.fullscreen = notch</code> makes the green button and ⌃⌘F do the same, and opens Tachyon that way. Fixed: ⌥⌘F only worked once, since leaving dropped keyboard focus. The window doesn't get a Space of its own.</p></li>
+      </ul></div></div>
+      <div class="bl-cell"><div class="bl-group paper"><span class="legend">Mac essentials</span><p class="bl-intro">Expected in any Mac terminal, and missing so far.</p><ul class="bl-list">
+        <li class="bl-item"><div class="bl-head"><h5>Find in scrollback (⌘F)</h5><span class="pill ok">Built</span></div><p class="bl-text">A glass find bar: search as you type, matches highlighted, <code>3 of 12</code>, Return or ⌘G up to older output, ⇧Return or ⌘⇧G down, Esc to close, smart case and a Regex checkbox. Searches cross wrapped lines; 12–18 ms over 100,000 lines. Tried in the app and merged. Not yet: searching one command's output alone.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Reopen a closed tab or pane (⌥⌘T)</h5><span class="pill ok">Built</span></div><p class="bl-text">A tab, split pane or window closed by hand is kept ten minutes with its shells running and read; ⌥⌘T brings the last back as a tab, splits and all, as it is now (⌘⇧T was taken by Fairy's global shortcut). Up to ten kept; quitting ends them; a shell that exits by itself isn't kept. Checked in a test copy through its menus. Tried in the app and merged in <a href="https://github.com/razeenwasif/Tachyon/pull/32">#32</a>. Closing the last window quit Tachyon: that was Vorssaint's Auto Quit (it sends a Quit event when an app's last window closes), not Tachyon; adding Tachyon to its Auto Quit exceptions keeps closed tabs reopenable after the last window. Noticed: closing the last window makes macOS send Tachyon a Quit event (older builds too), which ends the kept tabs.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>VoiceOver</h5><span class="pill muted">Idea</span></div><p class="bl-text">Expose the grid to accessibility, so VoiceOver can read output and the prompt. The one big gap among the Mac accessibility settings.</p></li>
+      </ul></div></div>
+      <div class="bl-cell"><div class="bl-group paper"><span class="legend">ML and the cluster</span><p class="bl-intro">For training runs, plots and jobs on the home cluster.</p><ul class="bl-list">
+        <li class="bl-item"><div class="bl-head"><h5>Inline images</h5><span class="pill ok">Built</span></div><p class="bl-text">iTerm2's protocol (OSC 1337, multipart too) and kitty's graphics protocol (PNG and raw pixels, chunked, ids, show again and delete, replies). Images scroll with their lines into the scrollback; <code>clear</code> removes them; wide ones scale down to fit. Cell pixel size reported for tools. Tried in the app with <code>scripts/image-test.py</code> and merged in <a href="https://github.com/razeenwasif/Tachyon/pull/28">#28</a>, with 13 new tests. Not yet: images after a reattach, GIF animation, kitty file and compressed transfers.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Images through tmux</h5><span class="pill ok">Built</span></div><p class="bl-text">Sixel support, advertised in DA1, so tmux 3.5 passes its images on and redraws them; images follow region scrolls; text over an iTerm2 or sixel image replaces it; whole-row erases clear kitty images so none hang over another tmux window. Also fixed: tmux's DA2 query got the DA1 answer and leaked <code>62;22c</code> into the shell, and <code>CSI &gt; 4;1 m</code> underlined text. Checked by replaying real tmux 3.5a output. Seen working: the sixel chart through tmux. Merged in <a href="https://github.com/razeenwasif/Tachyon/pull/29">#29</a>.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Suggestions in tmux</h5><span class="pill ok">Built</span></div><p class="bl-text">The zsh, bash and fish integrations load inside tmux and send their OSC 133 marks through its passthrough, with an ECH first so tmux sends the prompt before the input mark; Tachyon takes marks on the alternate screen. Suggestions, receipts and margin bars then work in tmux panes. The line is now near the top of your <code>~/.zshrc</code> (backup at <code>~/.zshrc.before-tachyon-tmux</code>). Checked by replaying real tmux 3.5a with zsh and bash. Merged in <a href="https://github.com/razeenwasif/Tachyon/pull/29">#29</a>.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Training charts</h5><span class="pill ok">Built</span></div><p class="bl-text">Click a command's metrics (or ⌥⌘C) for a live panel: a plot per metric, up to four, by the step the log reports; the last run of the same command (numbers aside) dashed beside it, with its value at the same step. Whole runs kept, thinned evenly to about 2,000 points. Tried in the app and merged in <a href="https://github.com/razeenwasif/Tachyon/pull/30">#30</a>, with 10 new tests. Try <code>python3 scripts/train-demo.py --lr 3e-4</code>, then <code>--lr 1e-3</code>.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Job notifications with Tachyon closed</h5><span class="pill ok">Built</span></div><p class="bl-text">The session host spots Nexus and Slurm submissions in every shell and checks them every 30 s while any is going (<code>nexus jobs --all</code>; <code>squeue</code>/<code>sacct</code> over the submission's ssh). When one ends with no window showing its shell, the host posts the notification: the job, how it ended, the command; a click opens that shell. Tested with a real host in-process, tried in the app, and merged in <a href="https://github.com/razeenwasif/Tachyon/pull/38">#38</a>.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Rewind across restarts</h5><span class="pill muted">Idea</span></div><p class="bl-text">The session host keeps the Rewind log, so reopening Tachyon keeps history from before you quit, not just the current screen.</p></li>
+      </ul></div></div>
+      <div class="bl-cell"><div class="bl-group paper"><span class="legend">Command output</span><p class="bl-intro">Using the shell-integration marks for more than receipts.</p><ul class="bl-list">
+        <li class="bl-item"><div class="bl-head"><h5>Command blocks</h5><span class="pill ok">Built</span></div><p class="bl-text">Click a command's bar in the margin to select its output; ⌥⌘O copies the selected or last command's output; ⌥⌘K (or ⌥-click the bar) folds a long output to one line, keeping its last three lines, and a click or ⌥⌘K unfolds it. Folded lines are taken out of the grid and kept packed, so nothing else needs remapping; copying still includes them. Tried in the app and merged in <a href="https://github.com/razeenwasif/Tachyon/pull/33">#33</a>, with 3 new tests.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Ask Fairy about the screen</h5><span class="pill ok">Built</span></div><p class="bl-text">Fairy's icon at the bottom right (and ⌥⌘I) opens a glass card: Explain this, Why did it fail?, Fix it, Summarize, or your own question; her answer streams in, in her name. Each question takes the screen, the last command with its exit status and output (or the selection), and the folder, as material rather than instructions. Through a private socket Fairy now opens in her data folder (Lyra branch <code>tachyon-link</code>, c09db8d, installed); kept in Fairy as a Terminal chat. Replaces the “Explain this failure” idea. Merged in <a href="https://github.com/razeenwasif/Tachyon/pull/34">#34</a>; checked against a stand-in Fairy and the real socket's hello; a real question not yet tried. Lyra's <code>tachyon-link</code> is unmerged, for you to merge.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Shortcut hints</h5><span class="pill ok">Built</span></div><p class="bl-text">A band along the bottom lists shortcuts, what fits the moment first (Tab for a suggestion, ⌥⌘I when a command failed, ⌥⌘K for a long output), then ⌘T, ⌘D, ⌘F, ⌘[, ⌥⌘O, ⌥⌘C, ⌥⌘T, ⌘↑. <code>window.hints = false</code> turns it off. Merged in <a href="https://github.com/razeenwasif/Tachyon/pull/34">#34</a>.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Open tracebacks in your editor</h5><span class="pill ok">Built</span></div><p class="bl-text">⌘-click a Python traceback's <code>File "train.py", line 142</code> (even wrapped), a compiler's <code>src/main.rs:42:7</code> or a stack trace's <code>(app.js:10:5)</code> to open it at that line; ⌥⌘-click any file. <code>editor = auto</code> picks Zed here (then VS Code, Cursor, Sublime, $EDITOR, nvim/vim); terminal editors and custom commands open in a new tab. Tried in the app and merged in <a href="https://github.com/razeenwasif/Tachyon/pull/35">#35</a>.</p></li>
+      </ul></div></div>
+      <div class="bl-cell"><div class="bl-group paper"><span class="legend">Mac polish</span><p class="bl-intro">Smaller touches.</p><ul class="bl-list">
+        <li class="bl-item"><div class="bl-head"><h5>Quick terminal from the notch</h5><span class="pill ok">Built</span></div><p class="bl-text">⌃` from any app drops a borderless terminal from the top of the screen the pointer is on, out of the notch, over full-screen apps and on every Space; ⌃` again or a click elsewhere slides it away, and focus goes back to the app you were in. It keeps its shell between showings and, with the session host, across restarts. <code>quick.hotkey</code> changes the key; a system hotkey, no accessibility permission. First version brought Tachyon's other windows onto the Stage Manager stage; it's now a non-activating panel (a3faf7e). Tried in the app and merged in <a href="https://github.com/razeenwasif/Tachyon/pull/36">#36</a>.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>System monitor card</h5><span class="pill ok">Built</span></div><p class="bl-text">A gauge left of Fairy's icon (and ⌥⌘U) pulls up a glass card read once a second while it shows: CPU overall and per core with history and load, GPU busy share, memory as Activity Monitor counts it with pressure and swap, network in and out, disk free, battery and thermal state, and the six busiest of your processes. Tried in the app and merged in <a href="https://github.com/razeenwasif/Tachyon/pull/37">#37</a>.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Neutrino card &amp; SSH machines</h5><span class="pill ok">Built</span></div><p class="bl-text">A branch button left of the gauge (and ⌘⇧N) opens a glass card showing the focused shell's repo (branch, ahead/behind, changed files, recent CI runs) and <code>ntr inbox</code>; clicking an item types its <code>ntr</code> command at the prompt. Over ssh on <code>kagutsuchi</code> it runs <code>ntr</code> there, and the session host polls the inbox to notify on finished runs even when closed. Shell &gt; New Tab On lists <code>~/.ssh/config</code> hosts with reachability dots and inline <code>ssh </code> suggestions. Merged in Neutrino PR #1 (<code>afa5a24</code>) and installed.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Rex-style multi-host multiplexer</h5><span class="pill warn">Partly built</span></div><p class="bl-text">Milestone 1 landed on <code>mux-server</code>: portable <code>tachyon server</code> (1.1 MB headless build), 9-byte framed Mux v2 protocol (22 µs median local echo), SSH stdio <code>tachyon bridge</code>, full automation CLI (<code>ls</code>, <code>new</code>, <code>split</code>, <code>run --wait</code>, <code>send</code>, <code>capture</code>, <code>events</code>, <code>hosts</code>), and live <code>launchd</code> deployment on Mac mini (<code>kagutsuchi</code>, 2.8–7.9 ms RTT). Next: Milestone 2 collapsible Liquid Glass multi-host sidebar &amp; pane headers, Milestone 3 OSC 7501 &amp; coding agent hooks, Milestone 4 Linux/Windows hosts. Full spec in <code>docs/REX_ARCHITECTURE.md</code>.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Danger colours for hosts</h5><span class="pill muted">Idea</span></div><p class="bl-text">Tint the window or the tab capsule when a pane is ssh'd into a host you mark as production or the cluster, so you always know where you're typing.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Broadcast input</h5><span class="pill muted">Idea</span></div><p class="bl-text">Type into every pane of a tab at once, to run the same command on several machines.</p></li>
+      </ul></div></div>
+      <div class="bl-cell"><div class="bl-group paper"><span class="legend">Out of scope</span><p class="bl-intro">Decided against for now.</p><ul class="bl-list">
+        <li class="bl-item"><div class="bl-head"><h5>The Windows build</h5><span class="pill muted">Legacy</span></div><p class="bl-text">The D3D11, DirectWrite and ConPTY backend stays in the repo but isn't maintained. All work targets the Apple silicon build.</p></li>
+        <li class="bl-item"><div class="bl-head"><h5>Importing Ghostty's config</h5><span class="pill muted">Not needed</span></div><p class="bl-text">You chose to keep Tachyon's own config. Starship works as it is.</p></li>
+      </ul></div></div>
+    </div>
+  </section>
+
+  <section class="part" id="guide" aria-labelledby="guide-h">
+    <div class="part-head">
+      <span class="eyebrow kicker">Guide</span>
+      <h2 class="display" id="guide-h">Using Tachyon</h2>
+      <p>Tachyon is a GPU terminal for your MacBook: Metal for drawing, Core Text for fonts, and a login zsh in every tab. The diagrams show how its parts work and a few everyday uses. This covers the installed app, as installed on 9 Nov at 09:57, and is updated after each build.</p>
+    </div>
+    <nav class="g-toc" aria-label="Guide sections">
+      <a href="#g-start">Getting started</a><a href="#g-window">The window</a><a href="#g-tabs">Tabs</a><a href="#g-panes">Split panes</a><a href="#g-host">Quitting and coming back</a><a href="#g-text">Text and the mouse</a><a href="#g-commands">Commands and receipts</a><a href="#g-settings">Settings</a><a href="#g-speed">Speed and efficiency</a><a href="#g-trouble">When something's off</a>
+    </nav>
+    <div class="guide">
+
+      <div class="g-block" id="g-start">
+        <h3>Getting started</h3>
+        <ol class="g-start">
+          <li class="paper"><b>Open it</b><p>Tachyon is in Applications. It opens one window running your login zsh, so your <code>.zshrc</code>, Starship and zoxide load as usual.</p></li>
+          <li class="paper"><b>Tabs and windows</b><p><kbd>⌘T</kbd> opens a tab and <kbd>⌘N</kbd> a window, each with its own shell. Closing the last window keeps Tachyon running; click its Dock icon for a new one.</p></li>
+          <li class="paper"><b>Find your commands</b><p>Each command gets a bar in the left gutter. <kbd>⌘↑</kbd> and <kbd>⌘↓</kbd> jump between them, and a receipt appears when one finishes.</p></li>
+          <li class="paper"><b>Change it</b><p>Settings live in <code>~/.config/Tachyon/tachyon.conf</code>. Yours sets new windows to 173 × 51 cells, about 1228 × 727 points; everything else is the default, like Cascadia Mono at 12 pt.</p></li>
+        </ol>
+      </div>
+
+      <div class="g-block" id="g-window">
+        <h3>The window</h3>
+        <p>The grid runs all the way to the top edge, so you get every row of the screen. The window buttons stay hidden until you need them.</p>
+        <div class="g-diagram paper">
+          <span class="legend">Edge-to-edge window</span>
+          <div class="scroll">
+            <svg viewBox="0 0 640 250" role="img" aria-label="A Tachyon window with numbered parts: the hover corner for the window buttons, the top edge for dragging, command bars in the gutter, and a receipt on a prompt line">
+              <rect class="dg-win" x="10" y="10" width="620" height="230" rx="12"/>
+              <rect class="dg-zone" x="12" y="12" width="84" height="34" rx="9"/>
+              <circle cx="30" cy="29" r="6" class="dg-crit"/><circle cx="49" cy="29" r="6" class="dg-light"/><circle cx="68" cy="29" r="6" class="dg-light"/>
+              <rect class="dg-bar" x="150" y="13" width="340" height="3" rx="1.5"/>
+              <rect class="dg-ok" x="16" y="58" width="3" height="40" rx="1.5"/>
+              <text class="dg-mono" x="30" y="70">❯ python train.py --epochs 3</text>
+              <text class="dg-monod" x="30" y="88">epoch 3/3  loss=0.412  acc=0.871</text>
+              <text class="dg-monod" x="372" y="70">✓ 3m52s · cpu 11m40s (P 88%) · 2.3 Wh · 9.4 GB</text>
+              <rect class="dg-crit" x="16" y="110" width="3" height="40" rx="1.5"/>
+              <text class="dg-mono" x="30" y="122">❯ make check</text>
+              <text class="dg-monod" x="30" y="140">error: 2 tests failed</text>
+              <text class="dg-monod" x="482" y="122">✗ 2 · 41.0s · 1.9 GB</text>
+              <rect class="dg-acc" x="16" y="162" width="3" height="18" rx="1.5"/>
+              <text class="dg-mono" x="30" y="175">❯ ls ~/Github</text><rect class="dg-cur" x="128" y="164" width="8" height="15" rx="1"/>
+              <g class="dg-n"><circle cx="108" cy="29" r="10"/><text x="108" y="29">1</text></g>
+              <g class="dg-n"><circle cx="508" cy="15" r="10"/><text x="508" y="15">2</text></g>
+              <g class="dg-n"><circle cx="34" cy="203" r="10"/><text x="34" y="203">3</text></g>
+              <g class="dg-n"><circle cx="604" cy="92" r="10"/><text x="604" y="92">4</text></g>
+              <text class="dg-txt" x="50" y="207">the bar's colour: green finished, red failed, blue running or waiting</text>
+            </svg>
+          </div>
+          <ol class="g-key">
+            <li><span>1</span><b>Window buttons</b>Move the pointer into the top-left corner and close, minimise and zoom fade in. Clicks there still reach the cells when the buttons are hidden.</li>
+            <li><span>2</span><b>Moving the window</b>Drag along the top edge, or hold <kbd>⌃⌘</kbd> and drag anywhere. Double-clicking the top edge does nothing, so it never fills the screen by accident.</li>
+            <li><span>3</span><b>Command bars</b>Each command's prompt and output get a bar in the gutter, coloured by how it ended.</li>
+            <li><span>4</span><b>Receipts</b>When a command ends, its receipt is written on the prompt line, or on the next row if the line is full.</li>
+          </ol>
+        </div>
+        <div class="g-cards">
+          <div class="g-card paper"><span class="legend">Windows</span>
+            <ul>
+              <li><b>New window</b> with <kbd>⌘N</kbd>; each runs its own shell.</li>
+              <li><b>Close</b> with <kbd>⌘⇧W</kbd>, or <kbd>⌘W</kbd> on the last tab. Shells are hung up and reaped, so nothing is left running.</li>
+              <li><b>No windows left</b>: Tachyon stays in the Dock; click it for a new window.</li>
+              <li><b>Tabs</b>: <kbd>⌘T</kbd> opens one; see Tabs below.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Look</span>
+            <ul>
+              <li><b>Cascadia Mono</b> at 12 pt, with SF Mono as the fallback and Nerd Fonts for prompt icons.</li>
+              <li><b>Box drawing and blocks</b> are drawn as shapes, so lines join with no gaps.</li>
+              <li><b>Text size</b>: <kbd>⌘+</kbd>, <kbd>⌘−</kbd>, <kbd>⌘0</kbd>, per window.</li>
+              <li><b>The cursor blinks</b> in Core Animation, so blinking costs no frames.</li>
+              <li><b>Liquid Glass</b> sits behind the text: the default background lets your wallpaper through, softly blurred, while text and colours stay solid. The glass itself is tinted with the theme's background (<code>window.glass_tint</code>, 0.75), which keeps its refraction; <code>window.glass = regular</code> frosts it more, and <code>window.backdrop = none</code> turns it off.</li>
+              <li><b>Light Mode</b> switches to a light theme and back with the system; <code>theme.appearance</code> fixes one.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="g-block" id="g-tabs">
+        <h3>Tabs</h3>
+        <p>With two or more tabs, they appear along the bottom edge; with one, they go away and the grid gets the space back. On Liquid Glass the tabs float in a <b>glass capsule</b>, sized to the tabs, with the one in front on a softer pill. Without glass they're drawn in cells as a strip, as in the diagram below, with the tab in front sharing the terminal's background.</p>
+        <div class="g-cards">
+          <div class="g-card paper"><span class="legend">Names and dots</span>
+            <ul>
+              <li><b>While a command runs</b>, the tab shows its command line, like <code>python train.py --epochs 3</code>, or a title the program sets, like vim's.</li>
+              <li><b>At a prompt</b>, it shows the folder: <code>Tachyon</code>, or <code>~</code> at home.</li>
+              <li><b>A dot</b> appears when a command finishes in a tab you aren't looking at: green if it succeeded, red if it failed. It clears when you show the tab.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Moving between tabs</span>
+            <ul>
+              <li><kbd>⌘1</kbd> to <kbd>⌘8</kbd> show that tab; <kbd>⌘9</kbd> the last one.</li>
+              <li><kbd>⌘⇧[</kbd> and <kbd>⌘⇧]</kbd>, or <kbd>⌃⇥</kbd> and <kbd>⌃⇧⇥</kbd>, step through them.</li>
+              <li><b>Click</b> a tab to show it, <b>middle-click</b> to close it.</li>
+              <li><kbd>⌘W</kbd> closes the tab in front (or, in a split tab, the pane with focus); the tab to its right comes forward. Typing <code>exit</code> closes it too.</li>
+              <li><b>Rewind</b>: <kbd>⌘[</kbd> shows the screen a moment earlier, even what htop or vim drew before they exited; <kbd>⌘[</kbd> again goes further back, <kbd>⌘]</kbd> forward, and <kbd>esc</kbd> or any key returns to live. A glass badge at the top says how long ago, with a slider to drag through every frame kept; the wheel steps them too. <kbd>⌥</kbd>-click a cell to see which output wrote it and when. Older output is kept on disk, compressed, until the tab closes.</li>
+              <li><b>Job tabs</b>: after <code>nexus gpu … --detach</code> or <code>sbatch</code>, the prompt line offers <code>⌘J follows j-1a2b3c4d</code>. <kbd>⌘J</kbd>, or <kbd>⌘</kbd>-click on the id, opens a tab that follows the job's log, named after its state, like <code>nexus j-1a2b3c4d · running on forge</code>.</li>
+            </ul>
+          </div>
+        </div>
+        <figure class="g-diagram paper">
+          <span class="legend">Use case · a run, an editor and a test</span>
+          <div class="scroll">
+            <svg viewBox="0 0 680 262" role="img" aria-label="A window with three tabs along the bottom: a training run named after its command line, vim named by the title it set, and a folder tab with a green dot because its tests passed while it was in the background">
+              <defs><clipPath id="clip-tabs"><rect x="10" y="10" width="660" height="170" rx="12"/></clipPath></defs>
+              <rect class="dg-win" x="10" y="10" width="660" height="170" rx="12"/>
+              <g clip-path="url(#clip-tabs)">
+                <rect class="dg-acc" x="17" y="26" width="2.5" height="34" rx="1"/>
+                <text class="dg-mono" x="28" y="38">❯ python train.py --epochs 30</text>
+                <text class="dg-monod" x="28" y="56">epoch 12/30  loss=0.412  acc=0.871  48.2 it/s</text>
+                <text class="dg-monod" x="28" y="74">epoch 13/30  loss=0.398  acc=0.876  48.5 it/s</text>
+                <rect class="dg-band" x="10" y="144" width="660" height="36"/>
+                <rect class="dg-ground" x="10" y="144" width="220" height="36"/>
+                <rect class="dg-bar" x="230" y="144" width="440" height="1"/>
+                <rect class="dg-bar" x="449" y="154" width="1" height="16"/>
+                <text class="dg-mono" x="120" y="166" text-anchor="middle">python train.py --e…</text>
+                <text class="dg-monod" x="340" y="166" text-anchor="middle">train.py - VIM</text>
+                <circle class="dg-ok" cx="522" cy="162" r="4"/>
+                <text class="dg-monod" x="560" y="166" text-anchor="middle">Tachyon</text>
+              </g>
+              <line class="dg-wire" x1="120" y1="184" x2="120" y2="198"/>
+              <line class="dg-wire" x1="340" y1="184" x2="340" y2="198"/>
+              <line class="dg-wire" x1="560" y1="184" x2="560" y2="198"/>
+              <text class="dg-txtm" x="120" y="214">In front: the command line</text>
+              <text class="dg-smm" x="120" y="230">while it runs · ⌘1</text>
+              <text class="dg-txtm" x="340" y="214">The title vim set</text>
+              <text class="dg-smm" x="340" y="230">dropped when vim exits · ⌘2</text>
+              <text class="dg-txtm" x="560" y="214">The folder, at a prompt</text>
+              <text class="dg-smm" x="560" y="230">green dot: cargo test passed unseen · ⌘3</text>
+              <text class="dg-sm" x="340" y="254" text-anchor="middle">example: names and output are made up</text>
+            </svg>
+          </div>
+          <figcaption>Train in one tab, edit in another, test in a third. You watch the run; when the tests finish in the background, their tab gets a <b>green dot</b> (red if they failed), and the dot clears when you show that tab. Each tab names itself from what's in it, so the strip doubles as a status line.</figcaption>
+        </figure>
+      </div>
+
+      <div class="g-block" id="g-panes">
+        <h3>Split panes</h3>
+        <p>A tab can hold several shells side by side or stacked. Each pane is a full session of its own, with its own scrollback, Rewind, receipts and notifications. The tab is named after the pane with focus, and the other panes are veiled slightly so you can see where your keys go.</p>
+        <div class="g-cards">
+          <div class="g-card paper"><span class="legend">Splitting and closing</span>
+            <ul>
+              <li><kbd>⌘D</kbd> splits the pane with focus side by side; <kbd>⌘⇧D</kbd> one above the other. The new shell starts in the same folder, unless that pane is in an ssh session.</li>
+              <li><kbd>⌘W</kbd> or <code>exit</code> closes a pane; the rest of its split takes the space and the focus. The last pane closes the tab.</li>
+              <li><kbd>⌘⇧↩</kbd> zooms the pane with focus to fill the tab; again puts it back. The others keep running.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Moving and resizing</span>
+            <ul>
+              <li><kbd>⌘⌥←</kbd> <kbd>⌘⌥→</kbd> <kbd>⌘⌥↑</kbd> <kbd>⌘⌥↓</kbd> move focus to the pane on that side, or click one.</li>
+              <li><b>Drag a divider</b> to resize the panes beside it; the pointer changes over it. Sizes snap to whole cells.</li>
+              <li><b>The wheel</b> scrolls the pane under the pointer without taking focus, so you can read back through a log while typing elsewhere.</li>
+            </ul>
+          </div>
+        </div>
+        <figure class="g-diagram paper">
+          <span class="legend">Use case · edit beside a run</span>
+          <div class="scroll">
+            <svg viewBox="0 0 680 270" role="img" aria-label="A tab split in three: an editor on the left with focus, a training run top right and a Nexus job log bottom right, veiled; one-cell dividers between them">
+              <defs><clipPath id="clip-panes"><rect x="10" y="10" width="660" height="180" rx="12"/></clipPath></defs>
+              <rect class="dg-win" x="10" y="10" width="660" height="180" rx="12"/>
+              <g clip-path="url(#clip-panes)">
+                <text class="dg-mono" x="24" y="36">def train(cfg):</text>
+                <text class="dg-mono" x="24" y="54">    for epoch in range(cfg.epochs):</text>
+                <text class="dg-mono" x="24" y="72">        loss = step(batch)</text>
+                <rect class="dg-acc" x="205" y="62" width="7" height="13"/>
+                <rect class="dg-bar" x="339" y="10" width="1" height="180"/>
+                <text class="dg-monod" x="352" y="36">❯ python train.py --lr 3e-4</text>
+                <text class="dg-monod" x="352" y="54">epoch 12/30  loss=0.412</text>
+                <text class="dg-monod" x="352" y="72">epoch 13/30  loss=0.398</text>
+                <rect class="dg-bar" x="340" y="104" width="330" height="1"/>
+                <text class="dg-monod" x="352" y="130">❯ nexus logs j-1a2b3c4d</text>
+                <text class="dg-monod" x="352" y="148">forge · RTX 4090 · step 4100</text>
+              </g>
+              <line class="dg-wire" x1="170" y1="194" x2="170" y2="210"/>
+              <line class="dg-wire" x1="339" y1="194" x2="339" y2="210"/>
+              <line class="dg-wire" x1="505" y1="194" x2="505" y2="210"/>
+              <text class="dg-txtm" x="170" y="226">Focus: keys go here</text>
+              <text class="dg-smm" x="170" y="242">⌘⌥← from the right, or click</text>
+              <text class="dg-txtm" x="339" y="226">A one-cell divider</text>
+              <text class="dg-smm" x="339" y="242">drag it to resize</text>
+              <text class="dg-txtm" x="505" y="226">⌘⇧D split this one</text>
+              <text class="dg-smm" x="505" y="242">veiled: no focus</text>
+              <text class="dg-sm" x="340" y="264" text-anchor="middle">example: names and output are made up</text>
+            </svg>
+          </div>
+          <figcaption>Edit on the left while a run and a cluster job stream on the right, all in one tab. <kbd>⌘D</kbd> made the right half and <kbd>⌘⇧D</kbd> split it; each pane got whole cells, so nothing sits under a divider. When the run looks done, <kbd>⌘⇧↩</kbd> zooms its pane to read the whole log, and again puts it back.</figcaption>
+        </figure>
+      </div>
+
+      <div class="g-block" id="g-host">
+        <h3>Quitting and coming back</h3>
+        <p>Your shells don't live in the Tachyon window. They live in a small background process, the session host, and the window is a view onto them. So quitting Tachyon, a crash, or installing an update leaves them running: a training run keeps going and an ssh session stays connected. Open Tachyon again and everything is where you left it.</p>
+        <div class="g-cards">
+          <div class="g-card paper"><span class="legend">What comes back</span>
+            <ul>
+              <li><b>Windows, tabs and splits</b>, in the same places, with the same tab in front and the same pane focused.</li>
+              <li><b>Each screen</b>: scrollback, colours, and a full-screen program (htop, vim) exactly as it is now, since the host kept watching while the window was closed.</li>
+              <li><b>Command marks</b> and their exit codes, so ⌘↑ and the gutter bars still work. Restored commands have no times in their receipts, and Rewind starts again from the restored screen.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Ending shells</span>
+            <ul>
+              <li><kbd>⌘Q</kbd> quits and keeps the shells. <kbd>⌥⌘Q</kbd> (Quit and End Shells) ends them too.</li>
+              <li>Closing a tab, pane or window ends its shells, as always.</li>
+              <li>The host leaves by itself 20 seconds after it has nothing to run. Set <code>shell.persist = false</code> to have shells end with the app.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Keeping the Mac awake</span>
+            <ul>
+              <li><kbd>⌥⌘A</kbd> keeps the Mac awake while the pane's command runs: the one running now, or at a prompt the next one you start. It lasts that one command.</li>
+              <li>The receipt reads <code>☕ awake · running 2h 14m</code> while it holds; a prompt says <code>☕ the next command keeps the Mac awake</code> until then.</li>
+              <li>The host holds it, so quitting Tachyon doesn't let the Mac sleep mid-run. It stops idle sleep only, like <code>caffeinate -i</code>: the display still sleeps, and so does a closed MacBook on battery. <code>pmset -g assertions</code> shows it by command.</li>
+            </ul>
+          </div>
+        </div>
+        <figure class="g-diagram paper">
+          <span class="legend">How it fits together</span>
+          <div class="scroll">
+            <svg viewBox="0 0 680 210" role="img" aria-label="The Tachyon app talks to the session host, which owns the shells; keys go straight to each shell's terminal, output comes back through the host, and when the app quits the host keeps the shells running">
+              <defs><marker id="ah-host" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="dg-head-fill" d="M0,0 L8,4 L0,8 z"/></marker></defs>
+              <rect class="dg-box" x="20" y="50" width="150" height="70" rx="10" stroke-dasharray="5 4"/>
+              <text class="dg-txtm" x="95" y="80">Tachyon</text>
+              <text class="dg-smm" x="95" y="98">the window: can quit,</text>
+              <text class="dg-smm" x="95" y="111">crash or update</text>
+              <rect class="dg-box" x="270" y="50" width="150" height="70" rx="10"/>
+              <text class="dg-txtm" x="345" y="80">Session host</text>
+              <text class="dg-smm" x="345" y="98">keeps each screen,</text>
+              <text class="dg-smm" x="345" y="111">answers while you're away</text>
+              <rect class="dg-box" x="520" y="20" width="140" height="34" rx="8"/>
+              <text class="dg-txtm" x="590" y="41">python train.py</text>
+              <rect class="dg-box" x="520" y="68" width="140" height="34" rx="8"/>
+              <text class="dg-txtm" x="590" y="89">ssh hpc</text>
+              <rect class="dg-box" x="520" y="116" width="140" height="34" rx="8"/>
+              <text class="dg-txtm" x="590" y="137">zsh</text>
+              <line class="dg-wire" x1="420" y1="85" x2="516" y2="37" marker-end="url(#ah-host)"/>
+              <line class="dg-wire" x1="420" y1="85" x2="516" y2="85" marker-end="url(#ah-host)"/>
+              <line class="dg-wire" x1="420" y1="85" x2="516" y2="133" marker-end="url(#ah-host)"/>
+              <text class="dg-smm" x="468" y="170">owns them</text>
+              <line class="dg-wire" x1="266" y1="72" x2="174" y2="72" marker-end="url(#ah-host)"/>
+              <text class="dg-smm" x="220" y="50">output, and the</text>
+              <text class="dg-smm" x="220" y="63">screen on reopening</text>
+              <line class="dg-wire" x1="174" y1="100" x2="266" y2="100" stroke-dasharray="4 3" marker-end="url(#ah-host)"/>
+              <text class="dg-smm" x="220" y="120">keys go straight</text>
+              <text class="dg-smm" x="220" y="133">to each shell</text>
+              <text class="dg-sm" x="340" y="200" text-anchor="middle">quit Tachyon: the left box goes, the rest keeps running</text>
+            </svg>
+          </div>
+          <figcaption>The host owns every shell's terminal and keeps a copy of its screen, parsed on an efficiency core. Tachyon gets each terminal handed to it, so keys go straight to the shell, and output comes through the host with a few microseconds' delay. When Tachyon quits, only the window goes. On reopening, the host gives each shell's current screen back first, then carries on streaming.</figcaption>
+        </figure>
+      </div>
+
+      <div class="g-block" id="g-text">
+        <h3>Text and the mouse</h3>
+        <div class="g-cards">
+          <div class="g-card paper"><span class="legend">Selecting</span>
+            <ul>
+              <li><b>Drag</b> to select by character. Starting on the right half of a letter leaves that letter out, as in other Mac text views.</li>
+              <li><b>Double-click</b> takes a word. A path or URL counts as one word.</li>
+              <li><b>Triple-click</b> takes the whole line, across wrapped rows.</li>
+              <li><kbd>⌘C</kbd> copies without trailing blanks; <kbd>⌘A</kbd> selects everything, scrollback too.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Programs that use the mouse</span>
+            <ul>
+              <li><b>htop, vim, tmux</b> and similar get clicks, drags and the wheel when they ask for them.</li>
+              <li><b>Hold <kbd>⇧</kbd></b> to select text anyway while a program has the mouse.</li>
+              <li><b><kbd>⌘</kbd>-click a path</b> to see the file in Quick Look, or <b>a URL</b> to open it. Paths are found from the tab's folder; <code>ls</code> of another folder prints bare names, which won't resolve.</li>
+              <li><b>The wheel</b> scrolls back through history when no program has the mouse.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Keys</span>
+            <ul>
+              <li><b>Option as Meta</b> is off by default, so <kbd>⌥</kbd> types accents. Set <code>macos.option_as_meta</code> to <code>left</code>, <code>right</code> or <code>true</code> for Meta.</li>
+              <li><b>Secure Keyboard Entry</b> turns on by itself while sudo, ssh or another program asks for a password, so other apps can't read those keys, and the prompt line says so.</li>
+              <li><b>Dead keys and input methods</b> work: <kbd>⌥E</kbd> then <kbd>E</kbd> gives é, and Pinyin or Japanese show what you're composing, underlined.</li>
+            </ul>
+          </div>
+        </div>
+        <figure class="g-diagram paper">
+          <span class="legend">Where a click goes</span>
+          <div class="scroll">
+            <svg viewBox="0 0 660 364" role="img" aria-label="Where a click goes, checked in order: the tab strip shows a tab; the top edge or Control-Command moves the window; Command-click opens a path or URL; a program that asked for the mouse gets it unless Shift is held; otherwise the click selects text">
+              <defs><marker id="ah-click" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="dg-head-fill" d="M0,0 L8,4 L0,8 z"/></marker></defs>
+              <rect class="dg-q" x="20" y="20" width="300" height="44" rx="10"/><text class="dg-hd" x="36" y="47">On the tab strip?</text>
+              <rect class="dg-q" x="20" y="92" width="300" height="44" rx="10"/><text class="dg-hd" x="36" y="119">On the top edge, or ⌃⌘ held?</text>
+              <rect class="dg-q" x="20" y="164" width="300" height="44" rx="10"/><text class="dg-hd" x="36" y="191">⌘ held, on a real path or a URL?</text>
+              <rect class="dg-q" x="20" y="236" width="300" height="44" rx="10"/><text class="dg-hd" x="36" y="263">Program wants the mouse, ⇧ not held?</text>
+              <rect class="dg-out" x="390" y="20" width="250" height="44" rx="10"/><text class="dg-txt" x="406" y="47">Show that tab · middle-click closes it</text>
+              <rect class="dg-out" x="390" y="92" width="250" height="44" rx="10"/><text class="dg-txt" x="406" y="119">Move the window</text>
+              <rect class="dg-out" x="390" y="164" width="250" height="44" rx="10"/><text class="dg-txt" x="406" y="191">Quick Look the file, or open the URL</text>
+              <rect class="dg-out" x="390" y="236" width="250" height="44" rx="10"/><text class="dg-txt" x="406" y="263">Sent to the program: vim, htop, tmux</text>
+              <rect class="dg-out" x="20" y="308" width="300" height="48" rx="10"/><text class="dg-txt" x="36" y="328">Select text in Tachyon</text><text class="dg-sm" x="36" y="345">drag · double-click a word · triple-click a line</text>
+              <line class="dg-wire" x1="320" y1="42" x2="388" y2="42" marker-end="url(#ah-click)"/><text class="dg-yes" x="354" y="36">yes</text>
+              <line class="dg-wire" x1="320" y1="114" x2="388" y2="114" marker-end="url(#ah-click)"/><text class="dg-yes" x="354" y="108">yes</text>
+              <line class="dg-wire" x1="320" y1="186" x2="388" y2="186" marker-end="url(#ah-click)"/><text class="dg-yes" x="354" y="180">yes</text>
+              <line class="dg-wire" x1="320" y1="258" x2="388" y2="258" marker-end="url(#ah-click)"/><text class="dg-yes" x="354" y="252">yes</text>
+              <line class="dg-wire" x1="170" y1="64" x2="170" y2="90" marker-end="url(#ah-click)"/><text class="dg-no" x="178" y="81">no</text>
+              <line class="dg-wire" x1="170" y1="136" x2="170" y2="162" marker-end="url(#ah-click)"/><text class="dg-no" x="178" y="153">no</text>
+              <line class="dg-wire" x1="170" y1="208" x2="170" y2="234" marker-end="url(#ah-click)"/><text class="dg-no" x="178" y="225">no</text>
+              <line class="dg-wire" x1="170" y1="280" x2="170" y2="306" marker-end="url(#ah-click)"/><text class="dg-no" x="178" y="297">no</text>
+            </svg>
+          </div>
+          <figcaption>Tachyon checks these in order. A ⌘-click on something that isn't a file or link falls through to selecting. The useful one to remember is the fourth: inside vim, htop or tmux the program gets your clicks, and <b>holding ⇧</b> lets you select and copy text anyway. The wheel follows the same rule: a program that asked for the mouse gets it; otherwise it scrolls back through history.</figcaption>
+        </figure>
+      </div>
+
+      <div class="g-block" id="g-commands">
+        <h3>Commands and receipts</h3>
+        <p>Tachyon loads its own integration into zsh, bash and fish on top of your config, so it knows where each prompt, command and its output start and end. None of your startup files change.</p>
+        <div class="g-cards">
+          <div class="g-card paper"><span class="legend">Reading a receipt</span>
+            <p><code>✓ 3m52s · cpu 11m40s (P 88%) · 2.3 Wh · 9.4 GB</code></p>
+            <ul>
+              <li><b>✓ or ✗ code</b>: how it ended.</li>
+              <li><b>Wall time</b>, then <b>CPU time</b> across all its processes, exact.</li>
+              <li><b>P share</b>: how much of that CPU ran on performance cores.</li>
+              <li><b>Energy</b> in J or Wh, from the kernel's per-process energy counter.</li>
+              <li><b>Peak footprint</b>: the most memory it held at once, the number that decides whether the next batch fits in 16 GB.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Moving around</span>
+            <ul>
+              <li><b>Suggestions</b>: as you type at a prompt, the rest of a command you've run before shows in grey, like <code>cargo t<span style="opacity:.45">est --release</span></code>. <kbd>→</kbd>, <kbd>End</kbd> or <kbd>⌃F</kbd> types it in; <kbd>⌥→</kbd> one word. They come from your shell's history and every command run in Tachyon, newest first and the same folder first. A leading space keeps a command out; <code>shell.suggestions = false</code> turns them off.</li>
+              <li><b>Rerun diff</b>: run a command again, even with different numbers like a new learning rate, and the lines that differ from the last run get an amber gutter mark. The prompt line says how many; hover a mark for the old line.</li>
+              <li><b>Metric lens</b>: while a training run or server prints metrics, its prompt line shows them, like <code>loss 0.398 ▇▆▅▄▃▂ · 48.2 it/s · 45%</code>, with a sparkline of the loss. A tqdm bar also shows on the Dock icon as a progress bar.</li>
+              <li><kbd>⌘↑</kbd> jumps to the previous command's prompt, <kbd>⌘↓</kbd> to the next.</li>
+              <li><b>Long runs</b>: a command that took 10 s or more and finished while you were in another app or window posts a <b>notification</b> with its receipt. Click it to go to its tab. Change the time with <code>notify.after</code>, or set it to 0 to turn it off.</li>
+              <li><b>Turn it off</b> with <code>shell.integration = false</code>. </li>
+              <li><b>bash and fish</b> get the same: set <code>shell.program</code> to either and Tachyon loads the integration itself, without touching your startup files. bash works from macOS's 3.2 on, alongside a starship prompt.</li>
+              <li><b>Over ssh</b>, copy the script to the other machine and load it from your startup file, for bash: <code>[[ $LC_TERMINAL == Tachyon ]] &amp;&amp; source ~/.tachyon-integration.bash</code>. ssh passes <code>LC_TERMINAL</code>, so it turns on only in Tachyon. The README has zsh and fish.</li>
+            </ul>
+          </div>
+        </div>
+        <figure class="g-diagram paper">
+          <span class="legend">How a receipt is made</span>
+          <div class="scroll">
+            <svg viewBox="0 0 680 250" role="img" aria-label="How a receipt is made: zsh reports when a command starts and ends; Tachyon notes the CPU used so far at the start, samples the command's processes every half second while it runs, and writes the receipt on the prompt line when it ends">
+              <defs><marker id="ah-rc" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="dg-head-fill" d="M0,0 L8,4 L0,8 z"/></marker></defs>
+              <text class="dg-hd" x="20" y="64">zsh</text>
+              <text class="dg-hd" x="20" y="164">Tachyon</text>
+              <line class="dg-bar" x1="90" y1="60" x2="660" y2="60" style="stroke:var(--line-strong)"/>
+              <line class="dg-bar" x1="90" y1="160" x2="660" y2="160" style="stroke:var(--line-strong)"/>
+              <rect class="dg-band" x="120" y="52" width="440" height="16" rx="3"/>
+              <text class="dg-smm" x="340" y="64">python train.py runs</text>
+              <circle class="dg-acc" cx="120" cy="60" r="5"/><circle class="dg-acc" cx="560" cy="60" r="5"/>
+              <text class="dg-sm" x="120" y="36" text-anchor="middle">⏎ · preexec</text>
+              <text class="dg-sm" x="560" y="36" text-anchor="middle">exits · precmd</text>
+              <line class="dg-wire" x1="120" y1="66" x2="120" y2="152" marker-end="url(#ah-rc)"/>
+              <line class="dg-wire" x1="560" y1="66" x2="560" y2="152" marker-end="url(#ah-rc)"/>
+              <text class="dg-sm" x="128" y="112">OSC 133;C + command line</text>
+              <text class="dg-sm" x="552" y="112" text-anchor="end">OSC 133;D + exit code</text>
+              <g class="dg-acc">
+                <rect x="159" y="154" width="2" height="12"/><rect x="199" y="154" width="2" height="12"/><rect x="239" y="154" width="2" height="12"/><rect x="279" y="154" width="2" height="12"/><rect x="319" y="154" width="2" height="12"/><rect x="359" y="154" width="2" height="12"/><rect x="399" y="154" width="2" height="12"/><rect x="439" y="154" width="2" height="12"/><rect x="479" y="154" width="2" height="12"/><rect x="519" y="154" width="2" height="12"/>
+              </g>
+              <text class="dg-sm" x="120" y="184" text-anchor="middle">notes CPU so far,</text>
+              <text class="dg-sm" x="120" y="198" text-anchor="middle">names the tab</text>
+              <text class="dg-smm" x="340" y="184">samples every 0.5 s:</text>
+              <text class="dg-smm" x="340" y="198">P-core time, energy, peak footprint</text>
+              <text class="dg-sm" x="560" y="184" text-anchor="middle">CPU now − at start,</text>
+              <text class="dg-sm" x="560" y="198" text-anchor="middle">exact</text>
+              <text class="dg-sm" x="90" y="236">On the prompt line:</text>
+              <text class="dg-okt" x="200" y="236">✓ 3m52s · cpu 11m40s (P 88%) · 2.3 Wh · 9.4 GB</text>
+            </svg>
+          </div>
+          <figcaption>zsh tells Tachyon when a command starts and ends; Tachyon does the measuring. <b>CPU time is exact</b> because it's the change in the shell's own accounting for its children. <b>P-core share, energy and footprint are sampled</b> every half second, so a child that lives less than that can be missed. While a command runs, its receipt counts up after 2 seconds.</figcaption>
+        </figure>
+
+        <figure class="g-diagram paper">
+          <span class="legend">Use case · finding the run that failed</span>
+          <div class="scroll">
+            <svg viewBox="0 0 660 236" role="img" aria-label="Command bars in the gutter mark each command green or red, and Command-Up jumps from prompt to prompt so the previous command sits at the top of the screen">
+              <defs><marker id="ah-nav" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="dg-head-fill" d="M0,0 L8,4 L0,8 z"/></marker></defs>
+              <rect class="dg-win" x="10" y="10" width="420" height="216" rx="12"/>
+              <rect class="dg-ok" x="18" y="22" width="2.5" height="36" rx="1"/>
+              <text class="dg-mono" x="30" y="36">❯ git pull</text><text class="dg-sm" x="418" y="36" text-anchor="end">✓ 1.2s</text>
+              <text class="dg-monod" x="30" y="53">Already up to date.</text>
+              <rect class="dg-crit" x="18" y="74" width="2.5" height="36" rx="1"/>
+              <text class="dg-mono" x="30" y="88">❯ make test</text><text class="dg-sm" x="418" y="88" text-anchor="end">✗ 2 · 41.0s</text>
+              <text class="dg-crt" x="30" y="105">error: 2 tests failed</text>
+              <rect class="dg-ok" x="18" y="126" width="2.5" height="36" rx="1"/>
+              <text class="dg-mono" x="30" y="140">❯ python bench.py</text><text class="dg-sm" x="418" y="140" text-anchor="end">✓ 9.8s · 21 J</text>
+              <text class="dg-monod" x="30" y="157">throughput 657 MiB/s</text>
+              <text class="dg-mono" x="30" y="192">❯</text><rect class="dg-cur" x="44" y="181" width="8" height="14" rx="1"/>
+              <path class="dg-wire" d="M436 188 C 470 180, 470 146, 438 138" marker-end="url(#ah-nav)"/>
+              <path class="dg-wire" d="M436 136 C 470 128, 470 94, 438 86" marker-end="url(#ah-nav)"/>
+              <text class="dg-act" x="474" y="166">⌘↑</text><text class="dg-sm" x="502" y="166">this prompt to the top</text>
+              <text class="dg-act" x="474" y="114">⌘↑</text><text class="dg-sm" x="502" y="114">and the one before</text>
+              <text class="dg-sm" x="474" y="206">⌘↓ goes back down;</text>
+              <text class="dg-sm" x="474" y="220">past the last, to live</text>
+            </svg>
+          </div>
+          <figcaption>Hours of output later, the <b>red bar</b> is the run that failed and its receipt says how long it took. <kbd>⌘↑</kbd> steps back prompt by prompt instead of scrolling, and a <b>triple-click</b> on the error line copies all of it, wrapped rows included.</figcaption>
+        </figure>
+      </div>
+
+      <div class="g-block" id="g-settings">
+        <h3>Settings</h3>
+        <p>Create <code>~/.config/Tachyon/tachyon.conf</code> with <code>key = value</code> lines. <code>tachyon.conf.example</code> in the repo lists every key. Quit and reopen Tachyon for changes to apply.</p>
+        <div class="table-card paper"><span class="legend">The keys you're most likely to change</span>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Key</th><th>Default</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code>font.family</code></td><td><code>"Cascadia Mono"</code></td><td>Any installed font; falls back to SF Mono</td></tr>
+              <tr><td><code>font.size</code></td><td><code>12.0</code></td><td>Points; <kbd>⌘+</kbd> and <kbd>⌘−</kbd> change it per window</td></tr>
+              <tr><td><code>font.line_height</code></td><td><code>1.0</code></td><td>Row height as a multiple of the font's</td></tr>
+              <tr><td><code>window.cols</code>, <code>window.rows</code></td><td><code>120</code>, <code>32</code></td><td>Size of a new window</td></tr>
+              <tr><td><code>window.padding_x</code>, <code>_y</code></td><td><code>8.0</code>, <code>6.0</code></td><td>Space around the grid, in points</td></tr>
+              <tr><td><code>theme.background</code> and friends</td><td><code>#0B0E14</code></td><td>Colours as hex: foreground, cursor, selection</td></tr>
+              <tr><td><code>macos.option_as_meta</code></td><td><code>false</code></td><td><code>left</code>, <code>right</code> or <code>true</code> to send Meta</td></tr>
+              <tr><td><code>shell.program</code></td><td>your login shell</td><td>Run something else in new windows</td></tr>
+              <tr><td><code>shell.integration</code></td><td><code>true</code></td><td>Command bars, receipts and <kbd>⌘↑</kbd>/<kbd>⌘↓</kbd></td></tr>
+              <tr><td><code>scrollback</code></td><td><code>10000</code></td><td>Lines of history per tab</td></tr>
+              <tr><td><code>window.backdrop</code>, <code>window.opacity</code></td><td><code>glass</code>, <code>0.05</code></td><td>Liquid Glass behind the text, and how solid the background drawn over it is; <code>none</code> for opaque</td></tr>
+              <tr><td><code>window.glass</code>, <code>window.glass_tint</code></td><td><code>clear</code>, <code>0.75</code></td><td>The glass's style (<code>regular</code> frosts more) and how strongly it's tinted with the theme's background; the tint keeps its refraction</td></tr>
+              <tr><td><code>theme.appearance</code></td><td><code>auto</code></td><td>Follow Light and Dark Mode, or fix <code>dark</code> or <code>light</code>. <code>theme.light.*</code> sets the light theme's colours</td></tr>
+              <tr><td><code>theme.cursor</code>, <code>theme.selection_bg</code></td><td>theme colours</td><td><code>accent</code> uses the system accent colour, in both themes</td></tr>
+              <tr><td><code>notify.after</code></td><td><code>10</code></td><td>Seconds a command must run to notify when it finishes unseen; 0 turns it off</td></tr>
+            </tbody>
+          </table></div>
+        </div>
+      </div>
+
+      <div class="g-block" id="g-speed">
+        <h3>Speed and efficiency</h3>
+        <p>Measured on your M2 Pro (6 performance and 4 efficiency cores, 16 GB) by feeding recorded output through the terminal core. These run locally because they measure this Mac's own hardware.</p>
+        <div class="table-card paper"><span class="legend">Before and after the Apple silicon work</span>
+          <div class="table-wrap"><table class="perf-table">
+            <thead><tr><th>Workload</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+            <tbody>
+              <tr><td>Plain ASCII, like <code>cat</code> of a big file</td><td class="n">429–455 MiB/s</td><td class="n">2,300 MiB/s</td><td class="n gain">×5.2</td></tr>
+              <tr><td>A colourful build log</td><td class="n">210–230 MiB/s</td><td class="n">291–296 MiB/s</td><td class="n gain">+33%</td></tr>
+              <tr><td>A full-screen TUI redrawing</td><td class="n">206–222 MiB/s</td><td class="n">244–247 MiB/s</td><td class="n gain">+15%</td></tr>
+              <tr><td>The scanner on its own</td><td class="n">7.0–8.3 GiB/s</td><td class="n">13.8–14.2 GiB/s</td><td class="n gain">+80%</td></tr>
+              <tr><td>Memory for 100k lines of scrollback</td><td class="n">420 MiB</td><td class="n">78 MiB</td><td class="n gain">−81%</td></tr>
+              <tr><td>CPU with an idle window</td><td class="n">—</td><td class="n">0.0%</td><td class="n">no wake-ups</td></tr>
+            </tbody>
+          </table></div>
+        </div>
+        <p><b>Where a keystroke's delay goes:</b> <kbd>⌥⌘L</kbd> shows it on the prompt line, for example <code>⏱ 11.8 ms (median 10.9 of 40) · Tachyon 0.6 · shell 0.3 · frame wait 2.4 · display 8.5</code>. Tachyon is taking the key plus reading and parsing the echo; shell includes ssh and the network for a remote one; display is the GPU and the screen. The same stages show in Instruments' Points of Interest track.</p>
+      </div>
+
+      <div class="g-block" id="g-trouble">
+        <h3>When something's off</h3>
+        <div class="g-cards">
+          <div class="g-card paper"><span class="legend">Things that look like bugs</span>
+            <ul>
+              <li><b>Tachyon quits when the last window closes</b>: that's Vorssaint, which quits apps with no windows. Tachyon itself stays open; add it to Vorssaint's exceptions.</li>
+              <li><b>A new window opens off to the side</b>: Stage Manager parks windows opened in the background. Click Tachyon in the Dock first.</li>
+            </ul>
+          </div>
+          <div class="g-card paper"><span class="legend">Looking closer</span>
+            <ul>
+              <li><b>The log</b> is <code>~/Library/Logs/Tachyon/tachyon.log</code>, which Console.app also shows.</li>
+              <li><b>Record a session's raw output</b> by starting Tachyon with <code>TACHYON_DUMP=/path/to/file</code>, to replay a rendering problem later.</li>
+              <li><b>Reinstall</b> from the repo with <code>scripts/bundle-macos.sh --install</code>.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <section class="part" id="cheatsheet" aria-labelledby="cheat-h">
+    <div class="part-head">
+      <span class="eyebrow kicker">Cheatsheet</span>
+      <h2 class="display" id="cheat-h">Keys and gestures</h2>
+      <p>Everything the installed app responds to.</p>
+    </div>
+    <div class="filters">
+      <input class="search" id="cheat-filter" type="search" placeholder="Filter: try “copy”, “font” or “⌘”" aria-label="Filter the cheatsheet" autocomplete="off" spellcheck="false">
+      <span class="count" id="cheat-count" aria-live="polite"></span>
+    </div>
+    <p class="empty" id="cheat-empty" hidden>Nothing matches. Try a shorter word, or a key name like “command”.</p>
+    <div class="cheat-grid" id="cheat-grid">
+      <div class="cheat-col">
+        <div class="cheat paper"><span class="legend">Tabs</span><table><tbody>
+          <tr><td class="k"><kbd>⌘T</kbd></td><td>New tab</td></tr>
+          <tr><td class="k"><kbd>⌘W</kbd></td><td>Close the pane; the tab with its last pane, the window with its last tab</td></tr>
+          <tr><td class="k"><kbd>⌘D</kbd> <kbd>⌘⇧D</kbd></td><td>Split the pane right or down</td></tr>
+          <tr><td class="k"><kbd>⌘⌥</kbd> arrows</td><td>Focus the pane on that side</td></tr>
+          <tr><td class="k">Drag a divider</td><td>Resize the panes beside it</td></tr>
+          <tr><td class="k"><kbd>⌘⇧↩</kbd></td><td>Zoom the pane, or put it back</td></tr>
+          <tr><td class="k"><kbd>⌘1</kbd>–<kbd>⌘8</kbd></td><td>Show that tab</td></tr>
+          <tr><td class="k"><kbd>⌘9</kbd></td><td>Show the last tab</td></tr>
+          <tr><td class="k"><kbd>⌘⇧[</kbd> <kbd>⌘⇧]</kbd></td><td>Previous or next tab</td></tr>
+          <tr><td class="k"><kbd>⌃⇥</kbd> <kbd>⌃⇧⇥</kbd></td><td>Next or previous tab</td></tr>
+          <tr><td class="k">Click a tab</td><td>Show it</td></tr>
+          <tr><td class="k">Middle-click a tab</td><td>Close it</td></tr>
+          <tr><td class="k"><kbd>⌥⌘T</kbd></td><td>Reopen the last closed tab, pane or window's tab (kept 10 min)</td></tr>
+          <tr><td class="k"><kbd>⌥⌘C</kbd></td><td>Training chart: plot the newest command's metrics live</td></tr>
+          <tr><td class="k"><kbd>⌘J</kbd></td><td>Follow the job this tab submitted last, in its own tab</td></tr>
+          <tr><td class="k"><kbd>⌘[</kbd> <kbd>⌘]</kbd></td><td>Rewind: the screen one frame earlier or later</td></tr>
+          <tr><td class="k">wheel, slider</td><td>While rewound: scrub through the frames kept</td></tr>
+          <tr><td class="k"><kbd>⌥</kbd>-click</td><td>While rewound: which output wrote that cell, and when</td></tr>
+          <tr><td class="k"><kbd>esc</kbd> while rewound</td><td>Back to the live screen</td></tr>
+          <tr><td class="k"><kbd>⌘</kbd> click a job id</td><td>Follow that job</td></tr>
+        </tbody></table></div>
+        <div class="cheat paper"><span class="legend">Windows</span><table><tbody>
+          <tr><td class="k"><kbd>⌘N</kbd></td><td>New window</td></tr>
+          <tr><td class="k"><kbd>⌘⇧W</kbd></td><td>Close the window and all its tabs</td></tr>
+          <tr><td class="k"><kbd>⌘M</kbd></td><td>Minimise</td></tr>
+          <tr><td class="k"><kbd>⌘H</kbd></td><td>Hide Tachyon</td></tr>
+          <tr><td class="k"><kbd>⌘Q</kbd></td><td>Quit; the shells keep running and come back next time</td></tr>
+          <tr><td class="k"><kbd>⌥⌘Q</kbd></td><td>Quit and end the shells</td></tr>
+          <tr><td class="k"><kbd>⌥⌘A</kbd></td><td>Keep the Mac awake while this pane's command runs</td></tr>
+          <tr><td class="k"><kbd>⌥⌘L</kbd></td><td>Latency ledger: where each keystroke's delay goes</td></tr>
+          <tr><td class="k"><kbd>⌃`</kbd></td><td>Quick terminal from the notch, from any app</td></tr>
+          <tr><td class="k"><kbd>⌘⇧N</kbd></td><td>Neutrino card: focused shell's repo and server inbox</td></tr>
+          <tr><td class="k"><kbd>⌥⌘U</kbd></td><td>System monitor card: CPU, GPU, memory, network, disk, battery</td></tr>
+          <tr><td class="k"><kbd>⌥⌘I</kbd></td><td>Ask Fairy about the screen or last command</td></tr>
+          <tr><td class="k"><kbd>⌥⌘F</kbd></td><td>Full screen around the notch, or back</td></tr>
+          <tr><td class="k"><kbd>⌃⌘</kbd> drag</td><td>Move the window from anywhere</td></tr>
+          <tr><td class="k">Top edge drag</td><td>Move the window</td></tr>
+          <tr><td class="k">Top-left corner</td><td>Show the window buttons</td></tr>
+        </tbody></table></div>
+        <div class="cheat paper"><span class="legend">Text size</span><table><tbody>
+          <tr><td class="k"><kbd>⌘+</kbd> or <kbd>⌘=</kbd></td><td>Bigger</td></tr>
+          <tr><td class="k"><kbd>⌘−</kbd></td><td>Smaller</td></tr>
+          <tr><td class="k"><kbd>⌘0</kbd></td><td>Back to the configured size</td></tr>
+        </tbody></table></div>
+      </div>
+      <div class="cheat-col">
+        <div class="cheat paper"><span class="legend">Selection and clipboard</span><table><tbody>
+          <tr><td class="k">Drag</td><td>Select by character</td></tr>
+          <tr><td class="k">Double-click</td><td>Select a word, path or URL</td></tr>
+          <tr><td class="k">Triple-click</td><td>Select the whole line, across wraps</td></tr>
+          <tr><td class="k"><kbd>⇧</kbd> click</td><td>Extend the selection</td></tr>
+          <tr><td class="k"><kbd>⇧</kbd> drag</td><td>Select while a program has the mouse</td></tr>
+          <tr><td class="k"><kbd>⌘</kbd> click a path</td><td>Show the file in Quick Look (or traceback line in your editor)</td></tr>
+          <tr><td class="k"><kbd>⌥⌘</kbd> click a path</td><td>Open any file in your editor</td></tr>
+          <tr><td class="k"><kbd>⌘</kbd> click a URL</td><td>Open the link</td></tr>
+          <tr><td class="k"><kbd>⌘C</kbd></td><td>Copy the selection</td></tr>
+          <tr><td class="k"><kbd>⌘V</kbd></td><td>Paste</td></tr>
+          <tr><td class="k"><kbd>⌘A</kbd></td><td>Select all, scrollback included</td></tr>
+        </tbody></table></div>
+        <div class="cheat paper"><span class="legend">Commands</span><table><tbody>
+          <tr><td class="k"><kbd>Tab</kbd> <kbd>→</kbd> <kbd>End</kbd> <kbd>⌃F</kbd></td><td>Take the grey suggestion</td></tr>
+          <tr><td class="k"><kbd>⌥⌘O</kbd></td><td>Copy the selected or last command's output</td></tr>
+          <tr><td class="k"><kbd>⌥⌘K</kbd></td><td>Fold or unfold a long command's output</td></tr>
+          <tr><td class="k"><kbd>⌥→</kbd></td><td>Take one word of it</td></tr>
+          <tr><td class="k"><kbd>⌘F</kbd></td><td>Find in scrollback</td></tr>
+          <tr><td class="k"><kbd>⌘G</kbd> <kbd>⌘⇧G</kbd></td><td>Next match up (older) or down</td></tr>
+          <tr><td class="k"><kbd>⌘↑</kbd></td><td>Previous command's prompt</td></tr>
+          <tr><td class="k"><kbd>⌘↓</kbd></td><td>Next command's prompt</td></tr>
+          <tr><td class="k">Wheel or trackpad</td><td>Scroll back through history</td></tr>
+          <tr><td class="k"><kbd>⌥E</kbd> then a letter</td><td>Accented letters, with Option as Meta off</td></tr>
+        </tbody></table></div>
+      </div>
+    </div>
+  </section>
+
+  </div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var PHASES = [
+    { id: "landed", name: "Landed", sub: "On GitHub and in the installed app" },
+    { id: "mac", name: "The Mac basics", sub: "What you'd expect from any Mac terminal, starting with tabs" },
+    { id: "work", name: "For ML and HPC work", sub: "Features built around training runs, Nexus and clusters" },
+    { id: "core", name: "Deeper core", sub: "Larger changes to how the terminal stores and serves output" },
+    { id: "mux", name: "Rex-style multi-host multiplexer", sub: "Persistent servers on Mac mini (and later Linux/Windows), CLI, sidebar and agent hooks" }
+  ];
+  var STEPS = [
+    { key: "concept", phase: "landed", title: "Tachyon Next concept and the new icon", who: "Claude", size: "M", refs: ["2655446", "04eec65", "02d1f64", "docs/NEXT.md"],
+      why: "You wanted a next-generation terminal for your ML, AI, systems and HPC work, with features other terminals don't have.",
+      covers: ["The look, the pipeline on Apple silicon, budgets and a build order", "Features: Rewind, run receipts with energy, metric lens, rerun diff, job tabs, session host, latency ledger", "Window layouts that give the grid the whole height", "A minimal dark icon: a block cursor with a fading trail on a squircle"],
+      done: "the concept is on main and the icon is in the app." },
+    { key: "backend", phase: "landed", title: "Native macOS backend for Apple silicon", who: "Claude", size: "L", refs: ["43ae9cb", "src/mac/"],
+      why: "You use Tachyon mainly on your MacBook, so it needed to run natively there instead of on Windows.",
+      covers: ["AppKit window, a Metal layer and the three render passes ported to Metal shaders", "Core Text fonts with SF Mono and Nerd Font fallback; box drawing as shapes", "A login zsh through forkpty", "The display link pauses when idle; the cursor blinks in Core Animation"],
+      done: "it builds as a signed arm64 app and is installed in /Applications." },
+    { key: "font", phase: "landed", title: "Cascadia Mono, installed and used", who: "Claude", size: "S", refs: ["src/config.rs"],
+      why: "You thought you had Cascadia Mono Bold, but it wasn't installed.",
+      covers: ["Installed the Cascadia Mono family, bold and italic included", "Made it Tachyon's default font"],
+      done: "Tachyon draws in Cascadia Mono with real bold." },
+    { key: "windows", phase: "landed", title: "Multiple windows", who: "Claude", size: "S", refs: ["1cde52a", "PR #1"],
+      why: "You wanted several Tachyon windows open at once.",
+      covers: ["⌘N and the Dock icon open new windows sharing one GPU", "Closing the last window keeps the app open", "⌘W hangs up and reaps the shell"],
+      done: "several windows run side by side with nothing left behind when they close." },
+    { key: "edge", phase: "landed", title: "Edge-to-edge window", who: "Claude", size: "M", refs: ["src/mac/mod.rs"],
+      why: "You like using every row of the screen, with no title bar taking space.",
+      covers: ["The grid starts at the top edge", "Window buttons appear in the top-left corner on hover", "Move by the top edge or ⌃⌘-drag; double-clicking the top no longer fills the screen"],
+      done: "you've said the traffic lights are fine as they are." },
+    { key: "everyday", phase: "landed", title: "Selection, the mouse and everyday keys", who: "Claude", size: "M", refs: ["b57e1b2", "PR #2"],
+      why: "The basics you reach for every minute in a terminal.",
+      covers: ["Selection by character, word and line, and copy", "Mouse reporting for htop, vim and tmux", "Left and right Option as Meta", "Text size with ⌘+, ⌘− and ⌘0; the blinking cursor", "A fix for output pushed into scrollback by Stage Manager's resize"],
+      done: "merged into main and installed." },
+    { key: "speed", phase: "landed", title: "NEON scanner and packed scrollback", who: "Claude", size: "L", refs: ["b68bb8c", "PR #3", "src/term/parser.rs", "src/term/grid.rs"],
+      why: "The measurement on your M2 Pro showed the per-byte path and scrollback memory were the bottlenecks.",
+      covers: ["A NEON scanner for printable text: 7–8 GiB/s to about 14 GiB/s", "Scrollback packed into one buffer per line: 420 MiB to 78 MiB for 100k lines", "Plain text throughput up about 50%, build logs about 33%"],
+      done: "merged into main and installed, with the numbers in docs/NEXT.md." },
+    { key: "shell", phase: "landed", title: "Shell integration, receipts and input methods", who: "Claude", size: "L", refs: ["875c9e3", "PR #4", "src/mac/receipts.rs", "shell/"],
+      why: "Every command should say how it went and what it cost, which matters for training runs on 16 GB.",
+      covers: ["zsh integration loaded automatically, marking prompts, commands and output", "Receipts: exit code, wall and CPU time, P-core share, energy and peak footprint", "Gutter bars, ⌘↑/⌘↓ between commands, and a Dock bounce for long runs", "Dead keys and input methods, with what you're composing underlined"],
+      done: "a live receipt read ✓ 4.2s · cpu 4.1s (P 100%) · 20.7 J · 425 MB, merged and installed." },
+
+    { key: "tabs", phase: "mac", title: "Tabs", who: "Claude", size: "M", refs: ["1c2f028", "PR #5", "src/mac/mod.rs", "src/mac/renderer.rs"],
+      why: "Several shells in one window, without giving up the rows the edge-to-edge layout saves.",
+      covers: ["⌘T, ⌘W (the window with its last tab), ⌘1–9, ⌘⇧[ ], ⌃⇥, click and middle-click", "Each tab keeps its own shell, scrollback, receipts and selection", "A strip drawn in cells along the bottom edge, shown only with two or more tabs (your choice of the bottom)", "Named after the running command, the folder, or a program's title; a green or red dot when a background tab's command finishes"],
+      done: "you work in several tabs in one window and switching is instant." },
+    { key: "notify", phase: "mac", title: "Notifications for long commands", who: "Claude", size: "S", refs: ["fd60db8", "PR #6", "src/mac/notify.rs"],
+      why: "A training run that finishes while you're in another app should tell you, with its receipt.",
+      covers: ["A notification with the command line, its folder and its receipt when a command of notify.after seconds (10) or more ends while you're elsewhere", "Clicking it brings that window and tab to the front", "A Dock bounce instead when running outside the app bundle"],
+      done: "a finished run in the background shows its receipt as a notification." },
+    { key: "shells", phase: "mac", title: "bash and fish integration", who: "Claude", size: "M", refs: ["f6464cb", "156496e", "PR #7", "shell/tachyon-integration.bash", "shell/xdg/fish/"],
+      why: "Command bars and receipts should work on clusters and in other shells, not only your zsh.",
+      covers: ["bash through --rcfile, reading your startup files first; macOS's 3.2 and Homebrew's 5.3, chaining existing DEBUG traps and PROMPT_COMMAND", "fish through vendor_conf.d, wrapping fish_prompt to mark where typing starts", "LC_TERMINAL=Tachyon so the scripts turn on over ssh, with the steps in the README", "Fixed on the way: a backslash printed after any escape sequence ended by ST, which fish 4, tmux and vim send"],
+      done: "receipts appear in bash and fish." },
+    { key: "macdetails", phase: "mac", title: "Mac details", who: "Claude", size: "S", refs: ["fd60db8", "PR #6", "src/mac/links.rs"],
+      why: "Small things expected on a Mac.",
+      covers: ["Quick Look on ⌘-click of a path, resolved from the tab's folder", "Open URLs with ⌘-click", "Secure Keyboard Entry while a program reads a password (echo off in line mode), with a note on the prompt line"],
+      done: "each works in the installed app." },
+    { key: "glass", phase: "mac", title: "Liquid Glass and appearance-following colours", who: "Claude", size: "M", refs: ["18afc6d", "PR #8", "3b9f14e", "PR #9", "6662334", "PR #11", "src/mac/strip.rs"],
+      why: "To match Apple's look: glass behind, letters kept opaque and sharp.",
+      covers: ["NSGlassEffectView behind a clear Metal layer, the Mac default, rounded like the window: clear glass tinted with the theme's background (window.glass_tint 0.75), which keeps its refraction", "The tabs float in their own glass capsule, where Liquid Glass's refraction and rim light show", "A light theme with its own ANSI colours, switched with Light and Dark Mode; theme.appearance and theme.light.*", "accent for the cursor and selection", "Opaque with Reduce Transparency; idle CPU still 0.0%"],
+      done: "it looks at home next to your other Mac apps, with no drop in speed." },
+
+    { key: "lens", phase: "work", title: "Metric lens", who: "Claude", size: "M", refs: ["d8fd98b", "PR #10", "src/term/lens.rs", "src/mac/dock.rs"],
+      why: "Training output scrolls by; the trend is what you want to see.",
+      covers: ["loss=, acc:, {'loss': …}, it/s, tok/s and tqdm's % read from the output stream, so tqdm's \\r redraws count", "On the prompt line: the latest loss with a sparkline, the rate and the percentage, beside the receipt, or shorter when the line is long", "A tqdm bar drives a progress bar on the Dock icon", "Every line of a training log is read; floods are sampled, so a 160 MB cat costs nothing measurable"],
+      done: "a training run shows its loss curve on the prompt line." },
+    { key: "jobs", phase: "work", title: "Job tabs, Nexus first, then Slurm", who: "Claude", size: "L", refs: ["3849a48", "PR #12", "src/term/jobs.rs", "shell/tachyon-job"],
+      why: "The MacBook submits and forge and atlas run. Following a job shouldn't take nexus logs by hand.",
+      covers: ["A submission's prompt line offers ⌘J follows j-1a2b3c4d; ⌘J or ⌘-click on the id opens the tab", "shell/tachyon-job streams the log and names the tab from nexus jobs or squeue: running on forge, then finished or failed", "Exits with the job's code, so the tab gets a receipt, the metric lens and a notification", "Slurm too, through the same ssh when submitted on a cluster"],
+      done: "a Nexus job you submit can be followed in its own tab to the end." },
+    { key: "rerun", phase: "work", title: "Rerun diff", who: "Claude", size: "M", refs: ["3f32615", "PR #13", "src/term/rerun.rs"],
+      why: "When you run something again, what changed is usually the point.",
+      covers: ["A rerun is the same command line with numbers ignored, so a learning-rate sweep compares run to run", "Lines are paired by shape, so a changed loss reads as changed; changed and new lines get an amber gutter mark", "The prompt line says 2 lines changed or same as last run; hover a mark for the old line"],
+      done: "rerunning a test suite marks exactly the lines that changed." },
+
+    { key: "rewind", phase: "core", title: "Rewind and cell provenance", who: "Claude", size: "L", refs: ["5dcab47", "1bbfd9d", "src/term/rewind.rs"],
+      why: "Scrollback never keeps what htop, nvtop or an agent UI drew on the alternate screen.",
+      covers: ["Each tab's newest 32 MiB in memory and up to 512 MiB more on disk, LZ4-compressed", "Seek any moment in 3.9 ms (memory) or 15.8 ms (disk); ⌘[ / ⌘], a slider and the wheel", "Option-click a cell to see the bytes that wrote it, their offset and time"],
+      done: "you can scrub back through a finished htop session, and it is." },
+    { key: "host", phase: "core", title: "Runs that outlive the window", who: "Claude", size: "L", refs: ["99f43ed", "93689e3", "src/mac/host.rs", "src/mac/power.rs"],
+      why: "Quitting or updating the app shouldn't kill a run.",
+      covers: ["A host process owns the shells and their screens; ⌘Q keeps them, ⌥⌘Q ends them", "Windows, tabs, splits and screens come back on reopening", "⌥⌘A keeps the Mac awake while a pane's command runs, held by the host (93689e3)", "Follow-up: Rewind across a restart"],
+      done: "a run keeps going across quitting and reopening Tachyon." },
+    { key: "splits", phase: "core", title: "Split panes", who: "Claude", size: "M", refs: ["ef92711", "src/mac/panes.rs"],
+      why: "Watching a job and editing beside it, in one tab.",
+      covers: ["⌘D and ⌘⇧D split on cell boundaries, the new shell in the same folder", "Move between panes with ⌘⌥ and the arrows, or a click; drag dividers; ⌘⇧↩ zooms"],
+      done: "you can split a tab and resize the panes." },
+    { key: "ligatures", phase: "core", title: "Ligatures and emoji sequences", who: "Claude", size: "M", refs: ["8e0d01f", "src/mac/font.rs", "src/mac/renderer.rs"],
+      why: "Fonts with ligatures, and emoji with skin tones or ZWJ, should draw as one glyph.",
+      covers: ["Core Text shaping of the spans that need it, cached", "Emoji sequences across cells drawn as one glyph; ligatures in fonts that have them (JetBrains Mono checked; Cascadia Code isn't installed)"],
+      done: "Cascadia Code ligatures and family emoji draw correctly." },
+    { key: "writepath", phase: "core", title: "Write path toward 1 GiB/s", who: "Claude", size: "M", refs: ["3b95fab", "src/term/mod.rs"],
+      why: "The scanner is far ahead of the grid writes, which now limit throughput.",
+      covers: ["Profiled: scrolling and row clears took over half the time", "Floods of plain lines go to the scrollback from their bytes: 640 → 2,300 MiB/s; build logs and TUI redraws unchanged"],
+      done: "plain text throughput is near 1 GiB/s, measured." },
+    { key: "ledger", phase: "core", title: "Latency ledger", who: "Claude", size: "M", refs: ["f04d5a6", "src/mac/ledger.rs"],
+      why: "To see where each keystroke's delay goes: the shell, ssh, or Tachyon.",
+      covers: ["Timestamps from the key event to the frame reaching the screen", "Each stage as an os_signpost interval for Instruments"],
+      done: "a keystroke's delay can be read stage by stage." },
+    { key: "rex-spec", phase: "mux", title: "Rex-style multi-host architecture & Mux v2 protocol spec", who: "Antigravity", size: "S", refs: ["docs/REX_ARCHITECTURE.md"],
+      why: "Lock down the portable server taxonomy (Host → Session → Window → Block), framed wire protocol, CLI, UI layout and 4-milestone rollout before coding.",
+      covers: ["9-byte binary framed protocol (JSON RPC/events + raw PTY I/O + LZ4 Term::to_vt snapshots)", "Single SSH stdio tunnel (tachyon bridge) over ~/.ssh/config + Tailscale for kagutsuchi, Linux and Windows", "Collapsible Liquid Glass sidebar + subtle per-pane headers wrapping TachyonView cleanly", "OSC 7501 status protocol and coding agent skills/hooks"],
+      done: "docs/REX_ARCHITECTURE.md is written and reviewed." },
+    { key: "mux-server", phase: "mux", title: "Milestone 1: Portable server, Mux v2 protocol, CLI & Mac mini host", who: "Antigravity", size: "L", refs: ["src/mux/", "src/server/", "kagutsuchi"],
+      why: "Replace local-only SCM_RIGHTS fd passing with a portable multiplexer daemon that runs locally and on kagutsuchi over SSH, driven by a scriptable CLI.",
+      covers: ["Default gui Cargo feature so headless tachyon builds with zero GUI deps on macOS, Linux and Windows", "Portable Unix PTY host, Session → Window → Block tree, LZ4 restore snapshots and slow-client resync", "tachyon server + tachyon bridge + CLI (ls, new, session, window, split, run --wait, send, capture, events, hosts) with --json and -S", "Live deployment and launchd service on Mac mini (kagutsuchi) + echo/throughput benchmarks"],
+      done: "sessions live on kagutsuchi and local MacBook, survive disconnects, and can be automated with tachyon CLI." },
+    { key: "rex-sidebar", phase: "mux", title: "Milestone 2: Multi-host Mac client, Liquid Glass sidebar & pane headers", who: "Antigravity", size: "L", refs: ["src/mac/sidebar.rs", "src/mac/mod.rs"],
+      why: "Make local and remote sessions first-class side by side in one native macOS window, with Rex's spatial workspace layout and Tachyon's glass chrome.",
+      covers: ["HostManager maintaining multiplexed MuxClient connections to This Mac + kagutsuchi with auto-reconnect and RTT ping", "Collapsible Liquid Glass left sidebar (⌘B): Host → Session → Window tree, live filter, host/server controls", "Subtle per-pane header bars (icon, title, remote host badge, split/zoom/close)", "Existing Tachyon tools (Fairy, Sysmon, Neutrino, Rewind, Receipts, Lens, Quick Terminal) preserved intact"],
+      done: "you can switch between This Mac and kagutsuchi sessions/splits seamlessly from the sidebar." },
+    { key: "agent-integrations", phase: "mux", title: "Milestone 3: OSC 7501, coding agent integrations & Settings UI", who: "Antigravity", size: "M", refs: ["src/term/mod.rs", "src/term/restore.rs"],
+      why: "Track multiple coding agents across hosts without clicking through every pane, and let agents drive Tachyon panes directly.",
+      covers: ["Native OSC 7501 status parsing (idle, working, blocked, done, error, app, msg) preserved in Term::to_vt()", "Live agent icons, status badges in sidebar/headers, and macOS notifications when remote agents block or finish", "tachyon skill setup + Claude Code / Codex / OpenCode / Pi hooks & agent session naming", "Native ⌘, Settings window (Server, Remote Hosts, Integrations, Interface, Notifications)"],
+      done: "coding agents report live state across local and remote hosts and can spawn/inspect Tachyon panes." },
+    { key: "cross-platform-hosts", phase: "mux", title: "Milestone 4: Linux & Windows PC hosts + optional Tailscale TCP", who: "Antigravity", size: "M", refs: ["src/pty/mod.rs", "src/server/"],
+      why: "Bring your Linux and Windows PCs into the exact same Tachyon sidebar as first-class session hosts.",
+      covers: ["Linux headless build + systemd --user service installer (tachyon server install-service)", "Windows ConPTY server wiring + named pipe listener + service installer", "Optional direct Tailscale TCP listener (--listen + token auth) alongside SSH"],
+      done: "Mac mini, Linux and Windows PCs can all host persistent Tachyon sessions in the sidebar." }
+  ];
+  var LABEL = { todo: "Not started", doing: "In progress", done: "Done", skipped: "Skipped" };
+  var STORAGE_KEY = "tachyon-status-overrides-v1";
+  var INITIAL_STATE = {"concept": {"status": "done", "updated": "2026-11-08T19:03:00+11:00"}, "backend": {"status": "done", "updated": "2026-11-08T19:36:00+11:00"}, "font": {"status": "done", "updated": "2026-11-08T19:36:00+11:00"}, "windows": {"status": "done", "updated": "2026-11-08T19:53:00+11:00"}, "edge": {"status": "done", "updated": "2026-11-08T20:41:00+11:00"}, "everyday": {"status": "done", "updated": "2026-11-09T08:42:00+11:00"}, "speed": {"status": "done", "updated": "2026-11-09T08:43:00+11:00"}, "shell": {"status": "done", "updated": "2026-11-09T09:09:00+11:00"}, "tabs": {"status": "done", "updated": "2026-11-09T10:05:00+11:00", "note": "Merged into main as 94d3b99 (PR #5) and installed."}, "notify": {"status": "done", "updated": "2026-11-09T11:40:00+11:00", "note": "Merged into main as 30ea9da (PR #6) and installed."}, "macdetails": {"status": "done", "updated": "2026-11-09T11:40:00+11:00", "note": "Merged into main as 30ea9da (PR #6) and installed. Tried live: Quick Look on a ⌘-clicked path, and Secure Keyboard Entry on and off around a getpass prompt."}, "shells": {"status": "done", "updated": "2026-11-09T12:29:00+11:00", "note": "Merged into main as 4e9be61 (PR #7) and installed. Tested in bash 3.2 and 5.3 and fish 4.9.3, in a pseudo-terminal and in the app."}, "glass": {"status": "done", "updated": "2026-11-09T13:29:00+11:00", "note": "On main as 220b311 (PRs #8, #9, #11) and installed: clear Liquid Glass tinted with the theme (glass_tint 0.75), rounded like the window, with the tabs in a floating glass capsule."}, "lens": {"status": "done", "updated": "2026-11-09T13:29:00+11:00", "note": "Merged into main as b4e1020 (PR #10) and installed. Tried with a fake tqdm training run (readout, sparkline, Dock bar)."}, "jobs": {"status": "done", "updated": "2026-11-09T13:47:00+11:00", "note": "Merged into main as 4b6fb1c (PR #12) and installed; detached host notifications merged in #38 (e4e3f86)."}, "rerun": {"status": "done", "updated": "2026-11-09T14:00:00+11:00", "note": "Merged into main as 9be64b6 (PR #13) and installed."}, "rewind": {"status": "done", "updated": "2026-11-09T15:15:00+11:00", "note": "Merged into main as #14 (580a050) and installed: disk log (LZ4, up to 512 MiB a tab, deleted on close), scrub slider and wheel, ⌥-click provenance. Seek 3.9 ms in memory, 15.8 ms on disk."}, "splits": {"status": "done", "updated": "2026-11-09T15:55:00+11:00", "note": "Merged into main as #15 (966f0da) and installed: ⌘D / ⌘⇧D on whole cells, ⌘⌥ arrows, click to focus, draggable dividers, ⌘⇧↩ zoom, ⌘W closes a pane. Idle stays at 0.0% CPU."}, "host": {"status": "done", "updated": "2026-11-09T17:10:00+11:00", "note": "Merged into main as #16 (60f8763) and installed: shells outlive quit, crash and update; windows, tabs, splits and screens come back; ⌥⌘A keeps the Mac awake for a command, held by the host."}, "writepath": {"status": "done", "updated": "2026-11-09T18:00:00+11:00", "note": "Merged as #17 (009af2a) and installed: plain text 640 → 2,300 MiB/s; build logs and TUI redraws unchanged."}, "ligatures": {"status": "done", "updated": "2026-11-09T18:00:00+11:00", "note": "Merged as #17 (009af2a) and installed: emoji sequences as one glyph, ligatures in fonts that have them."}, "ledger": {"status": "done", "updated": "2026-11-09T18:00:00+11:00", "note": "Merged as #17 (009af2a) and installed: ⌥⌘L shows each keystroke stage by stage; os_signpost intervals for Instruments."}, "rex-spec": {"status": "done", "updated": "2026-11-21T16:59:00+11:00", "note": "Written to docs/REX_ARCHITECTURE.md (Mux v2 framed protocol, SSH bridge for kagutsuchi, collapsible Liquid Glass sidebar, OSC 7501 & 4-milestone rollout)."}, "mux-server": {"status": "done", "updated": "2026-11-21T17:45:00+11:00", "note": "Built on mux-server and installed: 1.1 MB headless binary (--no-default-features), 9-byte Mux v2 framing (22 µs median local echo, p99 79 µs), full tachyon CLI linked at ~/.local/bin/tachyon, live launchd service running on kagutsuchi Mac mini (2.8–7.9 ms RTT over SSH bridge), 199/199 tests pass (120/120 headless)."}, "rex-sidebar": {"status": "todo", "updated": "2026-11-21T17:45:00+11:00", "note": "Up next: HostManager + collapsible Liquid Glass multi-host sidebar + per-pane headers."}, "agent-integrations": {"status": "todo"}, "cross-platform-hosts": {"status": "todo"}};
+  var state = {}, loaded = true, db = true, readOnly = false, writing = {};
+
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+  function build() {
+    var root = document.getElementById("phases");
+    PHASES.forEach(function (ph) {
+      var sec = el("section", "phase");
+      var head = el("div", "phase-head");
+      head.append(el("h3", null, ph.name), el("span", "phase-sub", ph.sub));
+      var c = el("span", "phase-count"); c.id = "count-" + ph.id; head.append(c);
+      sec.append(head);
+      var list = el("ol", "steps");
+      STEPS.filter(function (s) { return s.phase === ph.id; }).forEach(function (s) { list.append(stepRow(s)); });
+      sec.append(list); root.append(sec);
+    });
+  }
+  function stepRow(s) {
+    var li = el("li", "step paper"); li.id = "step-" + s.key;
+    li.append(el("span", "legend", s.size + " · " + s.who));
+    var body = el("div", "step-body");
+    var row = el("div", "title-row");
+    row.append(el("span", "title", s.title));
+    var next = el("span", "next-tag", "Next"); next.id = "next-" + s.key; next.hidden = true; row.append(next);
+    body.append(row, el("p", "why", s.why));
+    if (s.covers.length) { var ul = el("ul", "covers"); s.covers.forEach(function (c) { ul.append(el("li", null, c)); }); body.append(ul); }
+    var done = el("p", "done-when"); done.append(el("span", null, "Done when: "), document.createTextNode(s.done)); body.append(done);
+    var note = el("p", "note"); note.id = "note-" + s.key; note.hidden = true; body.append(note);
+    var meta = el("div", "meta");
+    meta.append(el("span", "tag who" + (s.who === "You" ? " you" : ""), s.who));
+    s.refs.forEach(function (r) { meta.append(el("span", "tag", r)); });
+    body.append(meta);
+    var ctl = el("div", "ctl");
+    var chip = el("span", "state", "—"); chip.id = "chip-" + s.key; ctl.append(chip);
+    var label = el("label", null, "Set status"); label.htmlFor = "st-" + s.key; ctl.append(label);
+    var sel = el("select"); sel.id = "st-" + s.key; sel.disabled = true;
+    Object.keys(LABEL).forEach(function (k) { var o = el("option", null, LABEL[k]); o.value = k; sel.append(o); });
+    sel.addEventListener("change", function () { setStatus(s.key, sel.value); });
+    ctl.append(sel);
+    var time = el("time"); time.id = "time-" + s.key; ctl.append(time);
+    li.append(body, ctl);
+    return li;
+  }
+  function statusOf(key) { var d = state[key]; return d && LABEL[d.status] ? d.status : "todo"; }
+  function apply() {
+    var done = 0, doing = 0, nextKey = null, perPhase = {};
+    STEPS.forEach(function (s) {
+      var st = loaded ? statusOf(s.key) : null;
+      var li = document.getElementById("step-" + s.key), chip = document.getElementById("chip-" + s.key), sel = document.getElementById("st-" + s.key), note = document.getElementById("note-" + s.key), time = document.getElementById("time-" + s.key);
+      li.classList.remove("is-done", "is-skipped", "is-next");
+      chip.className = "state" + (st ? " s-" + st : "");
+      chip.textContent = st ? LABEL[st] : "—";
+      if (st) {
+        if (document.activeElement !== sel) sel.value = st;
+        sel.disabled = !db || readOnly;
+        if (st === "done") { li.classList.add("is-done"); done += 1; }
+        if (st === "skipped") { li.classList.add("is-skipped"); done += 1; }
+        if (st === "doing") doing += 1;
+        if (!nextKey && st !== "done" && st !== "skipped") nextKey = s.key;
+        var p = perPhase[s.phase] || (perPhase[s.phase] = { d: 0 });
+        if (st === "done" || st === "skipped") p.d += 1;
+      }
+      var d = state[s.key], noteText = d && typeof d.note === "string" ? d.note : "";
+      note.hidden = !noteText; note.textContent = noteText;
+      var when = d && typeof d.updated === "string" ? new Date(d.updated) : null;
+      if (when && !isNaN(when)) { time.dateTime = d.updated; time.textContent = "Updated " + when.toLocaleDateString(undefined, { day: "numeric", month: "short" }); } else { time.textContent = ""; }
+    });
+    STEPS.forEach(function (s) {
+      document.getElementById("next-" + s.key).hidden = s.key !== nextKey;
+      if (s.key === nextKey) document.getElementById("step-" + s.key).classList.add("is-next");
+    });
+    PHASES.forEach(function (ph) {
+      var total = STEPS.filter(function (s) { return s.phase === ph.id; }).length, p = perPhase[ph.id];
+      document.getElementById("count-" + ph.id).textContent = loaded ? (p ? p.d : 0) + " of " + total + " done" : total + (total === 1 ? " step" : " steps");
+    });
+    var total = STEPS.length;
+    document.getElementById("progress-text").textContent = loaded ? done + " of " + total + " done" : "— of " + total + " done";
+    document.getElementById("bar-done").style.width = (loaded ? (done / total) * 100 : 0) + "%";
+    document.getElementById("bar-doing").style.width = (loaded ? (doing / total) * 100 : 0) + "%";
+    document.getElementById("sync-mini").textContent = loaded ? done + " of " + total + " steps done" : "";
+  }
+  function setSync(text, isErr) { var s = document.getElementById("sync"); s.textContent = text; s.classList.toggle("err", !!isErr); }
+  function loadState() {
+    var merged = {};
+    Object.keys(INITIAL_STATE).forEach(function (k) { merged[k] = Object.assign({}, INITIAL_STATE[k]); });
+    try {
+      var saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+      Object.keys(saved).forEach(function (k) {
+        if (!merged[k] || !merged[k].updated || (saved[k].updated && saved[k].updated > merged[k].updated)) {
+          merged[k] = Object.assign({}, merged[k] || {}, saved[k]);
+        }
+      });
+    } catch (_) {}
+    state = merged;
+  }
+  function setStatus(key, status) {
+    if (!LABEL[status]) return;
+    var prev = state[key] || {};
+    if (prev.status === status) return;
+    var body = { status: status, updated: new Date().toISOString() };
+    if (typeof prev.note === "string" && prev.note) body.note = prev.note;
+    state[key] = body;
+    try {
+      var saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+      saved[key] = body;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+    } catch (_) {}
+    apply();
+    setSync("Saved locally · repo copy docs/status.html");
+  }
+  function spy() {
+    var ids = ["plan", "concept", "backlog", "guide", "cheatsheet"], links = {};
+    document.querySelectorAll("[data-spy]").forEach(function (a) { links[a.getAttribute("data-spy")] = a; });
+    function mark() {
+      var current = null;
+      ids.forEach(function (id) { if (document.getElementById(id).getBoundingClientRect().top <= 140) current = id; });
+      ids.forEach(function (id) { links[id].setAttribute("aria-current", String(id === current)); });
+    }
+    window.addEventListener("scroll", mark, { passive: true });
+    mark();
+  }
+  loadState();
+  build(); apply(); spy();
+  setSync("Synced · Antigravity + docs/status.html");
+  if (location.hash) { var target = document.getElementById(location.hash.slice(1)); if (target) setTimeout(function () { target.scrollIntoView(); }, 0); }
+})();
+</script>
+<script>
+(function () {
+  "use strict";
+  var WORDS = { "⌘": " command cmd", "⇧": " shift", "⌥": " option alt", "⌃": " control ctrl", "↑": " up", "↓": " down" };
+  function norm(t) { return t.toLowerCase().replace(/[⌘⇧⌥⌃↑↓]/g, function (c) { return c + WORDS[c]; }).replace(/\s+/g, " "); }
+  function filterer(o) {
+    var input = document.getElementById(o.input), count = document.getElementById(o.count), empty = document.getElementById(o.empty);
+    var groups = [].slice.call(document.querySelectorAll(o.group)), items = [];
+    groups.forEach(function (g) {
+      var name = (g.querySelector(".legend") || {}).textContent || "";
+      [].slice.call(g.querySelectorAll(o.item)).forEach(function (it) { items.push({ el: it, g: g, text: norm(it.textContent + " " + name) }); });
+    });
+    function run() {
+      var terms = norm(input.value.trim()).split(" ").filter(Boolean), shown = 0;
+      items.forEach(function (i) { var hit = terms.every(function (t) { return i.text.indexOf(t) !== -1; }); i.el.hidden = !hit; if (hit) shown++; });
+      groups.forEach(function (g) {
+        var vis = [].filter.call(g.querySelectorAll(o.item), function (x) { return !x.hidden; });
+        (o.cell ? g.closest(o.cell) : g).hidden = vis.length === 0;
+        [].forEach.call(g.querySelectorAll(".firstv, .lastv"), function (x) { x.classList.remove("firstv", "lastv"); });
+        if (vis.length) { vis[0].classList.add("firstv"); vis[vis.length - 1].classList.add("lastv"); }
+      });
+      empty.hidden = shown !== 0;
+      count.textContent = terms.length ? shown + " of " + items.length + " shown" : items.length + " " + o.noun;
+    }
+    input.addEventListener("input", run);
+    input.addEventListener("keydown", function (e) { if (e.key === "Escape" && input.value) { e.preventDefault(); input.value = ""; run(); } });
+    run();
+  }
+  filterer({ input: "bl-filter", count: "bl-count", empty: "bl-empty", group: ".bl-group", item: ".bl-item", cell: ".bl-cell", noun: "items" });
+  filterer({ input: "cheat-filter", count: "cheat-count", empty: "cheat-empty", group: ".cheat", item: "tr", noun: "shortcuts" });
+})();
+</script>
+
+</body></html>

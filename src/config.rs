@@ -643,7 +643,7 @@ impl Config {
             "editor" => self.macos.editor = value.to_string(),
             "monitor.enabled" => self.macos.monitor = parse_bool(value)?,
             "quick.hotkey" => {
-                #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", feature = "gui"))]
                 crate::mac::hotkey::parse(value)?;
                 self.macos.quick_hotkey = value.to_string();
             }
