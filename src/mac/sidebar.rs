@@ -12,10 +12,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use block2::RcBlock;
+use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -33,14 +35,15 @@ use objc2_foundation::{
     NSAttributedString, NSAttributedStringKey, NSDictionary, NSNotification, NSObject,
     NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer,
 };
+use parking_lot::Mutex;
 
 use super::host_mgr::{HostStatus, HostView};
 use super::renderer::chrome_tokens;
 use super::{machines, with_window};
 use crate::config::ChromeStyle;
 use crate::mux::model::{
-    format_elapsed, git_branch_for_dir, group_agents_by_project, space_monogram, AgentCounts,
-    AgentEntry, AgentFilter, HostColor,
+    format_elapsed, git_info_for_dir, group_agents_by_project, space_monogram, AgentCounts,
+    AgentEntry, AgentFilter, GitDirInfo, HostColor,
 };
 use crate::term::{ProgramState, ProgramStatus};
 
@@ -52,6 +55,82 @@ const UTILITY_FOOTER_H: f64 = 58.0;
 const AGENTS_HEADER_H: f64 = 26.0;
 const EMPTY_AGENTS_H: f64 = 50.0;
 const RESIZE_GRIP_W: f64 = 6.0;
+
+struct GitDirtyState {
+    entries: HashMap<PathBuf, (Instant, bool)>,
+    in_flight: HashSet<PathBuf>,
+}
+
+struct GitDirtyProbe {
+    state: Mutex<GitDirtyState>,
+    tx: mpsc::Sender<(PathBuf, u64)>,
+}
+
+fn git_dirty_probe() -> &'static GitDirtyProbe {
+    static PROBE: OnceLock<GitDirtyProbe> = OnceLock::new();
+    PROBE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(PathBuf, u64)>();
+        let probe = GitDirtyProbe {
+            state: Mutex::new(GitDirtyState {
+                entries: HashMap::new(),
+                in_flight: HashSet::new(),
+            }),
+            tx,
+        };
+        let _ = std::thread::Builder::new()
+            .name("tachyon-git-probe".into())
+            .spawn(move || {
+                while let Ok((root, win_id)) = rx.recv() {
+                    let dirty = crate::mux::worktree::is_worktree_dirty(&root).unwrap_or(false);
+                    let p = git_dirty_probe();
+                    let changed = {
+                        let mut st = p.state.lock();
+                        st.in_flight.remove(&root);
+                        let prev = st.entries.get(&root).map(|(_, d)| *d);
+                        if st.entries.len() > 128 {
+                            let now = Instant::now();
+                            st.entries.retain(|_, (ts, _)| {
+                                now.saturating_duration_since(*ts) < Duration::from_secs(60)
+                            });
+                        }
+                        st.entries.insert(root, (Instant::now(), dirty));
+                        prev.map_or(dirty, |old| old != dirty)
+                    };
+                    if changed && win_id != 0 {
+                        DispatchQueue::main().exec_async(move || {
+                            super::refresh_window_sidebar(win_id);
+                        });
+                    }
+                }
+            });
+        probe
+    })
+}
+
+/// Non-blocking cache lookup + background probe for dirty worktrees (zero idle wake-ups).
+pub fn query_git_dirty(worktree_root: &Path, win_id: u64) -> bool {
+    const TTL: Duration = Duration::from_secs(5);
+    let probe = git_dirty_probe();
+    let now = Instant::now();
+    let (cached, should_send) = {
+        let mut st = probe.state.lock();
+        let (cached, fresh) = match st.entries.get(worktree_root) {
+            Some((ts, d)) => (*d, now.saturating_duration_since(*ts) < TTL),
+            None => (false, false),
+        };
+        let send = if !fresh && !st.in_flight.contains(worktree_root) {
+            st.in_flight.insert(worktree_root.to_path_buf());
+            true
+        } else {
+            false
+        };
+        (cached, send)
+    };
+    if should_send {
+        let _ = probe.tx.send((worktree_root.to_path_buf(), win_id));
+    }
+    cached
+}
 
 const BRAILLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -86,6 +165,8 @@ enum TreeRow {
         host: String,
         session_id: String,
         name: String,
+        cwd: Option<String>,
+        is_worktree: bool,
     },
     Window {
         host: String,
@@ -98,6 +179,9 @@ enum TreeRow {
         status: Option<ProgramStatus>,
         host_color: Option<HostColor>,
         git_branch: Option<String>,
+        git_dirty: bool,
+        is_worktree: bool,
+        cwd: Option<String>,
         blocked_count: usize,
         error_count: usize,
     },
@@ -134,7 +218,7 @@ struct TreeState {
     agents_only: Cell<bool>,
     active_target: RefCell<Option<(String, String)>>, // (host, window_id)
     rows: RefCell<Vec<(f64, f64, TreeRow)>>,          // (y_top, height, row) in flipped coords
-    branch_cache: RefCell<HashMap<String, (Instant, Option<String>)>>,
+    git_cache: RefCell<HashMap<String, (Instant, Option<GitDirInfo>)>>,
     content_h: Cell<f64>,
     scroll_y: Cell<f64>,
     hover: Cell<Option<(usize, RowAction)>>,
@@ -345,6 +429,30 @@ define_class!(
                 super::mux_kill_window(self.ivars().window.get(), &host, &wid);
             }
         }
+
+        #[unsafe(method(ctxNewWorktree:))]
+        fn ctx_new_worktree(&self, sender: Option<&AnyObject>) {
+            if let Some(cwd) = rep_string(sender) {
+                super::mux_prompt_new_worktree(self.ivars().window.get(), Some(cwd));
+            }
+        }
+
+        #[unsafe(method(ctxRemoveWorktree:))]
+        fn ctx_remove_worktree(&self, sender: Option<&AnyObject>) {
+            if let Some(raw) = rep_string(sender) {
+                let mut parts = raw.splitn(3, '\u{1F}');
+                if let (Some(host), Some(sid), Some(cwd)) =
+                    (parts.next(), parts.next(), parts.next())
+                {
+                    super::mux_prompt_remove_worktree(
+                        self.ivars().window.get(),
+                        host.to_string(),
+                        sid.to_string(),
+                        cwd.to_string(),
+                    );
+                }
+            }
+        }
     }
 );
 
@@ -364,26 +472,27 @@ impl SidebarTreeView {
         x >= (w - RESIZE_GRIP_W).max(0.0)
     }
 
-    fn resolve_local_branch(&self, cwd: &str) -> Option<String> {
+    fn resolve_local_git_info(&self, cwd: &str) -> Option<GitDirInfo> {
         let now = Instant::now();
-        let mut cache = self.ivars().branch_cache.borrow_mut();
+        let mut cache = self.ivars().git_cache.borrow_mut();
         if let Some((ts, cached)) = cache.get(cwd) {
             if now.duration_since(*ts) < Duration::from_secs(3) {
                 return cached.clone();
             }
         }
-        let branch = git_branch_for_dir(Path::new(cwd));
+        let info = git_info_for_dir(Path::new(cwd));
         if cache.len() > 64 {
-            cache.retain(|_, (ts, _)| now.duration_since(*ts) < Duration::from_secs(30));
+            cache.retain(|_, (ts, _)| now.saturating_duration_since(*ts) < Duration::from_secs(30));
         }
-        cache.insert(cwd.to_string(), (now, branch.clone()));
-        branch
+        cache.insert(cwd.to_string(), (now, info.clone()));
+        info
     }
 
     fn rebuild_rows(&self) {
         let hosts = self.ivars().hosts.borrow();
         let filter = self.ivars().filter.borrow().trim().to_ascii_lowercase();
         let active = self.ivars().active_target.borrow().clone();
+        let win_id = self.ivars().window.get();
 
         let mut rows = Vec::new();
         let mut y = 6.0;
@@ -424,14 +533,27 @@ impl SidebarTreeView {
 
             if let Some(snap) = &h.snapshot {
                 let agents_only = self.ivars().agents_only.get();
-                let mut shown_any = false;
-                for sess in &snap.sessions {
+                struct BuiltSession {
+                    orig_idx: usize,
+                    common_root: Option<PathBuf>,
+                    is_worktree: bool,
+                    branch: String,
+                    srow: TreeRow,
+                    win_rows: Vec<TreeRow>,
+                }
+                let mut built_sessions: Vec<BuiltSession> = Vec::new();
+                let mut first_repo_idx: HashMap<PathBuf, usize> = HashMap::new();
+
+                for (s_idx, sess) in snap.sessions.iter().enumerate() {
                     let sess_matches = filter.is_empty()
                         || sess.name.to_ascii_lowercase().contains(&filter)
                         || h.display_name.to_ascii_lowercase().contains(&filter)
                         || h.alias.to_ascii_lowercase().contains(&filter);
 
                     let mut win_rows = Vec::new();
+                    let mut sess_git: Option<GitDirInfo> = None;
+                    let mut sess_cwd: Option<String> = None;
+
                     for wid in &sess.windows {
                         let Some(win) = snap.windows.iter().find(|w| &w.id == wid) else {
                             continue;
@@ -475,27 +597,51 @@ impl SidebarTreeView {
                             continue;
                         }
 
-                        let git_branch = if h.is_local {
-                            let cwd = focused
-                                .and_then(|b| b.cwd.as_deref())
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| {
-                                    leaves.iter().find_map(|bid| {
-                                        snap.blocks
-                                            .iter()
-                                            .find(|b| &b.id == bid)
-                                            .and_then(|b| b.cwd.as_deref())
-                                            .filter(|s| !s.is_empty())
-                                    })
-                                });
-                            cwd.and_then(|dir| self.resolve_local_branch(dir))
+                        let cwd = focused
+                            .and_then(|b| b.cwd.as_deref())
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                leaves.iter().find_map(|bid| {
+                                    snap.blocks
+                                        .iter()
+                                        .find(|b| &b.id == bid)
+                                        .and_then(|b| b.cwd.as_deref())
+                                        .filter(|s| !s.is_empty())
+                                })
+                            });
+                        if sess_cwd.is_none() {
+                            sess_cwd = cwd.map(str::to_string);
+                        }
+
+                        let git_info = if h.is_local {
+                            cwd.and_then(|dir| self.resolve_local_git_info(dir))
                         } else {
                             None
+                        };
+                        if sess_git.is_none() {
+                            sess_git = git_info.clone();
+                        }
+
+                        let (git_branch, git_dirty, is_worktree, git_repo) = match git_info {
+                            Some(info) => {
+                                let dirty = query_git_dirty(&info.worktree_root, win_id);
+                                (
+                                    Some(info.branch),
+                                    dirty,
+                                    info.is_linked_worktree,
+                                    Some(info.repo_name),
+                                )
+                            }
+                            None => (None, false, false, None),
                         };
 
                         let branch_matches = git_branch
                             .as_deref()
-                            .is_some_and(|br| br.to_ascii_lowercase().contains(&filter));
+                            .is_some_and(|br| br.to_ascii_lowercase().contains(&filter))
+                            || git_repo
+                                .as_deref()
+                                .is_some_and(|r| r.to_ascii_lowercase().contains(&filter))
+                            || (is_worktree && "worktree".contains(&filter));
                         if !sess_matches
                             && !title.to_ascii_lowercase().contains(&filter)
                             && !branch_matches
@@ -516,26 +662,71 @@ impl SidebarTreeView {
                             status,
                             host_color: resolved_color,
                             git_branch,
+                            git_dirty,
+                            is_worktree,
+                            cwd: cwd.map(str::to_string),
                             blocked_count,
                             error_count,
                         });
                     }
 
                     if !win_rows.is_empty() || (!agents_only && sess_matches && sess.windows.is_empty()) {
-                        shown_any = true;
-                        let srow = TreeRow::Session {
-                            host: h.alias.clone(),
-                            session_id: sess.id.clone(),
-                            name: sess.name.clone(),
+                        let (common_root, is_worktree, branch) = match sess_git {
+                            Some(g) => {
+                                first_repo_idx.entry(g.common_repo_root.clone()).or_insert(s_idx);
+                                (Some(g.common_repo_root), g.is_linked_worktree, g.branch)
+                            }
+                            None => (None, false, String::new()),
                         };
-                        let sh = srow.height();
-                        rows.push((y, sh, srow));
-                        y += sh;
-                        for wr in win_rows {
-                            let wh = wr.height();
-                            rows.push((y, wh, wr));
-                            y += wh;
-                        }
+                        built_sessions.push(BuiltSession {
+                            orig_idx: s_idx,
+                            common_root,
+                            is_worktree,
+                            branch,
+                            srow: TreeRow::Session {
+                                host: h.alias.clone(),
+                                session_id: sess.id.clone(),
+                                name: sess.name.clone(),
+                                cwd: sess_cwd,
+                                is_worktree,
+                            },
+                            win_rows,
+                        });
+                    }
+                }
+
+                if h.is_local {
+                    built_sessions.sort_by(|a, b| {
+                        let ga = a
+                            .common_root
+                            .as_ref()
+                            .and_then(|r| first_repo_idx.get(r).copied())
+                            .unwrap_or(a.orig_idx);
+                        let gb = b
+                            .common_root
+                            .as_ref()
+                            .and_then(|r| first_repo_idx.get(r).copied())
+                            .unwrap_or(b.orig_idx);
+                        ga.cmp(&gb)
+                            .then_with(|| a.is_worktree.cmp(&b.is_worktree))
+                            .then_with(|| {
+                                a.branch
+                                    .to_ascii_lowercase()
+                                    .cmp(&b.branch.to_ascii_lowercase())
+                            })
+                            .then_with(|| a.orig_idx.cmp(&b.orig_idx))
+                    });
+                }
+
+                let shown_any = !built_sessions.is_empty();
+                for item in built_sessions {
+                    let sh = item.srow.height();
+                    rows.push((y, sh, item.srow));
+                    y += sh;
+                    for wr in item.win_rows {
+                        let wh = wr.height();
+                        rows.push((y, wh, wr));
+                        y += wh;
                     }
                 }
                 if !shown_any && filter.is_empty() {
@@ -819,6 +1010,8 @@ impl SidebarTreeView {
                     status,
                     host_color,
                     git_branch,
+                    git_dirty,
+                    is_worktree,
                     blocked_count,
                     error_count,
                     ..
@@ -950,16 +1143,28 @@ impl SidebarTreeView {
 
                     if let Some(branch) = git_branch {
                         if right_x - 38.0 >= 112.0 {
-                            let bw = ((branch.chars().count() as f64) * 5.8 + 4.0)
-                                .min((right_x - 38.0) * 0.42)
-                                .min(82.0);
-                            let br_col = if minimal {
+                            let display_branch = match (*is_worktree, *git_dirty) {
+                                (true, true) => format!("⎇ {branch}*"),
+                                (true, false) => format!("⎇ {branch}"),
+                                (false, true) => format!("{branch}*"),
+                                (false, false) => branch.clone(),
+                            };
+                            let bw = ((display_branch.chars().count() as f64) * 5.8 + 4.0)
+                                .min((right_x - 38.0) * 0.44)
+                                .min(94.0);
+                            let br_col = if *git_dirty {
+                                if minimal {
+                                    srgb_alpha([0xF2, 0xA3, 0x3C], 0.92)
+                                } else {
+                                    NSColor::systemOrangeColor().colorWithAlphaComponent(0.92)
+                                }
+                            } else if minimal {
                                 srgb_alpha([0x69, 0x6A, 0x6D], 1.0)
                             } else {
                                 NSColor::secondaryLabelColor().colorWithAlphaComponent(0.75)
                             };
                             draw_text_right(
-                                branch,
+                                &display_branch,
                                 10.5,
                                 FontWeight::Regular,
                                 &br_col,
@@ -1062,15 +1267,43 @@ impl SidebarTreeView {
                     add("Remove Host", sel!(ctxRemoveHost:), alias.clone());
                 }
             }
-            TreeRow::Session { host, session_id, .. } => {
+            TreeRow::Session { host, session_id, cwd, is_worktree, .. } => {
                 let key = format!("{host}\u{1F}{session_id}");
                 add("New Window", sel!(ctxNewWindow:), key.clone());
+                if host == "local" {
+                    if let Some(dir) = cwd.as_deref().filter(|d| git_info_for_dir(Path::new(d)).is_some()) {
+                        add("New Worktree Space…", sel!(ctxNewWorktree:), dir.to_string());
+                    }
+                    if *is_worktree {
+                        if let Some(dir) = cwd.as_deref() {
+                            add(
+                                "Remove Worktree & Close…",
+                                sel!(ctxRemoveWorktree:),
+                                format!("{host}\u{1F}{session_id}\u{1F}{dir}"),
+                            );
+                        }
+                    }
+                }
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
                 add("Kill Session", sel!(ctxKillSession:), key);
             }
-            TreeRow::Window { host, session_id, window_id, .. } => {
+            TreeRow::Window { host, session_id, window_id, cwd, is_worktree, .. } => {
                 add("Open Window", sel!(ctxOpenWindow:), format!("{host}\u{1F}{window_id}"));
                 add("New Window in Session", sel!(ctxNewWindow:), format!("{host}\u{1F}{session_id}"));
+                if host == "local" {
+                    if let Some(dir) = cwd.as_deref().filter(|d| git_info_for_dir(Path::new(d)).is_some()) {
+                        add("New Worktree Space…", sel!(ctxNewWorktree:), dir.to_string());
+                    }
+                    if *is_worktree {
+                        if let Some(dir) = cwd.as_deref() {
+                            add(
+                                "Remove Worktree & Close…",
+                                sel!(ctxRemoveWorktree:),
+                                format!("{host}\u{1F}{session_id}\u{1F}{dir}"),
+                            );
+                        }
+                    }
+                }
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
                 add("Kill Window", sel!(ctxKillWindow:), format!("{host}\u{1F}{window_id}"));
             }

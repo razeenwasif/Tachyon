@@ -708,6 +708,20 @@ define_class!(
             refresh_if_open();
         }
 
+        #[unsafe(method(wsInstallStarters:))]
+        fn ws_install_starters(&self, _sender: Option<&AnyObject>) {
+            match super::mux_workspace_install_starters() {
+                Ok(created) if created.is_empty() => {
+                    self.set_note("Starter templates already installed (dev-fleet, agent-swarm, ml-cluster).");
+                }
+                Ok(created) => {
+                    self.set_note(&format!("Installed starter template(s): {}", created.join(", ")));
+                }
+                Err(e) => self.set_note(&format!("Starter install failed: {e}")),
+            }
+            refresh_if_open();
+        }
+
         #[unsafe(method(wsOpenFolder:))]
         fn ws_open_folder(&self, _sender: Option<&AnyObject>) {
             super::open_workspaces_folder();
@@ -1459,7 +1473,9 @@ impl SettingsWindow {
         b_init.setFrame(NSRect::new(NSPoint::new(296.0, 12.0), NSSize::new(104.0, 26.0)));
 
         let b_open = push_button(mtm, "Open Folder", target, sel!(wsOpenFolder:));
-        b_open.setFrame(NSRect::new(NSPoint::new(14.0, 48.0), NSSize::new(108.0, 26.0)));
+        b_open.setFrame(NSRect::new(NSPoint::new(14.0, 48.0), NSSize::new(104.0, 26.0)));
+        let b_starters = push_button(mtm, "Install Starters", target, sel!(wsInstallStarters:));
+        b_starters.setFrame(NSRect::new(NSPoint::new(124.0, 48.0), NSSize::new(122.0, 26.0)));
         let dir_lbl = label(
             mtm,
             &crate::mux::workspace::display_path(&crate::mux::workspace::workspaces_dir()),
@@ -1468,13 +1484,14 @@ impl SettingsWindow {
             &NSColor::tertiaryLabelColor(),
         );
         dir_lbl.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
-        dir_lbl.setFrame(NSRect::new(NSPoint::new(130.0, 53.0), NSSize::new(w - 144.0, 16.0)));
+        dir_lbl.setFrame(NSRect::new(NSPoint::new(254.0, 53.0), NSSize::new(w - 268.0, 16.0)));
 
         for v in [
             &*b_save as &NSView,
             &*b_all as &NSView,
             &*b_init as &NSView,
             &*b_open as &NSView,
+            &*b_starters as &NSView,
             &*dir_lbl as &NSView,
         ] {
             acard.addSubview(v);

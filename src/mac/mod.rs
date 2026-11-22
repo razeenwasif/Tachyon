@@ -8921,6 +8921,209 @@ fn mux_workspace_init_starter() -> Result<(String, std::path::PathBuf), String> 
     Ok((spec.name, path))
 }
 
+fn mux_workspace_install_starters() -> Result<Vec<String>, String> {
+    let hosts = crate::mux::load_hosts();
+    let installed = crate::mux::workspace::install_starter_templates(&hosts, false)?;
+    let created: Vec<String> = installed
+        .into_iter()
+        .filter_map(|(name, _, is_new)| is_new.then_some(name))
+        .collect();
+    if !created.is_empty() {
+        crate::log::force(&format!(
+            "installed starter workspace template(s): {}",
+            created.join(", ")
+        ));
+    }
+    settings::refresh_if_open();
+    Ok(created)
+}
+
+fn refresh_window_sidebar(win_id: u64) {
+    with_window(win_id, |w| w.sync_sidebar());
+}
+
+fn mux_prompt_new_worktree(win_id: u64, seed_cwd: Option<String>) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let target_win = default_target_win_id(win_id);
+    let active_cwd = seed_cwd.or_else(|| {
+        target_win
+            .and_then(|id| {
+                query_window(id, |w| {
+                    let tab = &w.tabs[w.active];
+                    tab.panes.get(tab.focus).and_then(|p| p.term.lock().cwd.clone())
+                })
+            })
+            .flatten()
+    });
+    let Some(cwd) = active_cwd else {
+        let alert = objc2_app_kit::NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("No Active Repository Folder"));
+        alert.setInformativeText(&NSString::from_str(
+            "Open or focus a shell inside a local git repository first.",
+        ));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        alert.runModal();
+        return;
+    };
+    let Some(repo_info) = crate::mux::model::git_info_for_dir(std::path::Path::new(&cwd)) else {
+        let alert = objc2_app_kit::NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("Not a Git Repository"));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "No .git repository found at `{cwd}`."
+        )));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        alert.runModal();
+        return;
+    };
+
+    let alert = objc2_app_kit::NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(&format!(
+        "New Git Worktree in `{}`",
+        repo_info.repo_name
+    )));
+    alert.setInformativeText(&NSString::from_str(
+        "Creates an isolated sibling branch worktree and opens a dedicated local session.",
+    ));
+    let field = objc2_app_kit::NSTextField::initWithFrame(
+        objc2_app_kit::NSTextField::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(280.0, 24.0)),
+    );
+    field.setPlaceholderString(Some(&NSString::from_str("branch name (e.g. feat/agent-fix)")));
+    alert.setAccessoryView(Some(&field));
+    alert.addButtonWithTitle(&NSString::from_str("Create Space"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.window().setInitialFirstResponder(Some(&field));
+    if alert.runModal() != objc2_app_kit::NSAlertFirstButtonReturn {
+        return;
+    }
+
+    let branch = field.stringValue().to_string();
+    let branch = branch.trim().to_string();
+    if branch.is_empty() {
+        return;
+    }
+
+    let Some(win) = target_win else { return };
+    let (cols, rows) = query_window(win, |w| (w.grid.0.max(40) as u16, w.grid.1.max(12) as u16))
+        .unwrap_or((120, 32));
+    let Some(client) = mux_client("local").or_else(|| host_mgr().and_then(|m| m.connect_local_now()))
+    else {
+        crate::log::force("worktree creation failed: local server unavailable");
+        return;
+    };
+    let mgr = host_mgr();
+    let repo_root = repo_info.common_repo_root;
+    let repo_name = repo_info.repo_name;
+    let _ = std::thread::Builder::new()
+        .name("tachyon-mux-worktree".into())
+        .spawn(move || {
+            let entry = match crate::mux::worktree::create_worktree(&repo_root, &branch, None, None) {
+                Ok(e) => e,
+                Err(e) => {
+                    crate::log::force(&format!("worktree add `{branch}` failed: {e}"));
+                    return;
+                }
+            };
+            let base_name = crate::mux::worktree::session_name_for_worktree(&repo_name, &branch);
+            let final_name = client
+                .state()
+                .ok()
+                .map(|snap| {
+                    let mut cand = base_name.clone();
+                    let mut idx = 2usize;
+                    while snap.sessions.iter().any(|s| s.name == cand) {
+                        cand = format!("{base_name}-{idx}");
+                        idx += 1;
+                    }
+                    cand
+                })
+                .unwrap_or(base_name);
+            let cwd_s = entry.path.to_string_lossy().into_owned();
+            let res = client
+                .create_session(Some(&final_name), Some(&cwd_s), None, Some(&branch), cols, rows)
+                .and_then(|(_sess, mux_win, blk)| {
+                    let _ = client.rename_window(&mux_win.id, &branch);
+                    let stream = client.attach(&blk.id, true, true)?;
+                    Ok((mux_win, blk, stream))
+                });
+            match res {
+                Ok((mux_win, blk, stream)) => {
+                    if let Some(m) = mgr {
+                        m.refresh_host("local");
+                    }
+                    let data = AttachedWindowData {
+                        host: "local".into(),
+                        window: mux_win,
+                        blocks: vec![(blk, stream)],
+                        client,
+                    };
+                    DispatchQueue::main().exec_async(move || {
+                        with_app(|app| {
+                            let cfg = app.cfg.clone();
+                            let w = app.windows.iter_mut().find(|w| w.id == win)?;
+                            if let Ok(tab) = build_tab_from_attached(&cfg, data) {
+                                w.add_tab(tab);
+                                w.focus_terminal();
+                            }
+                            Some(())
+                        });
+                    });
+                }
+                Err(e) => crate::log::force(&format!("worktree session failed: {e}")),
+            }
+        });
+}
+
+fn mux_prompt_remove_worktree(win_id: u64, host: String, session_id: String, cwd: String) {
+    if host != "local" {
+        return;
+    }
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let cwd_path = std::path::PathBuf::from(&cwd);
+    let wt_label = crate::mux::model::git_info_for_dir(&cwd_path)
+        .map(|i| format!("{} ({})", i.worktree_root.display(), i.branch))
+        .unwrap_or_else(|| cwd.clone());
+
+    let alert = objc2_app_kit::NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Remove Git Worktree & Close Space?"));
+    alert.setInformativeText(&NSString::from_str(&format!(
+        "Closes the Mux session and runs `git worktree remove` on:\n{wt_label}"
+    )));
+    alert.addButtonWithTitle(&NSString::from_str("Remove"));
+    alert.addButtonWithTitle(&NSString::from_str("Force Remove"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let choice = alert.runModal();
+    let force = if choice == objc2_app_kit::NSAlertFirstButtonReturn {
+        false
+    } else if choice == objc2_app_kit::NSAlertSecondButtonReturn {
+        true
+    } else {
+        return;
+    };
+
+    switch_away_before_kill(win_id, &host, Some(&session_id), None);
+    let client = mux_client(&host);
+    let mgr = host_mgr();
+    let _ = std::thread::Builder::new()
+        .name("tachyon-mux-wt-rm".into())
+        .spawn(move || {
+            if let Some(c) = client {
+                let _ = c.kill_session(&session_id);
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            let target = crate::mux::model::git_info_for_dir(&cwd_path)
+                .map(|i| i.worktree_root)
+                .unwrap_or(cwd_path);
+            let target_s = target.to_string_lossy().into_owned();
+            if let Err(e) = crate::mux::worktree::remove_worktree(&target, &target_s, force, false) {
+                crate::log::force(&format!("worktree remove failed: {e}"));
+            }
+            if let Some(m) = mgr {
+                m.refresh_host(&host);
+            }
+        });
+}
+
 fn open_workspaces_folder() {
     let dir = crate::mux::workspace::workspaces_dir();
     let _ = std::fs::create_dir_all(&dir);

@@ -39,9 +39,10 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 i += 1;
                 continue;
             }
-            "server" | "bridge" | "hosts" | "workspace" | "ws" | "agents" | "agent" | "ls"
-            | "new" | "session" | "window" | "split" | "run" | "send" | "capture" | "rewind"
-            | "events" | "skill" | "status" | "hook" | "help" | "--help" | "-h" => {
+            "server" | "bridge" | "hosts" | "workspace" | "ws" | "worktree" | "wt" | "agents"
+            | "agent" | "ls" | "new" | "session" | "window" | "split" | "run" | "send"
+            | "capture" | "rewind" | "events" | "skill" | "status" | "hook" | "help"
+            | "--help" | "-h" => {
                 return true;
             }
             _ => return false,
@@ -110,6 +111,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "server" => cmd_server(&opts, tail),
         "hosts" => cmd_hosts(&opts, tail),
         "workspace" | "ws" => cmd_workspace(&opts, tail),
+        "worktree" | "wt" => cmd_worktree(&opts, tail),
         "agents" | "agent" => cmd_agents(&opts, tail),
         "ls" => cmd_ls(&opts),
         "new" => cmd_session_new(&opts, tail),
@@ -1713,9 +1715,9 @@ fn connect_host_alias(alias: &str, auto_start: bool) -> Result<std::sync::Arc<Mu
 
 fn cmd_workspace(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     use crate::mux::workspace::{
-        display_path, list_workspaces, load_workspace, remove_workspace, save_workspace,
-        snapshot_workspace, starter_workspace, workspace_down, workspace_up, workspaces_dir,
-        WorkspaceUpOptions,
+        display_path, install_starter_templates, list_workspaces, load_workspace, remove_workspace,
+        save_workspace, snapshot_workspace, starter_workspace_with_preset, workspace_down,
+        workspace_up, workspaces_dir, StarterPreset, WorkspaceUpOptions,
     };
 
     let sub = args.first().map(String::as_str).unwrap_or("ls");
@@ -1768,25 +1770,70 @@ fn cmd_workspace(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
         }
         "init" => {
             let mut name: Option<String> = None;
+            let mut preset_spec: Option<String> = None;
+            let mut starters = false;
             let mut force = false;
-            for a in rest {
-                match a.as_str() {
-                    "--force" | "-f" => force = true,
+            let mut idx = 0;
+            while idx < rest.len() {
+                match rest[idx].as_str() {
+                    "--force" | "-f" => {
+                        force = true;
+                        idx += 1;
+                    }
+                    "--starters" => {
+                        starters = true;
+                        idx += 1;
+                    }
+                    "--preset" => {
+                        let p = rest
+                            .get(idx + 1)
+                            .ok_or("--preset requires basic|fleet|swarm|ml")?;
+                        preset_spec = Some(p.clone());
+                        idx += 2;
+                    }
                     other if other.starts_with('-') => {
                         return Err(format!("unknown workspace init option `{other}`"));
                     }
                     other => {
                         if name.is_none() {
                             name = Some(other.to_string());
+                            idx += 1;
                         } else {
                             return Err(format!("unexpected argument `{other}`"));
                         }
                     }
                 }
             }
-            let name = name.ok_or("usage: tachyon workspace init <name> [--force]")?;
             let hosts = load_hosts();
-            let spec = starter_workspace(&name, &hosts)?;
+            if starters {
+                let installed = install_starter_templates(&hosts, force)?;
+                if opts.json {
+                    let arr: Vec<Value> = installed
+                        .iter()
+                        .map(|(n, p, created)| {
+                            json!({
+                                "name": n,
+                                "path": p.to_string_lossy(),
+                                "created": created,
+                            })
+                        })
+                        .collect();
+                    print_json(&json!({ "templates": arr }));
+                } else {
+                    for (n, p, created) in &installed {
+                        let tag = if *created { "created" } else { "kept existing" };
+                        println!("{tag} starter `{n}` -> {}", display_path(p));
+                    }
+                }
+                return Ok(0);
+            }
+            let preset = match preset_spec.as_deref() {
+                Some(raw) => StarterPreset::parse(raw)
+                    .ok_or_else(|| format!("unknown starter preset `{raw}` (expected basic|fleet|swarm|ml)"))?,
+                None => StarterPreset::Basic,
+            };
+            let final_name = name.unwrap_or_else(|| preset.default_name().to_string());
+            let spec = starter_workspace_with_preset(&final_name, preset, &hosts)?;
             let path = save_workspace(&spec, force)?;
             if opts.json {
                 print_json(&json!({
@@ -2050,6 +2097,345 @@ fn cmd_workspace(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
 }
 
 // ---------------------------------------------------------------------------
+// worktree (Git worktree spaces)
+// ---------------------------------------------------------------------------
+
+fn sessions_for_worktree<'a>(
+    snap: &'a crate::mux::model::ServerSnapshot,
+    wt_path: &std::path::Path,
+) -> Vec<&'a crate::mux::model::SessionInfo> {
+    let mut ids = std::collections::HashSet::new();
+    for b in &snap.blocks {
+        if let Some(cwd) = b.cwd.as_deref() {
+            if crate::mux::worktree::path_is_inside(std::path::Path::new(cwd), wt_path) {
+                ids.insert(b.session_id.as_str());
+            }
+        }
+    }
+    snap.sessions
+        .iter()
+        .filter(|s| ids.contains(s.id.as_str()))
+        .collect()
+}
+
+fn cmd_worktree(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    use crate::mux::model::git_info_for_dir;
+    use crate::mux::worktree;
+
+    let sub = args.first().map(String::as_str).unwrap_or("ls");
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+
+    match sub {
+        "ls" | "list" => {
+            let mut repo: Option<PathBuf> = None;
+            let mut dirty = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--repo" | "-C" => {
+                        let p = rest.get(i + 1).ok_or("--repo requires a directory")?;
+                        repo = Some(PathBuf::from(p));
+                        i += 2;
+                    }
+                    "--dirty" => {
+                        dirty = true;
+                        i += 1;
+                    }
+                    other => return Err(format!("unknown worktree ls option `{other}`")),
+                }
+            }
+            let dir = match repo {
+                Some(p) => p,
+                None => std::env::current_dir().map_err(|e| e.to_string())?,
+            };
+            let root = worktree::repo_root(&dir)?;
+            let entries = worktree::list_worktrees(&root, dirty)?;
+            let snap = connect(opts, false).ok().and_then(|(_, c)| c.state().ok());
+
+            if opts.json {
+                let items: Vec<Value> = entries
+                    .iter()
+                    .map(|e| {
+                        let mut v = e.to_json();
+                        let sess_names: Vec<Value> = snap
+                            .as_ref()
+                            .map(|s| {
+                                sessions_for_worktree(s, &e.path)
+                                    .into_iter()
+                                    .map(|si| json!({ "id": si.id, "name": si.name }))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        v["sessions"] = Value::Array(sess_names);
+                        v
+                    })
+                    .collect();
+                print_json(&json!({
+                    "repo_root": root.to_string_lossy(),
+                    "worktrees": items,
+                }));
+            } else {
+                for e in &entries {
+                    let br = e
+                        .branch
+                        .as_deref()
+                        .unwrap_or(if e.detached { "(detached)" } else { "(bare)" });
+                    let dirty_mark = match e.dirty {
+                        Some(true) => "*",
+                        _ => "",
+                    };
+                    let tag = if e.is_main { "[main] " } else { "" };
+                    let sess_str = snap
+                        .as_ref()
+                        .map(|s| {
+                            let names: Vec<&str> = sessions_for_worktree(s, &e.path)
+                                .into_iter()
+                                .map(|si| si.name.as_str())
+                                .collect();
+                            if names.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  [sessions: {}]", names.join(", "))
+                            }
+                        })
+                        .unwrap_or_default();
+                    println!("{tag}{br}{dirty_mark}  {}{sess_str}", e.path.display());
+                }
+            }
+            Ok(0)
+        }
+        "new" | "add" | "create" => {
+            let mut branch: Option<String> = None;
+            let mut repo: Option<PathBuf> = None;
+            let mut from_ref: Option<String> = None;
+            let mut custom_path: Option<PathBuf> = None;
+            let mut session_opt: Option<String> = None;
+            let mut agent_cmd: Option<String> = None;
+            let mut no_session = false;
+
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--repo" | "-C" => {
+                        repo = Some(PathBuf::from(rest.get(i + 1).ok_or("--repo requires a directory")?));
+                        i += 2;
+                    }
+                    "--from" | "--base" => {
+                        from_ref = Some(rest.get(i + 1).ok_or("--from requires a branch/commit")?.clone());
+                        i += 2;
+                    }
+                    "--path" => {
+                        custom_path = Some(PathBuf::from(rest.get(i + 1).ok_or("--path requires a directory")?));
+                        i += 2;
+                    }
+                    "--session" | "-s" => {
+                        session_opt = Some(rest.get(i + 1).ok_or("--session requires a name")?.clone());
+                        i += 2;
+                    }
+                    "--agent" => {
+                        agent_cmd = Some(rest.get(i + 1).ok_or("--agent requires a command")?.clone());
+                        i += 2;
+                    }
+                    "--no-session" => {
+                        no_session = true;
+                        i += 1;
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown worktree new option `{other}`"));
+                    }
+                    other => {
+                        if branch.is_none() {
+                            branch = Some(other.to_string());
+                            i += 1;
+                        } else {
+                            return Err(format!("unexpected argument `{other}`"));
+                        }
+                    }
+                }
+            }
+
+            let branch = branch.ok_or("usage: tachyon worktree new <branch> [--repo DIR] [--from REF] [--path DIR] [--session S] [--agent CMD] [--no-session]")?;
+            let dir = match repo {
+                Some(p) => p,
+                None => std::env::current_dir().map_err(|e| e.to_string())?,
+            };
+            let root = worktree::repo_root(&dir)?;
+            let entry = worktree::create_worktree(
+                &root,
+                &branch,
+                from_ref.as_deref(),
+                custom_path.as_deref(),
+            )?;
+
+            let mut created_session: Option<Value> = None;
+            if !no_session {
+                let (_, client) = connect(opts, true)?;
+                let snap = client.state().map_err(|e| e.to_string())?;
+                let existing = sessions_for_worktree(&snap, &entry.path);
+                if let Some(sess) = existing.first() {
+                    created_session = Some(json!({
+                        "id": sess.id,
+                        "name": sess.name,
+                        "reused": true,
+                    }));
+                } else {
+                    let repo_name = git_info_for_dir(&root)
+                        .map(|i| i.repo_name)
+                        .or_else(|| root.file_name().and_then(|s| s.to_str()).map(str::to_string))
+                        .unwrap_or_else(|| "repo".into());
+                    let base_name = session_opt
+                        .unwrap_or_else(|| worktree::session_name_for_worktree(&repo_name, &branch));
+                    let mut final_name = base_name.clone();
+                    let mut suffix = 2usize;
+                    while snap.sessions.iter().any(|s| s.name == final_name) {
+                        final_name = format!("{base_name}-{suffix}");
+                        suffix += 1;
+                    }
+                    let cwd_s = entry.path.to_string_lossy().into_owned();
+                    let (sess, win, blk) = client
+                        .create_session(Some(&final_name), Some(&cwd_s), None, Some(&branch), 120, 32)
+                        .map_err(|e| e.to_string())?;
+                    let _ = client.rename_window(&win.id, &branch);
+                    if let Some(ref cmd_line) = agent_cmd {
+                        let mut line = cmd_line.clone();
+                        if !line.ends_with('\r') && !line.ends_with('\n') {
+                            line.push('\r');
+                        }
+                        client
+                            .send_input(&blk.id, line.as_bytes())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    created_session = Some(json!({
+                        "id": sess.id,
+                        "name": sess.name,
+                        "window_id": win.id,
+                        "block_id": blk.id,
+                        "reused": false,
+                    }));
+                }
+            }
+
+            if opts.json {
+                print_json(&json!({
+                    "repo_root": root.to_string_lossy(),
+                    "worktree": entry.to_json(),
+                    "session": created_session,
+                }));
+            } else {
+                println!(
+                    "created worktree `{}` at {}",
+                    entry.branch.as_deref().unwrap_or(&branch),
+                    entry.path.display()
+                );
+            }
+            Ok(0)
+        }
+        "rm" | "remove" => {
+            let mut target: Option<String> = None;
+            let mut repo: Option<PathBuf> = None;
+            let mut force = false;
+            let mut delete_branch = false;
+            let mut keep_session = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--repo" | "-C" => {
+                        repo = Some(PathBuf::from(rest.get(i + 1).ok_or("--repo requires a directory")?));
+                        i += 2;
+                    }
+                    "--force" | "-f" => {
+                        force = true;
+                        i += 1;
+                    }
+                    "--delete-branch" | "-D" => {
+                        delete_branch = true;
+                        i += 1;
+                    }
+                    "--keep-session" => {
+                        keep_session = true;
+                        i += 1;
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown worktree rm option `{other}`"));
+                    }
+                    other => {
+                        if target.is_none() {
+                            target = Some(other.to_string());
+                            i += 1;
+                        } else {
+                            return Err(format!("unexpected argument `{other}`"));
+                        }
+                    }
+                }
+            }
+            let target = target.ok_or("usage: tachyon worktree rm <branch|path> [--repo DIR] [--force] [--delete-branch] [--keep-session]")?;
+            let dir = match repo {
+                Some(p) => p,
+                None => std::env::current_dir().map_err(|e| e.to_string())?,
+            };
+            let root = worktree::repo_root(&dir)?;
+            let entries = worktree::list_worktrees(&root, false)?;
+            let matched = worktree::find_worktree(&entries, &target)
+                .ok_or_else(|| format!("no worktree matching `{target}` in {}", root.display()))?
+                .clone();
+            if matched.is_main {
+                return Err("refusing to remove the main repository checkout".into());
+            }
+
+            let mut killed_sessions = Vec::new();
+            if !keep_session {
+                if let Ok((_, client)) = connect(opts, false) {
+                    if let Ok(snap) = client.state() {
+                        for sess in sessions_for_worktree(&snap, &matched.path) {
+                            if client.kill_session(&sess.id).is_ok() {
+                                killed_sessions.push(sess.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let removed = worktree::remove_worktree(&root, &target, force, delete_branch)?;
+            if opts.json {
+                let mut v = removed.to_json();
+                v["killed_sessions"] = json!(killed_sessions);
+                print_json(&v);
+            } else {
+                println!("removed worktree {}", removed.path.display());
+            }
+            Ok(0)
+        }
+        "prune" => {
+            let mut repo: Option<PathBuf> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--repo" | "-C" => {
+                        repo = Some(PathBuf::from(rest.get(i + 1).ok_or("--repo requires a directory")?));
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown worktree prune option `{other}`")),
+                }
+            }
+            let dir = match repo {
+                Some(p) => p,
+                None => std::env::current_dir().map_err(|e| e.to_string())?,
+            };
+            worktree::prune_worktrees(&dir)?;
+            if opts.json {
+                print_json(&json!({ "pruned": true }));
+            } else {
+                println!("pruned stale worktree metadata");
+            }
+            Ok(0)
+        }
+        other => Err(format!(
+            "unknown worktree subcommand `{other}` (expected ls|new|rm|prune)"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // agents (cross-host Agent Mission Control CLI)
 // ---------------------------------------------------------------------------
 
@@ -2209,15 +2595,23 @@ Server & Hosts:
   tachyon hosts remove <alias>              remove a saved host
   tachyon hosts test <alias>                verify SSH/TCP transport, server version & RTT
 
-Workspaces (Multi-host Templates):
+Workspaces & Git Worktrees:
   tachyon workspace ls                      list saved templates in ~/.config/Tachyon/workspaces/
   tachyon workspace up <name|path> [--recreate] [--dry-run]
                                             launch (or idempotently reuse) sessions & splits across hosts
   tachyon workspace down <name|path>        stop sessions belonging to a workspace
   tachyon workspace save <name> [--hosts H1,H2 | --all-hosts] [--session S] [--force]
                                             snapshot live sessions & split trees into a template
-  tachyon workspace init <name> [--force]   create a starter multi-host template from saved hosts
+  tachyon workspace init [NAME] [--preset basic|fleet|swarm|ml] [--starters] [--force]
+                                            create one or all curated multi-host starter templates
   tachyon workspace show|rm <name>          inspect or remove a saved template
+  tachyon worktree ls [--repo DIR] [--dirty]
+                                            list git worktrees & linked Mux sessions
+  tachyon worktree new <branch> [--repo DIR] [--from REF] [--path DIR] [--session S] [--agent CMD] [--no-session]
+                                            create an isolated git worktree + Mux session
+  tachyon worktree rm <branch|path> [--repo DIR] [--force] [--delete-branch] [--keep-session]
+                                            close matching Mux sessions and remove worktree
+  tachyon worktree prune [--repo DIR]       prune stale worktree metadata
 
 Sessions, Windows & Automation:
   tachyon ls                                list sessions, windows & blocks

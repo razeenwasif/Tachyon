@@ -7,6 +7,7 @@ pub mod model;
 pub mod proto;
 pub mod transport;
 pub mod workspace;
+pub mod worktree;
 
 use std::fs;
 use std::io;

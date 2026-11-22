@@ -1104,3 +1104,160 @@ fn cli_server_persists_sessions_splits_cwds_and_auto_resumes_agents_across_resta
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_worktree_lifecycle_and_multi_host_starter_templates() {
+    let dir = temp_dir("worktree-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    let ws_dir = dir.join("workspaces");
+    let repo = dir.join("my-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    // Initialize a real temporary git repo.
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "# demo\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    std::fs::write(
+        &hosts,
+        r#"{
+  "hosts": [
+    { "alias": "kagutsuchi", "uri": "ssh://kagutsuchi" },
+    { "alias": "amaterasu", "uri": "ssh://amaterasu", "remote_bin": "C:\\Users\\Razeen\\.local\\bin\\tachyon.exe" }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let repo_s = repo.to_string_lossy().into_owned();
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // 1. Create linked worktree + live Mux session in one step.
+    let (code, new_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["worktree", "new", "feat/parallel-agent", "--repo", &repo_s, "--json"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let new_v: Value = serde_json::from_str(&new_out).unwrap();
+    let wt_path = PathBuf::from(new_v["worktree"]["path"].as_str().unwrap());
+    assert!(wt_path.is_dir());
+    assert_eq!(new_v["worktree"]["branch"], "feat/parallel-agent");
+    assert_eq!(new_v["session"]["name"], "my-repo/feat-parallel-agent");
+
+    // 2. Dirty the worktree and inspect `worktree ls --dirty --json`.
+    std::fs::write(wt_path.join("scratch.txt"), "wip\n").unwrap();
+    let (code, ls_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["worktree", "ls", "--repo", &repo_s, "--dirty", "--json"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let ls_v: Value = serde_json::from_str(&ls_out).unwrap();
+    let wt_entry = ls_v["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["branch"] == "feat/parallel-agent")
+        .expect("feat/parallel-agent worktree entry");
+    assert_eq!(wt_entry["dirty"], true);
+    assert_eq!(
+        wt_entry["sessions"].as_array().unwrap()[0]["name"],
+        "my-repo/feat-parallel-agent"
+    );
+
+    // 3. Remove worktree (automatically kills linked Mux session + deletes branch).
+    let (code, rm_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "worktree",
+            "rm",
+            "feat/parallel-agent",
+            "--repo",
+            &repo_s,
+            "--force",
+            "--delete-branch",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let rm_v: Value = serde_json::from_str(&rm_out).unwrap();
+    assert_eq!(rm_v["branch_deleted"], true);
+    assert!(!wt_path.exists());
+
+    // Confirm linked session was closed cleanly.
+    let (code, sess_out, err) = run_cli(&sock, &hosts, &["ls", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let sess_v: Value = serde_json::from_str(&sess_out).unwrap();
+    assert!(
+        !sess_v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "my-repo/feat-parallel-agent"),
+        "expected session removed on worktree rm: {sess_v}"
+    );
+
+    // 4. Install multi-host starter templates non-destructively into isolated TACHYON_WORKSPACES_DIR.
+    let init_out = Command::new(bin())
+        .args(["workspace", "init", "--starters", "--json"])
+        .env("TACHYON_SOCKET", &sock)
+        .env("TACHYON_HOSTS_FILE", &hosts)
+        .env("TACHYON_WORKSPACES_DIR", &ws_dir)
+        .output()
+        .expect("workspace init starters");
+    assert!(
+        init_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+    let init_v: Value = serde_json::from_slice(&init_out.stdout).unwrap();
+    let tmpls = init_v["templates"].as_array().unwrap();
+    assert_eq!(tmpls.len(), 3);
+    assert!(tmpls.iter().all(|t| t["created"] == true));
+    assert!(ws_dir.join("dev-fleet.json").is_file());
+    assert!(ws_dir.join("agent-swarm.json").is_file());
+    assert!(ws_dir.join("ml-cluster.json").is_file());
+
+    // Second run without `--force` must keep existing files untouched (`created: false`).
+    let init_again = Command::new(bin())
+        .args(["workspace", "init", "--starters", "--json"])
+        .env("TACHYON_SOCKET", &sock)
+        .env("TACHYON_HOSTS_FILE", &hosts)
+        .env("TACHYON_WORKSPACES_DIR", &ws_dir)
+        .output()
+        .expect("workspace init starters second pass");
+    assert!(init_again.status.success());
+    let again_v: Value = serde_json::from_slice(&init_again.stdout).unwrap();
+    assert!(
+        again_v["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["created"] == false),
+        "second pass should preserve existing starter files: {again_v}"
+    );
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
