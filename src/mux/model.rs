@@ -902,26 +902,96 @@ pub fn short_path(path: &str) -> String {
         .to_string()
 }
 
-/// Read the active git branch (or short detached SHA) for `path` without
-/// spawning a git subprocess. Supports worktrees whose `.git` is a `gitdir:` file.
-pub fn git_branch_for_dir(path: &std::path::Path) -> Option<String> {
-    let raw = path.to_string_lossy();
-    let expanded: std::path::PathBuf = if raw == "~" {
-        std::path::PathBuf::from(std::env::var("HOME").ok()?)
-    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
-        let home = std::env::var("HOME").ok()?;
-        std::path::PathBuf::from(home).join(rest)
-    } else {
-        path.to_path_buf()
-    };
+/// Zero-subprocess metadata discovered from `.git` for a working directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitDirInfo {
+    pub branch: String,
+    pub worktree_root: std::path::PathBuf,
+    pub common_repo_root: std::path::PathBuf,
+    pub repo_name: String,
+    pub is_linked_worktree: bool,
+}
 
+fn expand_home_path(path: &std::path::Path) -> std::path::PathBuf {
+    let raw = path.to_string_lossy();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .filter(|h| !h.is_empty());
+    if let Some(h) = home {
+        if raw == "~" {
+            return std::path::PathBuf::from(h);
+        }
+        if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+            return std::path::PathBuf::from(h).join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn resolve_common_repo_root(worktree_root: &std::path::Path, gitdir: &std::path::Path) -> std::path::PathBuf {
+    let resolved_gitdir = std::fs::canonicalize(gitdir).unwrap_or_else(|_| gitdir.to_path_buf());
+    if let Ok(common_raw) = std::fs::read_to_string(resolved_gitdir.join("commondir")) {
+        let rel = common_raw.trim();
+        if !rel.is_empty() {
+            let candidate = if std::path::Path::new(rel).is_absolute() {
+                std::path::PathBuf::from(rel)
+            } else {
+                resolved_gitdir.join(rel)
+            };
+            let canon = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+            if let Some(parent) = canon.parent() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    // Fallback when `commondir` isn't present: `.../<repo>/.git/worktrees/<name>`.
+    if let Some(worktrees_dir) = resolved_gitdir.parent() {
+        if worktrees_dir.file_name().and_then(|n| n.to_str()) == Some("worktrees") {
+            if let Some(common_git) = worktrees_dir.parent() {
+                if common_git.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                    if let Some(repo) = common_git.parent() {
+                        return repo.to_path_buf();
+                    }
+                }
+            }
+        }
+    }
+    std::fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf())
+}
+
+fn parse_git_head_branch(head_raw: &str) -> Option<String> {
+    let s = head_raw.trim();
+    if let Some(branch) = s.strip_prefix("ref: refs/heads/") {
+        let b = branch.trim();
+        return (!b.is_empty()).then(|| b.to_string());
+    }
+    if let Some(r) = s.strip_prefix("ref: ") {
+        return r
+            .trim()
+            .rsplit('/')
+            .next()
+            .filter(|seg| !seg.is_empty())
+            .map(str::to_string);
+    }
+    if s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(s[..7].to_string());
+    }
+    None
+}
+
+/// Inspect `.git` ancestry for `path` without spawning a subprocess.
+/// Supports normal repositories, nested subdirectories, and linked worktrees.
+pub fn git_info_for_dir(path: &std::path::Path) -> Option<GitDirInfo> {
+    let expanded = expand_home_path(path);
     for dir in expanded.ancestors() {
         let dot_git = dir.join(".git");
         let Ok(meta) = std::fs::metadata(&dot_git) else {
             continue;
         };
-        let head_path = if meta.is_dir() {
-            dot_git.join("HEAD")
+        let worktree_root = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let (head_path, common_repo_root, is_linked_worktree) = if meta.is_dir() {
+            (dot_git.join("HEAD"), worktree_root.clone(), false)
         } else if meta.is_file() {
             let content = std::fs::read_to_string(&dot_git).ok()?;
             let line = content.lines().next()?.trim();
@@ -935,31 +1005,37 @@ pub fn git_branch_for_dir(path: &std::path::Path) -> Option<String> {
             } else {
                 dir.join(target_path)
             };
-            gitdir.join("HEAD")
+            let common = resolve_common_repo_root(&worktree_root, &gitdir);
+            (gitdir.join("HEAD"), common, true)
         } else {
             return None;
         };
 
         let head = std::fs::read_to_string(head_path).ok()?;
-        let s = head.trim();
-        if let Some(branch) = s.strip_prefix("ref: refs/heads/") {
-            let b = branch.trim();
-            return (!b.is_empty()).then(|| b.to_string());
-        }
-        if let Some(r) = s.strip_prefix("ref: ") {
-            return r
-                .trim()
-                .rsplit('/')
-                .next()
-                .filter(|seg| !seg.is_empty())
-                .map(str::to_string);
-        }
-        if s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Some(s[..7].to_string());
-        }
-        return None;
+        let branch = parse_git_head_branch(&head)?;
+        let repo_name = common_repo_root
+            .file_name()
+            .or_else(|| worktree_root.file_name())
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("repo")
+            .to_string();
+
+        return Some(GitDirInfo {
+            branch,
+            worktree_root,
+            common_repo_root,
+            repo_name,
+            is_linked_worktree,
+        });
     }
     None
+}
+
+/// Read the active git branch (or short detached SHA) for `path` without
+/// spawning a git subprocess. Supports worktrees whose `.git` is a `gitdir:` file.
+pub fn git_branch_for_dir(path: &std::path::Path) -> Option<String> {
+    git_info_for_dir(path).map(|info| info.branch)
 }
 
 /// Compact 1-character uppercase monogram (or `~` / `>`) for sidebar Space avatars.
@@ -1303,12 +1379,22 @@ mod tests {
         assert_eq!(git_branch_for_dir(&sub).as_deref(), Some("abcdef1"));
 
         let wt = base.join("wt");
-        let wt_gitdir = base.join("worktrees/wt1");
+        let wt_gitdir = repo.join(".git/worktrees/wt1");
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::create_dir_all(&wt_gitdir).unwrap();
         std::fs::write(wt_gitdir.join("HEAD"), "ref: refs/heads/feat/worktree\n").unwrap();
-        std::fs::write(wt.join(".git"), "gitdir: ../worktrees/wt1\n").unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_gitdir.display())).unwrap();
         assert_eq!(git_branch_for_dir(&wt).as_deref(), Some("feat/worktree"));
+
+        let info_main = git_info_for_dir(&sub).expect("main repo info");
+        assert!(!info_main.is_linked_worktree);
+        assert_eq!(info_main.repo_name, "repo");
+        let info_wt = git_info_for_dir(&wt).expect("worktree info");
+        assert!(info_wt.is_linked_worktree);
+        assert_eq!(info_wt.common_repo_root, info_main.common_repo_root);
+        assert_eq!(info_wt.repo_name, "repo");
+        assert_eq!(info_wt.branch, "feat/worktree");
 
         let plain = base.join("plain");
         std::fs::create_dir_all(&plain).unwrap();

@@ -71,6 +71,8 @@ pub enum PaletteAction {
     StopWorkspace(String),
     SaveActiveSessionWorkspace,
     SaveAllHostsWorkspace,
+    InstallStarterTemplates,
+    NewGitWorktree,
     OpenWorkspacesFolder,
     NewSessionOnHost(String),
     SwitchWindow { host: String, window_id: String },
@@ -336,6 +338,18 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Snapshot all live multi-host sessions into multi-host.json".into(),
             shortcut: "",
             action: PaletteAction::SaveAllHostsWorkspace,
+        },
+        PaletteItem {
+            title: "Worktree: New Isolated Git Worktree Space…".into(),
+            subtitle: "Create a linked git branch worktree & open a dedicated Mux session".into(),
+            shortcut: "",
+            action: PaletteAction::NewGitWorktree,
+        },
+        PaletteItem {
+            title: "Workspace: Install Multi-Host Starter Templates".into(),
+            subtitle: "Create dev-fleet, agent-swarm & ml-cluster JSON starters (keeps existing)".into(),
+            shortcut: "",
+            action: PaletteAction::InstallStarterTemplates,
         },
         PaletteItem {
             title: "Workspace: Open Templates Folder".into(),
@@ -955,6 +969,18 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
                 super::open_settings_section(5);
                 return;
             }
+        }
+        PaletteAction::InstallStarterTemplates => {
+            if let Err(e) = super::mux_workspace_install_starters() {
+                crate::log::force(&format!("starter install failed: {e}"));
+            } else {
+                super::open_settings_section(5);
+                return;
+            }
+        }
+        PaletteAction::NewGitWorktree => {
+            super::mux_prompt_new_worktree(win_id, None);
+            return;
         }
         PaletteAction::OpenWorkspacesFolder => {
             super::open_workspaces_folder();

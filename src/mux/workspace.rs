@@ -607,63 +607,278 @@ pub fn list_workspaces() -> Vec<WorkspaceSummary> {
     out
 }
 
+/// Curated starter layout presets for `tachyon workspace init`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StarterPreset {
+    Basic,
+    Fleet,
+    Swarm,
+    Ml,
+}
+
+impl StarterPreset {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "basic" | "starter" | "default" => Some(Self::Basic),
+            "fleet" | "dev-fleet" => Some(Self::Fleet),
+            "swarm" | "agent-swarm" => Some(Self::Swarm),
+            "ml" | "ml-cluster" | "cluster" => Some(Self::Ml),
+            _ => None,
+        }
+    }
+
+    pub fn default_name(self) -> &'static str {
+        match self {
+            Self::Basic => "starter",
+            Self::Fleet => "dev-fleet",
+            Self::Swarm => "agent-swarm",
+            Self::Ml => "ml-cluster",
+        }
+    }
+}
+
+fn starter_pane(label: &str, focus: bool) -> WorkspaceLayout {
+    WorkspaceLayout::Leaf(WorkspacePane {
+        label: Some(label.into()),
+        cwd: Some("~".into()),
+        cmd: None,
+        run: None,
+        focus,
+    })
+}
+
+fn starter_split(
+    dir: SplitDir,
+    ratio: f32,
+    a: WorkspaceLayout,
+    b: WorkspaceLayout,
+) -> WorkspaceLayout {
+    WorkspaceLayout::Split {
+        dir,
+        ratio,
+        a: Box::new(a),
+        b: Box::new(b),
+    }
+}
+
+fn is_windows_gpu_host(h: &HostEntry) -> bool {
+    h.alias.eq_ignore_ascii_case("amaterasu")
+        || h.remote_bin
+            .as_deref()
+            .is_some_and(|b| b.contains(".exe") || b.contains('\\'))
+}
+
 /// Generate a starter multi-host workspace template using `local` plus any
 /// configured remote hosts from `hosts.json`.
 pub fn starter_workspace(name: &str, configured_hosts: &[HostEntry]) -> Result<WorkspaceSpec, String> {
+    starter_workspace_with_preset(name, StarterPreset::Basic, configured_hosts)
+}
+
+/// Generate a curated workspace template for `preset` across `local` and configured remote hosts.
+pub fn starter_workspace_with_preset(
+    name: &str,
+    preset: StarterPreset,
+    configured_hosts: &[HostEntry],
+) -> Result<WorkspaceSpec, String> {
     let valid = validate_workspace_name(name)?;
-    let mut sessions = vec![WorkspaceSession {
+    let remotes: Vec<&HostEntry> = configured_hosts
+        .iter()
+        .filter(|h| h.alias != "local")
+        .collect();
+
+    let (local_layout, local_win_name, desc, sessions) = match preset {
+        StarterPreset::Basic => {
+            let layout = starter_split(
+                SplitDir::Right,
+                0.6,
+                starter_pane("main", true),
+                starter_pane("shell", false),
+            );
+            let mut sessions = vec![WorkspaceSession {
+                host: "local".into(),
+                name: valid.clone(),
+                cwd: Some("~".into()),
+                windows: vec![WorkspaceWindow {
+                    name: Some("dev".into()),
+                    layout,
+                }],
+            }];
+            for h in &remotes {
+                sessions.push(WorkspaceSession {
+                    host: h.alias.clone(),
+                    name: valid.clone(),
+                    cwd: Some("~".into()),
+                    windows: vec![WorkspaceWindow {
+                        name: Some(h.alias.clone()),
+                        layout: starter_pane(&h.alias, true),
+                    }],
+                });
+            }
+            let desc = if sessions.len() > 1 {
+                format!("Multi-host starter workspace across {} hosts", sessions.len())
+            } else {
+                "Local split starter workspace".into()
+            };
+            return Ok(WorkspaceSpec {
+                name: valid.clone(),
+                description: Some(desc),
+                focus: Some(WorkspaceFocus {
+                    host: "local".into(),
+                    session: Some(valid),
+                    window: Some("dev".into()),
+                }),
+                sessions,
+            });
+        }
+        StarterPreset::Fleet => {
+            let layout = starter_split(
+                SplitDir::Right,
+                0.55,
+                starter_pane("editor", true),
+                starter_split(
+                    SplitDir::Down,
+                    0.55,
+                    starter_pane("agent", false),
+                    starter_pane("shell", false),
+                ),
+            );
+            let mut sessions = Vec::new();
+            for h in &remotes {
+                let win_layout = if is_windows_gpu_host(h) {
+                    starter_split(
+                        SplitDir::Down,
+                        0.6,
+                        starter_pane("train", true),
+                        starter_pane("gpu", false),
+                    )
+                } else {
+                    starter_split(
+                        SplitDir::Right,
+                        0.55,
+                        starter_pane("build", true),
+                        starter_pane("logs", false),
+                    )
+                };
+                sessions.push(WorkspaceSession {
+                    host: h.alias.clone(),
+                    name: valid.clone(),
+                    cwd: Some("~".into()),
+                    windows: vec![WorkspaceWindow {
+                        name: Some(h.alias.clone()),
+                        layout: win_layout,
+                    }],
+                });
+            }
+            let desc = if remotes.is_empty() {
+                "Local IDE + agent + shell fleet workspace".to_string()
+            } else {
+                format!(
+                    "Multi-host dev fleet across MacBook + {}",
+                    remotes.iter().map(|h| h.alias.as_str()).collect::<Vec<_>>().join(" + ")
+                )
+            };
+            (layout, "macbook", desc, sessions)
+        }
+        StarterPreset::Swarm => {
+            let layout = starter_split(
+                SplitDir::Right,
+                0.5,
+                starter_split(
+                    SplitDir::Down,
+                    0.5,
+                    starter_pane("agent-1", true),
+                    starter_pane("tests", false),
+                ),
+                starter_split(
+                    SplitDir::Down,
+                    0.5,
+                    starter_pane("agent-2", false),
+                    starter_pane("git", false),
+                ),
+            );
+            let mut sessions = Vec::new();
+            if let Some(first_remote) = remotes.first() {
+                sessions.push(WorkspaceSession {
+                    host: first_remote.alias.clone(),
+                    name: valid.clone(),
+                    cwd: Some("~".into()),
+                    windows: vec![WorkspaceWindow {
+                        name: Some("remote".into()),
+                        layout: starter_split(
+                            SplitDir::Right,
+                            0.55,
+                            starter_pane("remote-agent", true),
+                            starter_pane("verify", false),
+                        ),
+                    }],
+                });
+            }
+            (
+                layout,
+                "swarm",
+                "Parallel coding-agent swarm grid (worktree-ready)".to_string(),
+                sessions,
+            )
+        }
+        StarterPreset::Ml => {
+            let layout = starter_split(
+                SplitDir::Right,
+                0.6,
+                starter_pane("eval", true),
+                starter_pane("notes", false),
+            );
+            let mut sessions = Vec::new();
+            if let Some(unix_host) = remotes.iter().copied().find(|h| !is_windows_gpu_host(h)) {
+                sessions.push(WorkspaceSession {
+                    host: unix_host.alias.clone(),
+                    name: valid.clone(),
+                    cwd: Some("~".into()),
+                    windows: vec![WorkspaceWindow {
+                        name: Some("cluster".into()),
+                        layout: starter_split(
+                            SplitDir::Right,
+                            0.5,
+                            starter_pane("build", true),
+                            starter_pane("neutrino", false),
+                        ),
+                    }],
+                });
+            }
+            if let Some(gpu_host) = remotes.iter().copied().find(|h| is_windows_gpu_host(h)) {
+                sessions.push(WorkspaceSession {
+                    host: gpu_host.alias.clone(),
+                    name: valid.clone(),
+                    cwd: Some("~".into()),
+                    windows: vec![WorkspaceWindow {
+                        name: Some("gpu".into()),
+                        layout: starter_split(
+                            SplitDir::Down,
+                            0.65,
+                            starter_pane("train", true),
+                            starter_pane("gpu-watch", false),
+                        ),
+                    }],
+                });
+            }
+            (
+                layout,
+                "control",
+                "ML training & evaluation cluster workspace (MacBook + CPU/GPU nodes)".to_string(),
+                sessions,
+            )
+        }
+    };
+
+    let mut all_sessions = vec![WorkspaceSession {
         host: "local".into(),
         name: valid.clone(),
         cwd: Some("~".into()),
         windows: vec![WorkspaceWindow {
-            name: Some("dev".into()),
-            layout: WorkspaceLayout::Split {
-                dir: SplitDir::Right,
-                ratio: 0.6,
-                a: Box::new(WorkspaceLayout::Leaf(WorkspacePane {
-                    label: Some("main".into()),
-                    cwd: Some("~".into()),
-                    cmd: None,
-                    run: None,
-                    focus: true,
-                })),
-                b: Box::new(WorkspaceLayout::Leaf(WorkspacePane {
-                    label: Some("shell".into()),
-                    cwd: Some("~".into()),
-                    cmd: None,
-                    run: None,
-                    focus: false,
-                })),
-            },
+            name: Some(local_win_name.into()),
+            layout: local_layout,
         }],
     }];
-
-    for h in configured_hosts {
-        if h.alias == "local" {
-            continue;
-        }
-        sessions.push(WorkspaceSession {
-            host: h.alias.clone(),
-            name: valid.clone(),
-            cwd: Some("~".into()),
-            windows: vec![WorkspaceWindow {
-                name: Some(h.alias.clone()),
-                layout: WorkspaceLayout::Leaf(WorkspacePane {
-                    label: Some(h.alias.clone()),
-                    cwd: Some("~".into()),
-                    cmd: None,
-                    run: None,
-                    focus: true,
-                }),
-            }],
-        });
-    }
-
-    let desc = if sessions.len() > 1 {
-        format!("Multi-host starter workspace across {} hosts", sessions.len())
-    } else {
-        "Local split starter workspace".into()
-    };
+    all_sessions.extend(sessions);
 
     Ok(WorkspaceSpec {
         name: valid.clone(),
@@ -671,10 +886,39 @@ pub fn starter_workspace(name: &str, configured_hosts: &[HostEntry]) -> Result<W
         focus: Some(WorkspaceFocus {
             host: "local".into(),
             session: Some(valid),
-            window: Some("dev".into()),
+            window: Some(local_win_name.into()),
         }),
-        sessions,
+        sessions: all_sessions,
     })
+}
+
+/// Curated multi-host starter templates (`dev-fleet`, `agent-swarm`, `ml-cluster`).
+pub fn starter_presets(configured_hosts: &[HostEntry]) -> Vec<WorkspaceSpec> {
+    [StarterPreset::Fleet, StarterPreset::Swarm, StarterPreset::Ml]
+        .into_iter()
+        .filter_map(|preset| {
+            starter_workspace_with_preset(preset.default_name(), preset, configured_hosts).ok()
+        })
+        .collect()
+}
+
+/// Write curated starter templates into `workspaces_dir()`, skipping existing
+/// files unless `force` is true. Returns `(name, path, created)`.
+pub fn install_starter_templates(
+    configured_hosts: &[HostEntry],
+    force: bool,
+) -> Result<Vec<(String, PathBuf, bool)>, String> {
+    let mut results = Vec::new();
+    for spec in starter_presets(configured_hosts) {
+        let dest = workspace_path(&spec.name)?;
+        if dest.exists() && !force {
+            results.push((spec.name, dest, false));
+            continue;
+        }
+        let saved = save_workspace(&spec, force)?;
+        results.push((spec.name, saved, true));
+    }
+    Ok(results)
 }
 
 /// Snapshot live sessions from one or more host `ServerSnapshot`s into a reusable
@@ -1539,5 +1783,49 @@ mod tests {
             }
             other => panic!("expected top split, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn starter_presets_build_multi_host_layouts_and_install_non_destructively() {
+        let hosts = vec![
+            HostEntry {
+                alias: "kagutsuchi".into(),
+                uri: "ssh://kagutsuchi".into(),
+                remote_bin: None,
+                token: None,
+                color: None,
+            },
+            HostEntry {
+                alias: "amaterasu".into(),
+                uri: "ssh://amaterasu".into(),
+                remote_bin: Some(r"C:\Users\Razeen\.local\bin\tachyon.exe".into()),
+                token: None,
+                color: None,
+            },
+        ];
+
+        let presets = starter_presets(&hosts);
+        assert_eq!(presets.len(), 3);
+        let fleet = presets.iter().find(|s| s.name == "dev-fleet").unwrap();
+        assert_eq!(fleet.sessions.len(), 3);
+        assert_eq!(fleet.pane_count(), 7);
+        let swarm = presets.iter().find(|s| s.name == "agent-swarm").unwrap();
+        assert_eq!(swarm.sessions.len(), 2);
+        assert_eq!(swarm.pane_count(), 6);
+        let ml = presets.iter().find(|s| s.name == "ml-cluster").unwrap();
+        assert_eq!(ml.sessions.len(), 3);
+        assert!(StarterPreset::parse("fleet") == Some(StarterPreset::Fleet));
+        assert!(StarterPreset::parse("ml") == Some(StarterPreset::Ml));
+
+        // Verify direct save & non-destructive behavior without mutating global env.
+        let dir = std::env::temp_dir().join(format!("tachyon-starter-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let raw = serde_json::to_string_pretty(&fleet.to_json()).unwrap();
+        let file = dir.join("dev-fleet.json");
+        fs::write(&file, &raw).unwrap();
+        let (_, parsed) = load_workspace(&file.to_string_lossy()).unwrap();
+        assert_eq!(parsed.pane_count(), fleet.pane_count());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

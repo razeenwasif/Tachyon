@@ -31,7 +31,7 @@ use super::host_mgr::{HostStatus, HostView};
 use super::renderer::chrome_tokens;
 use super::with_window;
 use crate::config::ChromeStyle;
-use crate::mux::model::{git_branch_for_dir, resolve_host_color, space_monogram, HostColor};
+use crate::mux::model::{git_info_for_dir, resolve_host_color, space_monogram, HostColor};
 use crate::mux::workspace::{list_workspaces, WorkspaceSummary};
 use crate::term::ProgramState;
 
@@ -57,6 +57,8 @@ pub enum SwitcherKind {
         title: String,
         pane_count: usize,
         git_branch: Option<String>,
+        git_dirty: bool,
+        is_worktree: bool,
         blocked_count: usize,
         working: bool,
         active: bool,
@@ -104,7 +106,7 @@ pub fn collect_switcher_items(
                     .filter(|s| !s.is_empty())
                     .or_else(|| focused.map(|b| b.display_name()))
                     .unwrap_or_else(|| "shell".to_string());
-                let git_branch = if h.is_local {
+                let (git_branch, git_dirty, is_worktree) = if h.is_local {
                     let cwd = focused
                         .and_then(|b| b.cwd.as_deref())
                         .filter(|s| !s.is_empty())
@@ -117,9 +119,15 @@ pub fn collect_switcher_items(
                                     .filter(|s| !s.is_empty())
                             })
                         });
-                    cwd.and_then(|dir| git_branch_for_dir(Path::new(dir)))
+                    match cwd.and_then(|dir| git_info_for_dir(Path::new(dir))) {
+                        Some(info) => {
+                            let dirty = super::sidebar::query_git_dirty(&info.worktree_root, 0);
+                            (Some(info.branch), dirty, info.is_linked_worktree)
+                        }
+                        None => (None, false, false),
+                    }
                 } else {
-                    None
+                    (None, false, false)
                 };
                 let blocked_count = snap
                     .blocks
@@ -147,6 +155,8 @@ pub fn collect_switcher_items(
                         title,
                         pane_count: leaves.len().max(1),
                         git_branch,
+                        git_dirty,
+                        is_worktree,
                         blocked_count,
                         working,
                         active,
@@ -530,6 +540,8 @@ impl WorkspacesListView {
                     title,
                     pane_count,
                     git_branch,
+                    git_dirty,
+                    is_worktree,
                     blocked_count,
                     working,
                     active,
@@ -616,11 +628,26 @@ impl WorkspacesListView {
                         NSRect::new(NSPoint::new(46.0, ry + 28.0), NSSize::new(sub_w, 16.0)),
                     );
                     if let Some(br) = git_branch {
+                        let txt = match (*is_worktree, *git_dirty) {
+                            (true, true) => format!("⎇ {br}*"),
+                            (true, false) => format!("⎇ {br}"),
+                            (false, true) => format!("{br}*"),
+                            (false, false) => br.clone(),
+                        };
+                        let col = if *git_dirty {
+                            if minimal {
+                                srgb_alpha([0xF2, 0xA3, 0x3C], 0.92)
+                            } else {
+                                NSColor::systemOrangeColor().colorWithAlphaComponent(0.92)
+                            }
+                        } else {
+                            NSColor::tertiaryLabelColor()
+                        };
                         draw_right(
-                            br,
+                            &txt,
                             10.5,
                             FontWeight::Regular,
-                            &NSColor::tertiaryLabelColor(),
+                            &col,
                             NSRect::new(NSPoint::new((w - branch_w - 14.0).max(120.0), ry + 29.0), NSSize::new(branch_w, 15.0)),
                         );
                     }
