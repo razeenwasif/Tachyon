@@ -809,6 +809,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             auth_enabled: Some(true),
+            listen_addr: None,
         };
         let d_ok = diagnose_from_status(
             "local",

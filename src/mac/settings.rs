@@ -19,8 +19,8 @@ use objc2_app_kit::{
     NSFont, NSFontAttributeName, NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold,
     NSForegroundColorAttributeName, NSGlassEffectView, NSImage, NSImageSymbolConfiguration,
     NSLineBreakMode, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSPopUpButton,
-    NSResponder, NSSwitch, NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSView,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+    NSResponder, NSScrollView, NSSwitch, NSTextField, NSTrackingArea, NSTrackingAreaOptions,
+    NSView, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
     NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_core_foundation::CGFloat;
@@ -365,12 +365,82 @@ impl SettingsCardView {
 }
 
 #[derive(Default)]
+struct QrViewState {
+    qr: RefCell<Option<crate::mux::qr::QrCode>>,
+}
+
+define_class!(
+    /// Crisp vector QR code view with a white rounded quiet-zone plate.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TachyonSettingsQrView"]
+    #[ivars = QrViewState]
+    struct SettingsQrView;
+
+    impl SettingsQrView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(isOpaque))]
+        fn is_opaque(&self) -> bool {
+            false
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let b = self.bounds();
+            let plate = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(b, 8.0, 8.0);
+            NSColor::whiteColor().setFill();
+            plate.fill();
+            if let Some(qr) = self.ivars().qr.borrow().as_ref() {
+                let n = qr.size();
+                let quiet = 2.0_f64;
+                let cell = (b.size.width.min(b.size.height) / (n as f64 + 2.0 * quiet))
+                    .floor()
+                    .max(1.0);
+                let total = cell * (n as f64);
+                let ox = ((b.size.width - total) * 0.5).floor();
+                let oy = ((b.size.height - total) * 0.5).floor();
+                NSColor::blackColor().setFill();
+                for y in 0..n {
+                    for x in 0..n {
+                        if qr.get(x, y) {
+                            NSBezierPath::fillRect(NSRect::new(
+                                NSPoint::new(ox + x as f64 * cell, oy + y as f64 * cell),
+                                NSSize::new(cell, cell),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+);
+
+impl SettingsQrView {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        qr: Option<crate::mux::qr::QrCode>,
+    ) -> Retained<Self> {
+        let ivars = QrViewState { qr: RefCell::new(qr) };
+        unsafe { msg_send![super(Self::alloc(mtm).set_ivars(ivars)), initWithFrame: frame] }
+    }
+}
+
+#[derive(Default)]
 struct ActionState {
     /// Dynamic aliases referenced by tag for host buttons.
     host_aliases: RefCell<Vec<String>>,
     ssh_candidates: RefCell<Vec<String>>,
     workspace_names: RefCell<Vec<String>>,
     workspace_paths: RefCell<Vec<std::path::PathBuf>>,
+    pair_aliases: RefCell<Vec<String>>,
+    pair_selected: Cell<usize>,
+    pair_uri: RefCell<String>,
+    pair_token: RefCell<String>,
     status_note: RefCell<Option<String>>,
 }
 
@@ -886,6 +956,228 @@ define_class!(
             self.set_note("Opened workspaces folder in Finder.");
             refresh_if_open();
         }
+
+        #[unsafe(method(serverInstallTailscaleService:))]
+        fn server_install_tailscale_service(&self, _sender: Option<&AnyObject>) {
+            let opts = server::ServiceOptions {
+                listen: Some("tailscale".into()),
+                token_file: None,
+            };
+            match server::install_service_with_options(&default_socket_path(), &opts) {
+                Ok(path) => {
+                    self.set_note(&format!(
+                        "Installed Tailscale TCP LaunchAgent -> {}",
+                        path.display()
+                    ));
+                    super::mux_reconnect_host("local");
+                }
+                Err(e) => self.set_note(&format!("Tailscale service install failed: {e}")),
+            }
+            refresh_if_open();
+        }
+
+        #[unsafe(method(pairSelectHost:))]
+        fn pair_select_host(&self, sender: Option<&AnyObject>) {
+            let idx = sender
+                .and_then(|s| s.downcast_ref::<NSPopUpButton>())
+                .map(|p| p.indexOfSelectedItem())
+                .unwrap_or(0);
+            self.ivars().pair_selected.set(idx.max(0) as usize);
+            refresh_if_open();
+        }
+
+        #[unsafe(method(pairCopyUri:))]
+        fn pair_copy_uri(&self, _sender: Option<&AnyObject>) {
+            let uri = self.ivars().pair_uri.borrow().clone();
+            if uri.is_empty() {
+                self.set_note("No pairing URI available for the selected host.");
+            } else {
+                super::copy_to_pasteboard(&uri);
+                self.set_note("Copied `tachyon://pair?...` URI to clipboard.");
+            }
+            refresh_if_open();
+        }
+
+        #[unsafe(method(pairCopyToken:))]
+        fn pair_copy_token(&self, _sender: Option<&AnyObject>) {
+            let tok = self.ivars().pair_token.borrow().clone();
+            if tok.is_empty() {
+                self.set_note("No bearer token available for the selected host.");
+            } else {
+                super::copy_to_pasteboard(&tok);
+                self.set_note("Copied bearer token to clipboard.");
+            }
+            refresh_if_open();
+        }
+
+        #[unsafe(method(pairRotateToken:))]
+        fn pair_rotate_token(&self, _sender: Option<&AnyObject>) {
+            let sel_idx = self.ivars().pair_selected.get();
+            let is_local = self
+                .ivars()
+                .pair_aliases
+                .borrow()
+                .get(sel_idx)
+                .map(String::as_str)
+                == Some("local");
+            if !is_local {
+                self.set_note(
+                    "Token rotation applies to This Mac (`local`). Run `tachyon server token --regenerate` on remote hosts.",
+                );
+                refresh_if_open();
+                return;
+            }
+            let path = crate::mux::default_token_path();
+            match crate::mux::generate_auth_token().and_then(|tok| {
+                crate::mux::write_token_file(&path, &tok)?;
+                Ok(tok)
+            }) {
+                Ok(tok) => {
+                    self.set_note("Rotated local bearer token — updating running server…");
+                    refresh_if_open();
+                    std::thread::spawn(move || {
+                        let hot = crate::mux::client::MuxClient::connect(
+                            &crate::mux::Target::Local { socket: default_socket_path() },
+                            false,
+                            "mac-settings",
+                            "rotate-token",
+                        )
+                        .and_then(|c| c.server_set_token(Some(&tok)))
+                        .is_ok();
+                        DispatchQueue::main().exec_async(move || {
+                            let msg = if hot {
+                                "Rotated local bearer token & updated running daemon."
+                            } else {
+                                "Rotated local bearer token file (applies on next server start)."
+                            };
+                            set_status_note_if_open(msg);
+                            refresh_if_open();
+                        });
+                    });
+                }
+                Err(e) => {
+                    self.set_note(&format!("Token rotation failed: {e}"));
+                    refresh_if_open();
+                }
+            }
+        }
+
+        #[unsafe(method(alertsSaveHooks:))]
+        fn alerts_save_hooks(&self, _sender: Option<&AnyObject>) {
+            let (webhook_raw, cmd_raw) = SETTINGS.with(|slot| {
+                let guard = slot.borrow();
+                let Some(win) = guard.as_ref() else {
+                    return (String::new(), String::new());
+                };
+                let w = win
+                    .alert_webhook_field
+                    .as_ref()
+                    .map(|f| f.stringValue().to_string())
+                    .unwrap_or_default();
+                let c = win
+                    .alert_command_field
+                    .as_ref()
+                    .map(|f| f.stringValue().to_string())
+                    .unwrap_or_default();
+                (w, c)
+            });
+
+            let webhook = match crate::server::alerts::normalize_webhook_url(&webhook_raw) {
+                Ok(w) => w,
+                Err(e) => {
+                    self.set_note(&e);
+                    refresh_if_open();
+                    return;
+                }
+            };
+            let cmd_trimmed = cmd_raw.trim().to_string();
+            let cmd_opt = (!cmd_trimmed.is_empty()).then(|| cmd_trimmed.clone());
+
+            if let Err(e) = Config::update_default_key(
+                "server.alert_webhook",
+                webhook.as_deref().unwrap_or(""),
+            ) {
+                self.set_note(&format!("Failed to save server.alert_webhook: {e}"));
+                refresh_if_open();
+                return;
+            }
+            if let Err(e) = Config::update_default_key("server.alert_command", &cmd_trimmed) {
+                self.set_note(&format!("Failed to save server.alert_command: {e}"));
+                refresh_if_open();
+                return;
+            }
+
+            self.set_note("Saved alert hooks to tachyon.conf — syncing running server…");
+            refresh_if_open();
+            std::thread::spawn(move || {
+                let patch = serde_json::json!({
+                    "webhook": webhook,
+                    "command": cmd_opt,
+                });
+                let live_ok = crate::mux::client::MuxClient::connect(
+                    &crate::mux::Target::Local { socket: default_socket_path() },
+                    false,
+                    "mac-settings",
+                    "alerts-set",
+                )
+                .and_then(|c| c.server_alerts_set(patch))
+                .is_ok();
+                DispatchQueue::main().exec_async(move || {
+                    let msg = if live_ok {
+                        "Saved alert hooks to tachyon.conf & updated running server."
+                    } else {
+                        "Saved alert hooks to tachyon.conf."
+                    };
+                    set_status_note_if_open(msg);
+                    refresh_if_open();
+                });
+            });
+        }
+
+        #[unsafe(method(alertsSendTest:))]
+        fn alerts_send_test(&self, _sender: Option<&AnyObject>) {
+            self.set_note("Dispatching test `agent.alert` hook…");
+            refresh_if_open();
+            std::thread::spawn(|| {
+                let res = crate::mux::client::MuxClient::connect(
+                    &crate::mux::Target::Local { socket: default_socket_path() },
+                    false,
+                    "mac-settings",
+                    "alerts-test",
+                )
+                .and_then(|c| {
+                    c.server_alerts_test(
+                        Some("blocked"),
+                        Some("Test away-from-desk alert from Tachyon Settings"),
+                    )
+                });
+                let msg = match res {
+                    Ok(v) => {
+                        let del = &v["delivery"];
+                        let wh = del.get("webhook_ok").and_then(serde_json::Value::as_bool);
+                        let cm = del.get("command_ok").and_then(serde_json::Value::as_bool);
+                        let we = del
+                            .get("webhook_error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let ce = del
+                            .get("command_error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if we.is_empty() && ce.is_empty() {
+                            format!("Test `agent.alert` emitted (webhook={wh:?}, command={cm:?}).")
+                        } else {
+                            format!("Test `agent.alert` finished (webhook={wh:?} {we}, command={cm:?} {ce}).")
+                        }
+                    }
+                    Err(e) => format!("Test alert failed: {e}"),
+                };
+                DispatchQueue::main().exec_async(move || {
+                    set_status_note_if_open(&msg);
+                    refresh_if_open();
+                });
+            });
+        }
     }
 );
 
@@ -922,12 +1214,15 @@ fn tagged_string(sender: Option<&AnyObject>, list: &[String]) -> Option<String> 
 struct SettingsWindow {
     window: Retained<NSWindow>,
     nav: Retained<SettingsNavView>,
+    _scroll: Retained<NSScrollView>,
     detail: Retained<SettingsDetailView>,
     actions: Retained<SettingsActions>,
     active: Cell<usize>,
     custom_alias: Option<Retained<NSTextField>>,
     custom_uri: Option<Retained<NSTextField>>,
     custom_token: Option<Retained<NSTextField>>,
+    alert_webhook_field: Option<Retained<NSTextField>>,
+    alert_command_field: Option<Retained<NSTextField>>,
 }
 
 impl SettingsWindow {
@@ -958,10 +1253,19 @@ impl SettingsWindow {
         nav.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(RAIL_W, WIN_H)));
         let detail = SettingsDetailView::new(
             mtm,
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIN_W - RAIL_W, WIN_H)),
+        );
+        let scroll = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
             NSRect::new(NSPoint::new(RAIL_W, 0.0), NSSize::new(WIN_W - RAIL_W, WIN_H)),
         );
+        scroll.setDrawsBackground(false);
+        scroll.setHasVerticalScroller(true);
+        scroll.setHasHorizontalScroller(false);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDocumentView(Some(&detail));
         container.addSubview(&nav);
-        container.addSubview(&detail);
+        container.addSubview(&scroll);
 
         if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
             let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
@@ -981,12 +1285,15 @@ impl SettingsWindow {
         let mut this = Self {
             window,
             nav,
+            _scroll: scroll,
             detail,
             actions,
             active: Cell::new(2), // Open directly to Integrations by default unless specified.
             custom_alias: None,
             custom_uri: None,
             custom_token: None,
+            alert_webhook_field: None,
+            alert_command_field: None,
         };
         this.rebuild_detail(mtm);
         this
@@ -1001,6 +1308,8 @@ impl SettingsWindow {
         self.custom_alias = None;
         self.custom_uri = None;
         self.custom_token = None;
+        self.alert_webhook_field = None;
+        self.alert_command_field = None;
 
         let w = WIN_W - RAIL_W;
         let pad = 22.0;
@@ -1022,14 +1331,15 @@ impl SettingsWindow {
             _ => self.build_workspaces(mtm, pad, inner_w, &mut y),
         }
 
+        let mut content_h = y + 24.0;
         if let Some(note) = self.actions.ivars().status_note.borrow().as_deref() {
+            let note_y = (WIN_H - 34.0).max(y + 8.0);
             let n = label(mtm, note, 11.5, false, &NSColor::secondaryLabelColor());
-            n.setFrame(NSRect::new(
-                NSPoint::new(pad, (WIN_H - 34.0).max(y + 8.0)),
-                NSSize::new(inner_w, 18.0),
-            ));
+            n.setFrame(NSRect::new(NSPoint::new(pad, note_y), NSSize::new(inner_w, 18.0)));
             self.detail.addSubview(&n);
+            content_h = note_y + 28.0;
         }
+        self.detail.setFrameSize(NSSize::new(w, content_h.max(WIN_H)));
     }
 
     fn build_server(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
@@ -1077,9 +1387,19 @@ impl SettingsWindow {
                         crate::LOCAL_CAPABILITIES.len(),
                     )
                 };
+                let tcp_part = info
+                    .listen_addr
+                    .as_deref()
+                    .map(|a| format!("TCP {a}"))
+                    .unwrap_or_else(|| "TCP off".into());
                 (
                     head,
-                    format!("{} sessions, {} blocks · {}", s, b, default_socket_path().display()),
+                    format!(
+                        "{} sessions, {} blocks · {tcp_part} · {}",
+                        s,
+                        b,
+                        default_socket_path().display()
+                    ),
                     diag.update_available,
                 )
             }
@@ -1095,12 +1415,13 @@ impl SettingsWindow {
             ),
         };
 
-        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 116.0)));
+        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 150.0)));
         let l1 = label(mtm, "Local Multiplexer Daemon", 13.0, true, &NSColor::labelColor());
         l1.setFrame(NSRect::new(NSPoint::new(14.0, 12.0), NSSize::new(w - 28.0, 18.0)));
         let l2 = label(mtm, &state_text, 12.5, false, &NSColor::labelColor());
         l2.setFrame(NSRect::new(NSPoint::new(14.0, 34.0), NSSize::new(w - 28.0, 18.0)));
         let l3 = label(mtm, &detail_text, 11.0, false, &NSColor::secondaryLabelColor());
+        l3.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
         l3.setFrame(NSRect::new(NSPoint::new(14.0, 54.0), NSSize::new(w - 28.0, 16.0)));
 
         let start_btn = if local_update {
@@ -1114,6 +1435,22 @@ impl SettingsWindow {
         let uninst_btn = push_button(mtm, "Uninstall Service", target, sel!(serverUninstallService:));
         uninst_btn.setFrame(NSRect::new(NSPoint::new(316.0, 78.0), NSSize::new(130.0, 26.0)));
 
+        let ts_btn = push_button(
+            mtm,
+            "Install Tailscale TCP Service",
+            target,
+            sel!(serverInstallTailscaleService:),
+        );
+        ts_btn.setFrame(NSRect::new(NSPoint::new(14.0, 112.0), NSSize::new(204.0, 26.0)));
+        let ts_hint = label(
+            mtm,
+            "Listen on Tailscale 100.x with bearer auth for iPhone companion",
+            10.5,
+            false,
+            &NSColor::tertiaryLabelColor(),
+        );
+        ts_hint.setFrame(NSRect::new(NSPoint::new(226.0, 117.0), NSSize::new(w - 240.0, 16.0)));
+
         for v in [
             &*l1 as &NSView,
             &*l2 as &NSView,
@@ -1121,11 +1458,13 @@ impl SettingsWindow {
             &*start_btn as &NSView,
             &*inst_btn as &NSView,
             &*uninst_btn as &NSView,
+            &*ts_btn as &NSView,
+            &*ts_hint as &NSView,
         ] {
             card.addSubview(v);
         }
         self.detail.addSubview(&card);
-        *y += 130.0;
+        *y += 164.0;
 
         let tip = label(
             mtm,
@@ -1142,7 +1481,7 @@ impl SettingsWindow {
     fn build_remote_hosts(&mut self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
         let target: &AnyObject = self.actions.as_ref();
         let hosts = super::mux_host_views();
-        let remotes: Vec<_> = hosts.into_iter().filter(|h| !h.is_local).collect();
+        let remotes: Vec<_> = hosts.iter().filter(|h| !h.is_local).cloned().collect();
 
         let mut aliases = Vec::new();
         let rows_h = (remotes.len().max(1) as f64) * 52.0 + 40.0;
@@ -1338,6 +1677,162 @@ impl SettingsWindow {
         self.custom_token = Some(token_field);
         self.detail.addSubview(&acard);
         *y += 116.0;
+
+        // Mobile Pairing QR card (This Mac + saved tcp:// hosts).
+        let saved_hosts = crate::mux::load_hosts();
+        let mut choices: Vec<(String, String)> = vec![("local".into(), "This Mac (local)".into())];
+        for entry in &saved_hosts {
+            if entry.uri.trim().starts_with("tcp://")
+                && entry
+                    .token
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+            {
+                choices.push((entry.alias.clone(), format!("{} ({})", entry.alias, entry.uri)));
+            }
+        }
+        {
+            let mut pa = self.actions.ivars().pair_aliases.borrow_mut();
+            pa.clear();
+            for (alias, _) in &choices {
+                pa.push(alias.clone());
+            }
+        }
+        let sel_idx = self
+            .actions
+            .ivars()
+            .pair_selected
+            .get()
+            .min(choices.len().saturating_sub(1));
+        self.actions.ivars().pair_selected.set(sel_idx);
+        let selected_alias = &choices[sel_idx].0;
+
+        let pair_result: Result<(crate::mux::pairing::PairingPayload, bool), String> =
+            if selected_alias == "local" {
+                let tok = crate::mux::load_or_create_token(&crate::mux::default_token_path())
+                    .map(|(t, _)| t)
+                    .unwrap_or_default();
+                let (hostname, running_listen) = hosts
+                    .iter()
+                    .find(|h| h.is_local)
+                    .and_then(|h| match &h.status {
+                        HostStatus::Connected { info, .. } => {
+                            Some((info.hostname.clone(), info.listen_addr.clone()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| (crate::mux::local_hostname(), None));
+                Ok(crate::mux::pairing::build_local_pairing(
+                    &tok,
+                    None,
+                    running_listen.as_deref(),
+                    None,
+                    &hostname,
+                ))
+            } else if let Some(entry) = saved_hosts.iter().find(|h| &h.alias == selected_alias) {
+                let live_info = hosts
+                    .iter()
+                    .find(|h| &h.alias == selected_alias)
+                    .and_then(|h| match &h.status {
+                        HostStatus::Connected { info, .. } => Some(info),
+                        _ => None,
+                    });
+                crate::mux::pairing::build_remote_pairing(entry, live_info).map(|p| (p, true))
+            } else {
+                Err("Selected host entry not found.".into())
+            };
+
+        let (uri, token_val, status_line, qr) = match pair_result {
+            Ok((payload, ready)) => {
+                let u = payload.to_uri();
+                let tok = payload.token.clone();
+                let tcp = payload.tcp_uri();
+                let status = if selected_alias == "local" && !ready {
+                    format!("{tcp} · Install Tailscale TCP Service for iPhone access")
+                } else {
+                    format!("{tcp} · TCP listener ready")
+                };
+                let q = crate::mux::qr::QrCode::encode(u.as_bytes()).ok();
+                (u, tok, status, q)
+            }
+            Err(e) => (String::new(), String::new(), e, None),
+        };
+        *self.actions.ivars().pair_uri.borrow_mut() = uri.clone();
+        *self.actions.ivars().pair_token.borrow_mut() = token_val;
+
+        let pcard = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 188.0)));
+        let qr_view = SettingsQrView::new(
+            mtm,
+            NSRect::new(NSPoint::new(14.0, 18.0), NSSize::new(152.0, 152.0)),
+            qr,
+        );
+        let rx = 180.0;
+        let rw = (w - rx - 14.0).max(160.0);
+        let phdr = label(
+            mtm,
+            "Mobile Pairing (iPhone over Tailscale)",
+            12.5,
+            true,
+            &NSColor::labelColor(),
+        );
+        phdr.setFrame(NSRect::new(NSPoint::new(rx, 12.0), NSSize::new(rw, 17.0)));
+
+        let picker = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            NSRect::new(NSPoint::new(rx, 35.0), NSSize::new(rw.min(260.0), 24.0)),
+            false,
+        );
+        for (_, title) in &choices {
+            picker.addItemWithTitle(&NSString::from_str(title));
+        }
+        picker.selectItemAtIndex(sel_idx as isize);
+        unsafe {
+            picker.setTarget(Some(target));
+            picker.setAction(Some(sel!(pairSelectHost:)));
+        }
+
+        let pline = label(mtm, &status_line, 11.0, false, &NSColor::secondaryLabelColor());
+        pline.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        pline.setFrame(NSRect::new(NSPoint::new(rx, 65.0), NSSize::new(rw, 16.0)));
+
+        let puri = label(
+            mtm,
+            if uri.is_empty() { "—" } else { &uri },
+            10.5,
+            false,
+            &NSColor::tertiaryLabelColor(),
+        );
+        puri.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        puri.setFrame(NSRect::new(NSPoint::new(rx, 86.0), NSSize::new(rw, 16.0)));
+
+        let copy_uri_btn = push_button(mtm, "Copy URI", target, sel!(pairCopyUri:));
+        copy_uri_btn.setFrame(NSRect::new(NSPoint::new(rx, 112.0), NSSize::new(104.0, 26.0)));
+        let copy_tok_btn = push_button(mtm, "Copy Token", target, sel!(pairCopyToken:));
+        copy_tok_btn.setFrame(NSRect::new(NSPoint::new(rx + 112.0, 112.0), NSSize::new(112.0, 26.0)));
+
+        let rot_btn = push_button(mtm, "Rotate Local Token", target, sel!(pairRotateToken:));
+        rot_btn.setFrame(NSRect::new(NSPoint::new(rx, 146.0), NSSize::new(150.0, 26.0)));
+        let cli_lbl = label(mtm, "CLI: `tachyon pair`", 10.5, false, &NSColor::tertiaryLabelColor());
+        cli_lbl.setFrame(NSRect::new(
+            NSPoint::new(rx + 158.0, 151.0),
+            NSSize::new((rw - 158.0).max(60.0), 16.0),
+        ));
+
+        for v in [
+            &*qr_view as &NSView,
+            &*phdr as &NSView,
+            &*picker as &NSView,
+            &*pline as &NSView,
+            &*puri as &NSView,
+            &*copy_uri_btn as &NSView,
+            &*copy_tok_btn as &NSView,
+            &*rot_btn as &NSView,
+            &*cli_lbl as &NSView,
+        ] {
+            pcard.addSubview(v);
+        }
+        self.detail.addSubview(&pcard);
+        *y += 202.0;
     }
 
     fn build_integrations(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
@@ -1560,7 +2055,7 @@ impl SettingsWindow {
         *y += 461.0;
     }
 
-    fn build_notifications(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
+    fn build_notifications(&mut self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
         let target: &AnyObject = self.actions.as_ref();
         let cfg = Config::load_default();
         let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 266.0)));
@@ -1651,6 +2146,85 @@ impl SettingsWindow {
         }
         self.detail.addSubview(&card);
         *y += 280.0;
+
+        // Away-from-Desk Alert Hooks card (webhook + shell command).
+        let hcard = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 170.0)));
+        let h_title = label(
+            mtm,
+            "Away-from-Desk Alert Hooks (server-side)",
+            13.0,
+            true,
+            &NSColor::labelColor(),
+        );
+        h_title.setFrame(NSRect::new(NSPoint::new(14.0, 12.0), NSSize::new(w - 28.0, 18.0)));
+        let h_sub = label(
+            mtm,
+            "POST JSON to a webhook (ntfy.sh / Pushover / Slack) or run a command when agents block or error.",
+            11.0,
+            false,
+            &NSColor::secondaryLabelColor(),
+        );
+        h_sub.setFrame(NSRect::new(NSPoint::new(14.0, 32.0), NSSize::new(w - 28.0, 26.0)));
+
+        let webhook_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(14.0, 64.0), NSSize::new(w - 28.0, 24.0)),
+        );
+        webhook_field.setPlaceholderString(Some(&NSString::from_str(
+            "Webhook URL (https://ntfy.sh/your-topic or http://...)",
+        )));
+        if let Some(url) = cfg.server.alert_webhook.as_deref() {
+            webhook_field.setStringValue(&NSString::from_str(url));
+        }
+
+        let command_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(14.0, 96.0), NSSize::new(w - 28.0, 24.0)),
+        );
+        command_field.setPlaceholderString(Some(&NSString::from_str(
+            "Optional shell command (receives $TACHYON_ALERT_* env & JSON stdin)",
+        )));
+        if let Some(cmd) = cfg.server.alert_command.as_deref() {
+            command_field.setStringValue(&NSString::from_str(cmd));
+        }
+
+        let save_btn = push_button(mtm, "Save Alert Hooks", target, sel!(alertsSaveHooks:));
+        save_btn.setFrame(NSRect::new(NSPoint::new(14.0, 130.0), NSSize::new(142.0, 26.0)));
+        let send_test_btn = push_button(mtm, "Send Test Alert", target, sel!(alertsSendTest:));
+        send_test_btn.setFrame(NSRect::new(NSPoint::new(164.0, 130.0), NSSize::new(136.0, 26.0)));
+
+        let states_lbl = if cfg.server.alert_states.is_empty() {
+            "off".to_string()
+        } else {
+            cfg.server.alert_states.join(", ")
+        };
+        let meta = label(
+            mtm,
+            &format!("States: {states_lbl} · Cooldown: {}s", cfg.server.alert_cooldown_secs),
+            10.5,
+            false,
+            &NSColor::tertiaryLabelColor(),
+        );
+        meta.setFrame(NSRect::new(
+            NSPoint::new(308.0, 135.0),
+            NSSize::new((w - 322.0).max(80.0), 16.0),
+        ));
+
+        for v in [
+            &*h_title as &NSView,
+            &*h_sub as &NSView,
+            &*webhook_field as &NSView,
+            &*command_field as &NSView,
+            &*save_btn as &NSView,
+            &*send_test_btn as &NSView,
+            &*meta as &NSView,
+        ] {
+            hcard.addSubview(v);
+        }
+        self.alert_webhook_field = Some(webhook_field);
+        self.alert_command_field = Some(command_field);
+        self.detail.addSubview(&hcard);
+        *y += 184.0;
     }
 
     fn build_workspaces(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {

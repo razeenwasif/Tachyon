@@ -314,6 +314,8 @@ Every managed pane automatically exports:
 tachyon hosts ls --json
 tachyon doctor --json
 tachyon ls --json
+tachyon pair --json                          # generate Tailscale/TCP pairing link & QR
+tachyon server alerts [--test] [--json]      # inspect or test away-from-desk alert hooks
 
 # Open a split pane beside or below the current pane
 tachyon split --right -- <command>

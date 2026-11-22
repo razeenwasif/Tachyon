@@ -543,6 +543,17 @@ pub struct ServerConfig {
     /// commands (`claude --continue`, `codex resume --last`, `agy --continue`)
     /// when restoring persisted panes.
     pub auto_resume_agents: bool,
+    /// Optional HTTP(S) webhook URL (`ntfy.sh`, Pushover bridge, Slack, etc.)
+    /// notified on coding-agent transitions.
+    pub alert_webhook: Option<String>,
+    /// Optional local shell command invoked on coding-agent alert transitions.
+    pub alert_command: Option<String>,
+    /// Agent states triggering away-from-desk alerts (`blocked`, `error`, `done`).
+    pub alert_states: Vec<String>,
+    /// Minimum cooldown seconds between alerts for the same block unless reset by `working`.
+    pub alert_cooldown_secs: u64,
+    /// Only deliver alerts when the block has no interactive attached clients.
+    pub alert_when_detached: bool,
 }
 
 impl Default for ServerConfig {
@@ -550,6 +561,11 @@ impl Default for ServerConfig {
         ServerConfig {
             persist_sessions: true,
             auto_resume_agents: true,
+            alert_webhook: None,
+            alert_command: None,
+            alert_states: vec!["blocked".into(), "error".into()],
+            alert_cooldown_secs: 30,
+            alert_when_detached: false,
         }
     }
 }
@@ -915,6 +931,22 @@ impl Config {
             "agents.auto_name_sessions" => self.agents.auto_name_sessions = parse_bool(value)?,
             "server.persist_sessions" => self.server.persist_sessions = parse_bool(value)?,
             "server.auto_resume_agents" => self.server.auto_resume_agents = parse_bool(value)?,
+            "server.alert_webhook" => {
+                self.server.alert_webhook = crate::server::alerts::normalize_webhook_url(value)?;
+            }
+            "server.alert_command" => {
+                let t = value.trim();
+                self.server.alert_command = (!t.is_empty()).then(|| t.to_string());
+            }
+            "server.alert_states" => {
+                self.server.alert_states = crate::server::alerts::parse_alert_states(value)?;
+            }
+            "server.alert_cooldown_secs" => {
+                self.server.alert_cooldown_secs = parse_usize(value, 0, 3600)? as u64;
+            }
+            "server.alert_when_detached" => {
+                self.server.alert_when_detached = parse_bool(value)?;
+            }
             "notify.agent_status" => self.macos.notify_agent_status = parse_bool(value)?,
             "notify.sound_cues" => self.macos.sound_cues = parse_bool(value)?,
             "notify.sound_volume" => self.macos.sound_volume = parse_f32(value, 0.0, 1.0)?,
@@ -1402,6 +1434,40 @@ mod contrast_tests {
 
         let bad = Config::parse("server.persist_sessions = maybe\n");
         assert_eq!(bad.warnings.len(), 1);
+    }
+
+    #[test]
+    fn server_alert_hook_keys_parse_and_validate() {
+        let def = Config::default();
+        assert_eq!(def.server.alert_webhook, None);
+        assert_eq!(def.server.alert_command, None);
+        assert_eq!(def.server.alert_states, vec!["blocked", "error"]);
+        assert_eq!(def.server.alert_cooldown_secs, 30);
+        assert!(!def.server.alert_when_detached);
+
+        let custom = Config::parse(
+            "server.alert_webhook = https://ntfy.sh/my-topic\n\
+             server.alert_command = echo alerted\n\
+             server.alert_states = blocked, done\n\
+             server.alert_cooldown_secs = 45\n\
+             server.alert_when_detached = true\n",
+        );
+        assert!(custom.warnings.is_empty(), "{:?}", custom.warnings);
+        assert_eq!(
+            custom.server.alert_webhook.as_deref(),
+            Some("https://ntfy.sh/my-topic")
+        );
+        assert_eq!(custom.server.alert_command.as_deref(), Some("echo alerted"));
+        assert_eq!(custom.server.alert_states, vec!["blocked", "done"]);
+        assert_eq!(custom.server.alert_cooldown_secs, 45);
+        assert!(custom.server.alert_when_detached);
+
+        let bad = Config::parse(
+            "server.alert_webhook = ftp://invalid\n\
+             server.alert_states = invalid_state\n\
+             server.alert_cooldown_secs = 99999\n",
+        );
+        assert_eq!(bad.warnings.len(), 3, "{:?}", bad.warnings);
     }
 
     #[test]

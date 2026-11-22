@@ -42,11 +42,13 @@ pub const APP_BUILD_SHA: &str = match option_env!("TACHYON_BUILD_SHA") {
 };
 
 pub const LOCAL_CAPABILITIES: &[&str] = &[
+    "alerts.hook",
     "auth.bearer",
     "block.handoff",
     "block.receipts",
     "block.rewind",
     "block.wait",
     "images.restore",
+    "mobile.pair",
     "server.persist",
 ];

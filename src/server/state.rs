@@ -10,7 +10,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use serde_json::{json, Value};
 
 use crate::mux::model::{
@@ -21,6 +21,7 @@ use crate::mux::proto::{Frame, PROTOCOL_VERSION};
 use crate::mux::{local_hostname, unix_now};
 use crate::term::{CommandEvent, Processor, ProgramState, ProgramStatus, Term, TermMode};
 
+use super::alerts;
 use super::persist::{
     self, PersistedPane, PersistedSession, PersistedState, PersistedWindow, RestoreReport,
 };
@@ -581,11 +582,13 @@ impl PersistCoordinator {
 
 pub struct ServerState {
     host_info: HostInfo,
-    auth_token: Option<String>,
+    auth_token: RwLock<Option<String>>,
+    token_file: Option<PathBuf>,
     next_id: AtomicU64,
     shutdown: AtomicBool,
     inner: Mutex<StateInner>,
     persist: PersistCoordinator,
+    alerts: Arc<alerts::AlertManager>,
 }
 
 impl Drop for ServerState {
@@ -605,6 +608,22 @@ impl ServerState {
     }
 
     pub fn with_options(auth_token: Option<String>, persist: PersistOptions) -> Arc<Self> {
+        Self::with_full_options(
+            auth_token,
+            None,
+            None,
+            persist,
+            alerts::AlertConfig::default(),
+        )
+    }
+
+    pub fn with_full_options(
+        auth_token: Option<String>,
+        token_file: Option<PathBuf>,
+        listen_addr: Option<String>,
+        persist: PersistOptions,
+        alert_config: alerts::AlertConfig,
+    ) -> Arc<Self> {
         if let Some(root) = server_rewind_root() {
             crate::term::rewind::remove_stale(&root);
         }
@@ -623,8 +642,10 @@ impl ServerState {
                     .map(|s| (*s).to_string())
                     .collect(),
                 auth_enabled: Some(auth_token.is_some()),
+                listen_addr,
             },
-            auth_token,
+            auth_token: RwLock::new(auth_token),
+            token_file,
             next_id: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
             inner: Mutex::new(StateInner {
@@ -636,6 +657,7 @@ impl ServerState {
                 state_waiters: HashMap::new(),
             }),
             persist: PersistCoordinator::new(persist),
+            alerts: Arc::new(alerts::AlertManager::new(alert_config)),
         });
         if spawn_worker {
             let weak: Weak<ServerState> = Arc::downgrade(&state);
@@ -651,6 +673,12 @@ impl ServerState {
 
     pub fn host_info(&self) -> &HostInfo {
         &self.host_info
+    }
+
+    fn current_host_info(&self) -> HostInfo {
+        let mut h = self.host_info.clone();
+        h.auth_enabled = Some(self.auth_token.read().is_some());
+        h
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -1075,7 +1103,7 @@ impl ServerState {
         drop(st);
         let block_infos = blocks.iter().map(|b| b.info()).collect();
         ServerSnapshot {
-            host: self.host_info.clone(),
+            host: self.current_host_info(),
             sessions,
             windows,
             blocks: block_infos,
@@ -1154,6 +1182,10 @@ impl ServerState {
             "server.snapshot" => self.rpc_server_snapshot(),
             "server.persist_info" => Ok(self.persist_info_json()),
             "server.restore" => self.rpc_server_restore(req),
+            "server.set_token" => self.rpc_server_set_token(req),
+            "server.alerts.get" => Ok(self.alerts.config().to_json()),
+            "server.alerts.set" => self.rpc_server_alerts_set(req),
+            "server.alerts.test" => self.rpc_server_alerts_test(req),
             "events.subscribe" => {
                 outbox.subscribed_events.store(true, Ordering::Release);
                 Ok(json!({ "subscribed": true }))
@@ -1226,7 +1258,7 @@ impl ServerState {
             ));
         }
         if !outbox.authenticated.load(Ordering::Acquire) {
-            if let Some(expected) = self.auth_token.as_deref() {
+            if let Some(expected) = self.auth_token.read().as_deref() {
                 let supplied = req.get("token").and_then(Value::as_str).unwrap_or("");
                 if !crate::mux::ct_eq(supplied.as_bytes(), expected.as_bytes()) {
                     return Err("unauthorized: invalid or missing bearer token".into());
@@ -1243,7 +1275,7 @@ impl ServerState {
         Ok(json!({
             "protocol": PROTOCOL_VERSION,
             "client_id": outbox.id,
-            "host": self.host_info.to_json(),
+            "host": self.current_host_info().to_json(),
         }))
     }
 
@@ -1275,6 +1307,74 @@ impl ServerState {
         let auto_resume = req.get("auto_resume").and_then(Value::as_bool);
         let report = self.restore_from_disk(path.as_deref(), auto_resume)?;
         Ok(report.to_json())
+    }
+
+    fn rpc_server_set_token(&self, req: &Value) -> Result<Value, String> {
+        let regenerate = req.get("regenerate").and_then(Value::as_bool).unwrap_or(false);
+        let new_token = if regenerate {
+            crate::mux::generate_auth_token().map_err(|e| e.to_string())?
+        } else if let Some(tok) = req
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            tok.to_string()
+        } else {
+            crate::mux::generate_auth_token().map_err(|e| e.to_string())?
+        };
+        if let Some(ref path) = self.token_file {
+            crate::mux::write_token_file(path, &new_token).map_err(|e| e.to_string())?;
+        }
+        *self.auth_token.write() = Some(new_token.clone());
+        Ok(json!({
+            "updated": true,
+            "token": new_token,
+            "path": self.token_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "auth_enabled": true,
+        }))
+    }
+
+    fn rpc_server_alerts_set(&self, req: &Value) -> Result<Value, String> {
+        let updated = self.alerts.update_config(req)?;
+        Ok(updated.to_json())
+    }
+
+    fn rpc_server_alerts_test(&self, req: &Value) -> Result<Value, String> {
+        let cfg = self.alerts.config();
+        let state_str = req
+            .get("state")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("blocked")
+            .to_string();
+        let msg = req
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "Test alert from Tachyon".into());
+        let payload = alerts::AlertPayload {
+            host: self.host_info.hostname.clone(),
+            block_id: "test".into(),
+            session_id: "test".into(),
+            window_id: "test".into(),
+            label: "test".into(),
+            state: state_str,
+            app: Some("tachyon".into()),
+            message: Some(msg),
+            cwd: None,
+            inferred: false,
+            interactive_clients: 0,
+            timestamp_unix: unix_now(),
+        };
+        self.broadcast_event(payload.to_json());
+        let delivery = alerts::dispatch_sync(&cfg, &payload);
+        Ok(json!({
+            "alert": payload.to_json(),
+            "config": cfg.to_json(),
+            "delivery": delivery.to_json(),
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2460,6 +2560,30 @@ impl ServerState {
                         st.msg.as_deref(),
                         false,
                     );
+                }
+                let interactive = block.attached_count.load(Ordering::Acquire);
+                if let Some(cfg) = self.alerts.evaluate_transition(
+                    &block.id,
+                    st.state.as_str(),
+                    st.msg.as_deref(),
+                    interactive,
+                ) {
+                    let payload = alerts::AlertPayload {
+                        host: self.host_info.hostname.clone(),
+                        block_id: block.id.clone(),
+                        session_id: block.session_id.clone(),
+                        window_id: block.window_id.clone(),
+                        label: info.display_name().to_string(),
+                        state: st.state.as_str().to_string(),
+                        app: st.app.clone(),
+                        message: st.msg.clone(),
+                        cwd: info.cwd.clone(),
+                        inferred: info.status_inferred,
+                        interactive_clients: interactive,
+                        timestamp_unix: unix_now(),
+                    };
+                    self.broadcast_event(payload.to_json());
+                    alerts::dispatch_async(cfg, payload);
                 }
             }
         }

@@ -9168,7 +9168,7 @@ fn ssh_target_host(cmd: &str) -> Option<String> {
     None
 }
 
-fn copy_to_pasteboard(text: &str) {
+pub(super) fn copy_to_pasteboard(text: &str) {
     let board = NSPasteboard::generalPasteboard();
     board.clearContents();
     board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
