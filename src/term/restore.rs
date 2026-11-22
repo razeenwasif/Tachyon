@@ -12,11 +12,16 @@
 //! What isn't kept: how long restored commands took (they get no receipt
 //! times), rerun-diff marks, character sets, and a pending wrap.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::sync::Arc;
+
+use base64::Engine as _;
 
 use super::cell::{Cell, CellFlags, CLUSTER_TAG};
 use super::color::Color;
 use super::grid::RowMark;
+use super::image;
 use super::{CommandState, CursorShape, Term, TermMode};
 
 impl Term {
@@ -64,6 +69,10 @@ impl Term {
             w.finish(id);
         }
 
+        // Cached kitty image data and primary/scrollback inline images.
+        w.write_kitty_cache();
+        w.write_images(false, primary.scrolled() as i64);
+
         // The cursor on the shell's screen: where the program that took the
         // alternate screen will return it.
         let shell_cursor = if alt { self.saved_cursor } else { self.cursor };
@@ -79,6 +88,7 @@ impl Term {
                 // Never let the last column wrap onto the next row.
                 w.row(screen.row(y).cells(), screen.cols(), false);
             }
+            w.write_images(true, screen.scrolled() as i64);
         }
 
         // Modes, the scroll region, the cursor and its pen.
@@ -306,6 +316,89 @@ impl Writer<'_> {
         }
         self.out.push('\x07');
     }
+
+    fn write_kitty_transmit_payload(&mut self, header: &str, img: &image::Image) {
+        let (fmt_code, compressed, payload): (u32, bool, Cow<'_, [u8]>) = match img.format {
+            image::Format::Encoded => (100, false, Cow::Borrowed(&img.data)),
+            image::Format::Rgb | image::Format::Rgba => {
+                let code = if img.format == image::Format::Rgb { 24 } else { 32 };
+                let z = image::compress_zlib(&img.data);
+                if z.len() < img.data.len() {
+                    (code, true, Cow::Owned(z))
+                } else {
+                    (code, false, Cow::Borrowed(&img.data))
+                }
+            }
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload.as_ref());
+        let z_flag = if compressed { ",o=z" } else { "" };
+        const CHUNK: usize = 32 * 1024;
+        if b64.len() <= CHUNK {
+            let _ = write!(
+                self.out,
+                "\x1b_G{header},f={fmt_code},s={},v={}{z_flag};{b64}\x1b\\",
+                img.width, img.height
+            );
+            return;
+        }
+        let bytes = b64.as_bytes();
+        let total = bytes.len();
+        let mut pos = 0usize;
+        while pos < total {
+            let end = (pos + CHUNK).min(total);
+            let more = u8::from(end < total);
+            let slice = &b64[pos..end];
+            if pos == 0 {
+                let _ = write!(
+                    self.out,
+                    "\x1b_G{header},f={fmt_code},s={},v={}{z_flag},m={more};{slice}\x1b\\",
+                    img.width, img.height
+                );
+            } else {
+                let _ = write!(self.out, "\x1b_Gm={more};{slice}\x1b\\");
+            }
+            pos = end;
+        }
+    }
+
+    fn write_kitty_cache(&mut self) {
+        let mut ids: Vec<u32> = self.term.kitty_images.keys().copied().collect();
+        ids.sort_unstable();
+        for kid in ids {
+            if let Some(img) = self.term.kitty_images.get(&kid) {
+                self.write_kitty_transmit_payload(&format!("a=t,q=2,i={kid}"), img);
+            }
+        }
+    }
+
+    fn write_images(&mut self, alt_screen: bool, scrolled: i64) {
+        for p in self.term.placements().iter().filter(|p| p.alt == alt_screen) {
+            let from_top = p.line - scrolled;
+            let tc = u8::from(p.in_cells);
+            let is_cached_kitty = p.kitty_id.is_some_and(|kid| {
+                self.term
+                    .kitty_images
+                    .get(&kid)
+                    .is_some_and(|img| Arc::ptr_eq(img, &p.image))
+            });
+            if is_cached_kitty {
+                let kid = p.kitty_id.unwrap();
+                let _ = write!(
+                    self.out,
+                    "\x1b_Ga=p,q=2,C=1,i={kid},c={},r={},ty={from_top},tx={},tc={tc}\x1b\\",
+                    p.cols, p.rows, p.col
+                );
+            } else {
+                self.write_kitty_transmit_payload(
+                    &format!(
+                        "a=T,q=2,C=1,c={},r={},ty={from_top},tx={},tc={tc}",
+                        p.cols, p.rows, p.col
+                    ),
+                    &p.image,
+                );
+            }
+        }
+    }
 }
 
 fn color(s: &mut String, c: Color, base: u8) {
@@ -466,5 +559,77 @@ mod tests {
         assert_eq!(rr.peak_footprint, expected_receipt.peak_footprint);
         assert!((rr.pcore_share.unwrap() - 0.75).abs() < 1e-3);
         assert!((rr.energy_joules.unwrap() - 3.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn inline_images_round_trip_across_scrollback_alt_screen_and_kitty_cache() {
+        let mut t = Term::new(20, 6, 100);
+        t.set_cell_pixels(10, 20);
+
+        // 1. iTerm2 PNG in scrollback (`in_cells = true`).
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&20u32.to_be_bytes());
+        png.extend_from_slice(&40u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0x01, 0x02, 0x03]);
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        feed(&mut t, &format!("\x1b]1337;File=inline=1:{png_b64}\x07"));
+        for i in 0..8 {
+            feed(&mut t, &format!("\r\nscroll {i}"));
+        }
+
+        // 2. Sixel RGBA on primary screen (`in_cells = true`).
+        feed(&mut t, "\r\n\x1bPq\"1;1;4;7#1;2;100;0;0#1!4~-\x1b\\");
+
+        // 3. Cached kitty image transmitted with a=t (id=9) and placed with a=p on primary.
+        let rgba = vec![0u8, 255, 0, 255, 0, 0, 255, 255];
+        let rgba_z = base64::engine::general_purpose::STANDARD.encode(image::compress_zlib(&rgba));
+        feed(&mut t, &format!("\x1b_Ga=t,q=2,i=9,f=32,s=2,v=1,o=z;{rgba_z}\x1b\\"));
+        feed(&mut t, "\x1b[2;3H\x1b_Ga=p,q=2,i=9,c=2,r=1,C=1\x1b\\");
+        assert!(t.take_replies().is_empty(), "q=2 suppresses ack");
+
+        // 4. Alt screen kitty placement (`alt = true`, `in_cells = false`).
+        feed(&mut t, "\x1b[?1049h\x1b[1;1Halt screen");
+        let alt_rgb = vec![255u8, 0, 0, 0, 255, 0];
+        let alt_b64 = base64::engine::general_purpose::STANDARD.encode(&alt_rgb);
+        feed(&mut t, &format!("\x1b[3;4H\x1b_Ga=T,q=2,i=11,f=24,s=2,v=1,c=2,r=1,C=1;{alt_b64}\x1b\\"));
+
+        assert_eq!(t.placements().len(), 4);
+        assert!(t.has_kitty_image(9));
+        assert!(t.has_kitty_image(11));
+
+        // Round-trip via Term::to_vt().
+        let vt = t.to_vt();
+        let mut r = Term::new(20, 6, 100);
+        r.set_cell_pixels(10, 20);
+        r.restoring = true;
+        feed(&mut r, std::str::from_utf8(&vt).expect("UTF-8 restore stream"));
+        r.restoring = false;
+        same(&t, &r);
+        assert!(r.take_replies().is_empty(), "restore produces no kitty acks");
+
+        assert!(r.has_kitty_image(9));
+        assert!(r.has_kitty_image(11));
+        assert_eq!(r.placements().len(), 4);
+        assert_eq!(
+            r.placements().iter().map(|p| (p.line, p.col, p.cols, p.rows, p.alt, p.in_cells, &p.image.data)).collect::<Vec<_>>(),
+            t.placements().iter().map(|p| (p.line, p.col, p.cols, p.rows, p.alt, p.in_cells, &p.image.data)).collect::<Vec<_>>(),
+        );
+
+        // Cached kitty id=9 remains usable after restore.
+        feed(&mut r, "\x1b[?1049l\x1b[4;1H\x1b_Ga=p,i=9,c=2,r=1,C=1\x1b\\");
+        assert!(String::from_utf8_lossy(&r.take_replies()).contains("i=9;OK"));
+
+        // Re-verify `in_cells` punch behavior on restored Sixel placement on primary screen.
+        let before_punch = r.placements().len();
+        feed(&mut r, "\x1b[6;1Hoverwrite");
+        assert!(r.placements().len() <= before_punch);
+
+        // Smaller destination scrollback evicts images whose lines fell off scrollback.
+        let mut small = Term::new(20, 6, 2);
+        small.set_cell_pixels(10, 20);
+        small.restoring = true;
+        feed(&mut small, std::str::from_utf8(&vt).expect("UTF-8 restore stream"));
+        small.restoring = false;
+        assert!(small.placements().len() < t.placements().len(), "scrollback PNG should prune on 2-line scrollback");
     }
 }

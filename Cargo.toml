@@ -48,8 +48,9 @@ bitflags = "2.13"
 parking_lot = "0.12"
 similar = { version = "2", default-features = false }
 lz4_flex = "0.11"
-# Inline images: their payloads come base64-encoded.
+# Inline images: their payloads come base64-encoded (and optionally zlib-compressed).
 base64 = "0.22"
+miniz_oxide = "0.8"
 # Fairy's socket speaks lines of JSON.
 serde_json = "1"
 # Find in scrollback: plain text and regex searches.
