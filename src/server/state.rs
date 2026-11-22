@@ -617,6 +617,12 @@ impl ServerState {
                 version: crate::APP_VERSION.to_string(),
                 protocol: PROTOCOL_VERSION,
                 pid: std::process::id(),
+                build: Some(crate::APP_BUILD_SHA.to_string()),
+                capabilities: crate::LOCAL_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                auth_enabled: Some(auth_token.is_some()),
             },
             auth_token,
             next_id: AtomicU64::new(1),

@@ -296,6 +296,9 @@ impl MuxClient {
                 version: String::new(),
                 protocol: PROTOCOL_VERSION,
                 pid: 0,
+                build: None,
+                capabilities: Vec::new(),
+                auth_enabled: None,
             },
             client_id: String::new(),
         };

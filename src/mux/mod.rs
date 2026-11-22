@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod client;
+pub mod doctor;
 pub mod model;
 pub mod proto;
 pub mod transport;

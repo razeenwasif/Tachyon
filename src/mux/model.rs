@@ -175,6 +175,9 @@ pub struct HostInfo {
     pub version: String,
     pub protocol: u32,
     pub pid: u32,
+    pub build: Option<String>,
+    pub capabilities: Vec<String>,
+    pub auth_enabled: Option<bool>,
 }
 
 impl HostInfo {
@@ -186,6 +189,9 @@ impl HostInfo {
             "version": self.version,
             "protocol": self.protocol,
             "pid": self.pid,
+            "build": self.build,
+            "capabilities": self.capabilities,
+            "auth_enabled": self.auth_enabled,
         })
     }
 
@@ -197,6 +203,17 @@ impl HostInfo {
             version: v.get("version")?.as_str()?.to_string(),
             protocol: v.get("protocol")?.as_u64()? as u32,
             pid: v.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32,
+            build: v.get("build").and_then(Value::as_str).map(str::to_string),
+            capabilities: v
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            auth_enabled: v.get("auth_enabled").and_then(Value::as_bool),
         })
     }
 }
@@ -1437,6 +1454,9 @@ mod tests {
                 version: "0.1.0".into(),
                 protocol: 2,
                 pid: 10,
+                build: None,
+                capabilities: Vec::new(),
+                auth_enabled: None,
             },
             sessions: vec![SessionInfo {
                 id: "s1".into(),
