@@ -35,7 +35,7 @@ use unicode_width::UnicodeWidthChar;
 use super::font::{CellMetrics, FontSet, GlyphBitmap};
 use super::images;
 use super::selection::Range;
-use crate::config::{ChromeStyle, Config};
+use crate::config::{ChromeStyle, Config, PaneStyle};
 use crate::term::{Cell, CellFlags, CursorShape, Palette, Term, TermMode, CLUSTER_TAG};
 
 const SHADERS: &str = include_str!("shaders.metal");
@@ -78,6 +78,15 @@ const IMAGE_CACHE_BYTES: usize = 384 << 20;
 struct RectInstance {
     rect: [f32; 4],
     color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CardInstance {
+    rect: [f32; 4],
+    fill_color: [f32; 4],
+    border_color: [f32; 4],
+    params: [f32; 4],
 }
 
 #[repr(C)]
@@ -214,6 +223,7 @@ pub struct HostAccent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChromeTokens {
     pub chrome_bg: [u8; 3],
+    pub canvas_bg: [u8; 3],
     pub pane_bg_override: Option<[u8; 3]>,
     pub hairline_rgb: [u8; 3],
     pub hairline_alpha: f32,
@@ -228,6 +238,7 @@ pub fn chrome_tokens(style: ChromeStyle, theme_bg: [u8; 3]) -> ChromeTokens {
     match style {
         ChromeStyle::Glass => ChromeTokens {
             chrome_bg: theme_bg,
+            canvas_bg: theme_bg,
             pane_bg_override: None,
             hairline_rgb: [255, 255, 255],
             hairline_alpha: 0.12,
@@ -238,6 +249,7 @@ pub fn chrome_tokens(style: ChromeStyle, theme_bg: [u8; 3]) -> ChromeTokens {
         },
         ChromeStyle::Herdr => ChromeTokens {
             chrome_bg: [0x10, 0x11, 0x14],
+            canvas_bg: [0x13, 0x15, 0x18],
             pane_bg_override: None,
             hairline_rgb: [255, 255, 255],
             hairline_alpha: 0.094,
@@ -248,6 +260,7 @@ pub fn chrome_tokens(style: ChromeStyle, theme_bg: [u8; 3]) -> ChromeTokens {
         },
         ChromeStyle::Terminals => ChromeTokens {
             chrome_bg: [0x0C, 0x0D, 0x0F],
+            canvas_bg: [0x0C, 0x0D, 0x0F],
             pane_bg_override: Some([0x11, 0x12, 0x14]),
             hairline_rgb: [255, 255, 255],
             hairline_alpha: 0.094,
@@ -258,6 +271,7 @@ pub fn chrome_tokens(style: ChromeStyle, theme_bg: [u8; 3]) -> ChromeTokens {
         },
         ChromeStyle::Core => ChromeTokens {
             chrome_bg: [0x0A, 0x0B, 0x0C],
+            canvas_bg: [0x0A, 0x0B, 0x0C],
             pane_bg_override: Some([0x0A, 0x0B, 0x0C]),
             hairline_rgb: [0x24, 0x26, 0x2A],
             hairline_alpha: 1.0,
@@ -269,22 +283,63 @@ pub fn chrome_tokens(style: ChromeStyle, theme_bg: [u8; 3]) -> ChromeTokens {
     }
 }
 
+/// Inner horizontal/vertical padding (in drawable pixels) around a pane card's
+/// cell grid so split cards keep an ~8pt canvas gap while keeping all corner
+/// glyphs inside the 10pt corner radius.
+pub fn card_inner_pad(cell_w: f32, cell_h: f32, scale: f32) -> (f32, f32) {
+    let px = (cell_w * 0.5).clamp(4.0 * scale, 6.0 * scale).round();
+    let py = ((cell_h - 8.0 * scale) * 0.5).clamp(3.5 * scale, 6.0 * scale).round();
+    (px, py)
+}
+
+/// Crisp 1px card outline colour (straight sRGB RGBA) prioritizing Broadcast mode,
+/// then danger/remote/local focused accents, then a subtle inactive card border.
+pub fn card_border_color(
+    chrome: ChromeStyle,
+    focused: bool,
+    window_focused: bool,
+    broadcast: bool,
+    host_accent: Option<&HostAccent>,
+    theme_accent: [u8; 3],
+) -> [f32; 4] {
+    if broadcast {
+        let mut c = srgb([245, 158, 11]);
+        c[3] = 0.88;
+        return c;
+    }
+    if focused && window_focused {
+        if let Some(acc) = host_accent {
+            let mut c = srgb(acc.rgb);
+            c[3] = if acc.danger { 0.90 } else { 0.78 };
+            return c;
+        }
+        let rgb = if chrome.is_minimal() { [0x96, 0xB2, 0xD7] } else { theme_accent };
+        let mut c = srgb(rgb);
+        c[3] = if chrome.is_minimal() { 0.65 } else { 0.70 };
+        return c;
+    }
+    [1.0, 1.0, 1.0, if chrome.is_minimal() { 0.08 } else { 0.12 }]
+}
+
 /// One frame's worth of GPU-visible instance buffers.
 #[derive(Default)]
 struct Slot {
+    cards_bg: Option<Retained<Buffer>>,
     bg: Option<Retained<Buffer>>,
     glyphs: Option<Retained<Buffer>>,
     overlay: Option<Retained<Buffer>>,
+    cards_fg: Option<Retained<Buffer>>,
     panel_glyphs: Option<Retained<Buffer>>,
     in_flight: Option<Retained<CommandBuffer>>,
 }
 
-/// Metal objects shared by every window: one device, one queue, and the two
+/// Metal objects shared by every window: one device, one queue, and the
 /// pipelines, so opening a window does not recompile the shaders.
 pub struct Gpu {
     device: Retained<Device>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     rect_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    card_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     glyph_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     image_pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }
@@ -298,12 +353,14 @@ impl Gpu {
             .newLibraryWithSource_options_error(&source, None)
             .map_err(|e| format!("shader compile failed: {}", e.localizedDescription()))?;
         let rect_pso = pipeline(&device, &*library, "vs_rect", "fs_rect")?;
+        let card_pso = pipeline(&device, &*library, "vs_card", "fs_card")?;
         let glyph_pso = pipeline(&device, &*library, "vs_glyph", "fs_glyph")?;
         let image_pso = pipeline(&device, &*library, "vs_image", "fs_image")?;
         Ok(Rc::new(Gpu {
             device,
             queue,
             rect_pso,
+            card_pso,
             glyph_pso,
             image_pso,
         }))
@@ -334,10 +391,13 @@ pub struct Renderer {
     /// Fairy's button.
     hints_band: bool,
     chrome: ChromeStyle,
+    pane_style: PaneStyle,
 
+    cards_bg: Vec<CardInstance>,
     bg: Vec<RectInstance>,
     glyphs: Vec<GlyphInstance>,
     overlay: Vec<RectInstance>,
+    cards_fg: Vec<CardInstance>,
     /// Inline images this frame, by image id, drawn in order.
     images: Vec<(u64, ImageInstance)>,
     textures: FxHashMap<u64, ImageTexture>,
@@ -392,10 +452,13 @@ impl Renderer {
             top_inset: 0.0,
             hints_band: false,
             chrome: cfg.window.chrome,
+            pane_style: cfg.window.pane_style,
             strip_band: None,
+            cards_bg: Vec::new(),
             bg: Vec::new(),
             glyphs: Vec::new(),
             overlay: Vec::new(),
+            cards_fg: Vec::new(),
             images: Vec::new(),
             textures: FxHashMap::default(),
             panel_texture: None,
@@ -440,10 +503,20 @@ impl Renderer {
     }
 
     pub fn padding(&self) -> (f32, f32) {
-        (
-            (self.cfg.window.padding_x * self.scale).round(),
-            (self.cfg.window.padding_y * self.scale).round(),
-        )
+        let base_x = (self.cfg.window.padding_x * self.scale).round();
+        let base_y = (self.cfg.window.padding_y * self.scale).round();
+        if self.pane_style.is_cards() {
+            let m = self.fonts.metrics;
+            let (card_px, card_py) = card_inner_pad(m.width, m.height, self.scale);
+            let outer = (8.0 * self.scale).round();
+            (base_x.max(card_px + outer), base_y.max(card_py + outer))
+        } else {
+            (base_x, base_y)
+        }
+    }
+
+    pub fn set_pane_style(&mut self, style: PaneStyle) {
+        self.pane_style = style;
     }
 
     /// Grid dimensions that fit a drawable of the given pixel size, above the
@@ -787,10 +860,67 @@ impl Renderer {
             self.atlas.reset();
             self.atlas.overflowed = false;
         }
+        self.cards_bg.clear();
         self.bg.clear();
         self.glyphs.clear();
         self.overlay.clear();
+        self.cards_fg.clear();
         self.images.clear();
+
+        let tokens = chrome_tokens(self.chrome, self.cfg.theme.background);
+        let cards_mode = self.pane_style.is_cards();
+        if cards_mode {
+            let m = self.fonts.metrics;
+            let (card_px, card_py) = card_inner_pad(m.width, m.height, self.scale);
+            let radius = (10.0 * self.scale).round();
+            let window_focused = panes.iter().any(|p| p.focused);
+            let pane_fill = if self.chrome.is_minimal() {
+                srgb(tokens.pane_bg_override.unwrap_or(self.cfg.theme.background))
+            } else {
+                let mut f = srgb(self.cfg.theme.background);
+                f[3] = 0.55;
+                f
+            };
+            let accent = self.cfg.theme.cursor;
+            let broadcast = broadcast_panes.is_some();
+            for p in panes {
+                let origin = self.pane_origin(p.col, p.row);
+                let top_extra = p.card_top_rows as f32 * m.height;
+                let rect = [
+                    origin.0 - card_px,
+                    origin.1 - top_extra - card_py,
+                    p.term.cols() as f32 * m.width + 2.0 * card_px,
+                    (p.term.rows() + p.card_top_rows) as f32 * m.height + 2.0 * card_py,
+                ];
+                let border_color = card_border_color(
+                    self.chrome,
+                    p.focused,
+                    window_focused,
+                    broadcast,
+                    host_accent,
+                    accent,
+                );
+                let border_w = if broadcast || (p.focused && window_focused && host_accent.is_some_and(|a| a.danger)) {
+                    (1.25 * self.scale).max(1.0)
+                } else {
+                    (1.0 * self.scale).max(1.0)
+                };
+                let params = [radius, border_w, 0.0, 0.0];
+                self.cards_bg.push(CardInstance {
+                    rect,
+                    fill_color: pane_fill,
+                    border_color: [0.0; 4],
+                    params,
+                });
+                self.cards_fg.push(CardInstance {
+                    rect,
+                    fill_color: [0.0; 4],
+                    border_color,
+                    params,
+                });
+            }
+        }
+
         for p in panes {
             let origin = self.pane_origin(p.col, p.row);
             self.build(p.term, origin, p.focused, p.selection, p.cursor_on_layer);
@@ -806,7 +936,7 @@ impl Renderer {
                 (origin.0 - self.fonts.metrics.width * 0.3).round()
             };
             self.build_decor(p.term, origin, gutter_x, p.decor);
-            if p.dim {
+            if p.dim && !cards_mode {
                 // A pane without focus, in a window with focus: its text
                 // recedes a little, so the one keys go to stands out.
                 let m = self.fonts.metrics;
@@ -816,8 +946,7 @@ impl Renderer {
                 self.overlay.push(RectInstance { rect, color: veil });
             }
         }
-        if !dividers.is_empty() {
-            let tokens = chrome_tokens(self.chrome, self.cfg.theme.background);
+        if !dividers.is_empty() && !cards_mode {
             let (color, dashed) = if broadcast_panes.is_some() {
                 let mut c = srgb([245, 158, 11]);
                 c[3] = 0.88;
@@ -859,12 +988,19 @@ impl Renderer {
 
         let device = &self.gpu.device;
         let slot = &mut self.slots[slot_idx];
+        let cards_bg = upload(device, &mut slot.cards_bg, &self.cards_bg);
         let bg = upload(device, &mut slot.bg, &self.bg);
         let glyphs = upload(device, &mut slot.glyphs, &self.glyphs);
         let overlay = upload(device, &mut slot.overlay, &self.overlay);
+        let cards_fg = upload(device, &mut slot.cards_fg, &self.cards_fg);
         let panel_glyphs = upload(device, &mut slot.panel_glyphs, &self.panel_glyphs);
 
         let theme = &self.cfg.theme;
+        let clear_rgb = if cards_mode && self.chrome.is_minimal() {
+            tokens.canvas_bg
+        } else {
+            theme.background
+        };
         let opacity = if self.chrome.is_minimal() { 1.0 } else { self.cfg.window.opacity };
         let lin = |v: u8| -> f64 {
             let c = v as f64 / 255.0;
@@ -876,9 +1012,9 @@ impl Renderer {
         };
         let a = opacity as f64;
         let clear = MTLClearColor {
-            red: lin(theme.background[0]) * a,
-            green: lin(theme.background[1]) * a,
-            blue: lin(theme.background[2]) * a,
+            red: lin(clear_rgb[0]) * a,
+            green: lin(clear_rgb[1]) * a,
+            blue: lin(clear_rgb[2]) * a,
             alpha: a,
         };
 
@@ -928,6 +1064,7 @@ impl Renderer {
             }
         };
 
+        draw(&self.gpu.card_pso, cards_bg, self.cards_bg.len());
         draw(&self.gpu.rect_pso, bg, self.bg.len());
         // Images sit on the cell backgrounds, under any text.
         if !self.images.is_empty() {
@@ -944,6 +1081,7 @@ impl Renderer {
         unsafe { enc.setFragmentTexture_atIndex(Some(&self.atlas.texture), 0) };
         draw(&self.gpu.glyph_pso, glyphs, self.glyphs.len());
         draw(&self.gpu.rect_pso, overlay, self.overlay.len());
+        draw(&self.gpu.card_pso, cards_fg, self.cards_fg.len());
         // A panel over everything: its picture, then its text.
         if let (Some(quad), Some(tex)) = (&self.panel_quad, &self.panel_texture) {
             enc.setRenderPipelineState(&self.gpu.image_pso);
@@ -1768,6 +1906,8 @@ pub struct PaneFrame<'a> {
     pub term: &'a Term,
     pub col: usize,
     pub row: usize,
+    /// Extra top rows inside the card reserved for a per-pane header bar.
+    pub card_top_rows: usize,
     pub focused: bool,
     pub selection: Option<Range>,
     pub cursor_on_layer: bool,
@@ -1936,6 +2076,7 @@ mod tests {
         let herdr = chrome_tokens(ChromeStyle::Herdr, [0x17, 0x19, 0x1D]);
         assert!(herdr.opaque_surface);
         assert_eq!(herdr.chrome_bg, [0x10, 0x11, 0x14]);
+        assert_eq!(herdr.canvas_bg, [0x13, 0x15, 0x18]);
         assert_eq!(herdr.pane_bg_override, None);
         assert_eq!(herdr.hairline_rgb, [255, 255, 255]);
         assert!((herdr.hairline_alpha - 0.094).abs() < 1e-4);
@@ -1944,14 +2085,55 @@ mod tests {
         let terminals = chrome_tokens(ChromeStyle::Terminals, [0x17, 0x19, 0x1D]);
         assert!(terminals.opaque_surface);
         assert_eq!(terminals.chrome_bg, [0x0C, 0x0D, 0x0F]);
+        assert_eq!(terminals.canvas_bg, [0x0C, 0x0D, 0x0F]);
         assert_eq!(terminals.pane_bg_override, Some([0x11, 0x12, 0x14]));
         assert!(!terminals.dashed_dividers);
 
         let core = chrome_tokens(ChromeStyle::Core, [0x17, 0x19, 0x1D]);
         assert!(core.opaque_surface);
         assert_eq!(core.chrome_bg, [0x0A, 0x0B, 0x0C]);
+        assert_eq!(core.canvas_bg, [0x0A, 0x0B, 0x0C]);
         assert_eq!(core.pane_bg_override, Some([0x0A, 0x0B, 0x0C]));
         assert_eq!(core.divider_rgb, [0x2A, 0x2C, 0x30]);
         assert!(core.dashed_dividers);
+    }
+
+    #[test]
+    fn card_inner_pad_keeps_text_inside_corner_arc_and_border_priority() {
+        use super::{card_border_color, card_inner_pad, HostAccent};
+        use crate::config::ChromeStyle;
+
+        let scale = 2.0;
+        let (px, py) = card_inner_pad(16.0, 36.0, scale);
+        assert!(px >= 4.0 * scale && px <= 6.0 * scale);
+        assert!(py >= 3.5 * scale && py <= 6.0 * scale);
+        // For r = 10pt (20px), the corner arc intrudes at most (1 - sqrt(0.5)) * r ≈ 2.93pt,
+        // which stays strictly smaller than card_inner_pad.
+        assert!(px >= 3.0 * scale && py >= 3.0 * scale);
+
+        let accent = [0x60, 0xA5, 0xFA];
+        let danger = HostAccent { label: "prod".into(), rgb: [242, 74, 74], danger: true };
+        let remote = HostAccent { label: "mini".into(), rgb: [66, 153, 255], danger: false };
+
+        let bcast = card_border_color(ChromeStyle::Herdr, false, false, true, Some(&danger), accent);
+        assert!((bcast[0] - 245.0 / 255.0).abs() < 1e-3 && (bcast[3] - 0.88).abs() < 1e-3);
+
+        let foc_danger = card_border_color(ChromeStyle::Herdr, true, true, false, Some(&danger), accent);
+        assert!((foc_danger[3] - 0.90).abs() < 1e-3);
+
+        let foc_remote = card_border_color(ChromeStyle::Herdr, true, true, false, Some(&remote), accent);
+        assert!((foc_remote[3] - 0.78).abs() < 1e-3);
+
+        let foc_local_herdr = card_border_color(ChromeStyle::Herdr, true, true, false, None, accent);
+        assert!((foc_local_herdr[0] - 0x96 as f32 / 255.0).abs() < 1e-3 && (foc_local_herdr[3] - 0.65).abs() < 1e-3);
+
+        let foc_local_glass = card_border_color(ChromeStyle::Glass, true, true, false, None, accent);
+        assert!((foc_local_glass[3] - 0.70).abs() < 1e-3);
+
+        let inactive_herdr = card_border_color(ChromeStyle::Herdr, false, true, false, Some(&danger), accent);
+        assert!((inactive_herdr[3] - 0.08).abs() < 1e-3);
+
+        let unfocused_win = card_border_color(ChromeStyle::Glass, true, false, false, None, accent);
+        assert!((unfocused_win[3] - 0.12).abs() < 1e-3);
     }
 }

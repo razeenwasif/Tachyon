@@ -60,6 +60,7 @@ pub enum SheetAction {
     Find,
     ResetFont,
     AgentMissionControl,
+    WorkspaceSwitcher,
     CopyCli(&'static str),
 }
 
@@ -76,12 +77,13 @@ pub const ENTRIES: &[SheetEntry] = &[
     // Workspace & Multi-Host
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘B", title: "Toggle multi-host sidebar", detail: "Show or hide This Mac + remote servers", action: Some(SheetAction::ToggleSidebar) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘⇧P", title: "Command Palette", detail: "Jump to any action, host, or session", action: Some(SheetAction::CommandPalette) },
+    SheetEntry { category: "Workspace & Multi-Host", keys: "⌘⇧W", title: "Workspace Switcher", detail: "Switch live multi-host workspaces or launch templates", action: Some(SheetAction::WorkspaceSwitcher) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘⇧A", title: "Agent Mission Control", detail: "Cross-host coding-agent inbox (blocked, working & done)", action: Some(SheetAction::AgentMissionControl) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘,", title: "Settings", detail: "Server, Remote Hosts, Agent Integrations & Interface", action: Some(SheetAction::OpenSettings) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘/", title: "Keyboard Cheatsheet", detail: "Show or hide this floating cheatsheet", action: None },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘T", title: "New tab / window", detail: "Open a new persistent shell in the current host", action: Some(SheetAction::NewTab) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘N", title: "New window", detail: "Open an additional Tachyon window", action: Some(SheetAction::NewWindow) },
-    SheetEntry { category: "Workspace & Multi-Host", keys: "⌘W", title: "Close pane", detail: "Close focused pane, tab, or window", action: Some(SheetAction::ClosePane) },
+    SheetEntry { category: "Workspace & Multi-Host", keys: "⌘W / ⌥⌘W", title: "Close pane or window", detail: "⌘W closes focused pane or tab; ⌥⌘W closes window", action: Some(SheetAction::ClosePane) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌥⌘T", title: "Reopen closed tab", detail: "Restore recently closed tab with shells running", action: Some(SheetAction::ReopenTab) },
     SheetEntry { category: "Workspace & Multi-Host", keys: "⌘Q / ⌥⌘Q", title: "Quit (keep vs end shells)", detail: "⌘Q detaches cleanly; ⌥⌘Q terminates shells", action: None },
 
@@ -643,6 +645,10 @@ fn execute_action(win_id: u64, action: SheetAction) {
         SheetAction::ResetFont => with_window(win_id, |w| w.zoom_font(0.0)),
         SheetAction::AgentMissionControl => {
             with_window(win_id, |w| w.open_agents_card());
+            return;
+        }
+        SheetAction::WorkspaceSwitcher => {
+            with_window(win_id, |w| w.open_workspaces_card());
             return;
         }
         SheetAction::CopyCli(_) => {}

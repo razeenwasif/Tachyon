@@ -85,11 +85,13 @@ window.padding_y = 6.0
 # chrome + dashed 1px dividers) give a crisp opaque dark minimal workspace.
 # window.chrome = glass
 
-# macOS: collapsible Rex-style multi-host sidebar (`⌘B` toggles at runtime)
-# and optional minimal per-pane header strip (`never` by default, or `auto`/`always`).
+# macOS: collapsible Rex-style multi-host sidebar (`⌘B` toggles at runtime),
+# optional minimal per-pane header strip (`never`, `auto`, or `always`), and
+# split-pane container style (`seamless` edge dividers or `cards` inset rounded cards).
 # window.sidebar       = true
 # window.sidebar_width = 240
 # window.pane_headers  = never
+# window.pane_style    = seamless
 
 # macOS: Liquid Glass's style. clear (the default) is less frosted and bends
 # more of what's behind at its edges; regular frosts it more and adapts its

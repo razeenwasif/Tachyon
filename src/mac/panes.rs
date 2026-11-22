@@ -53,23 +53,38 @@ pub enum Node {
 const MIN: usize = 2;
 
 impl Node {
-    /// Each pane's rectangle and each divider, for `area`.
+    /// Each pane's rectangle and each divider, for `area` (1-cell divider gaps).
+    #[cfg(test)]
     pub fn layout(&self, area: Rect) -> (Vec<(u64, Rect)>, Vec<Divider>) {
+        self.layout_with_gap(area, 1, 1)
+    }
+
+    /// Each pane's rectangle and divider gap for `area`, reserving `col_gap`
+    /// columns on vertical splits and `row_gap` rows on horizontal splits when room allows.
+    pub fn layout_with_gap(&self, area: Rect, col_gap: usize, row_gap: usize) -> (Vec<(u64, Rect)>, Vec<Divider>) {
         let mut panes = Vec::new();
         let mut dividers = Vec::new();
-        self.place(area, &mut Vec::new(), &mut panes, &mut dividers);
+        self.place(area, col_gap.max(1), row_gap.max(1), &mut Vec::new(), &mut panes, &mut dividers);
         (panes, dividers)
     }
 
-    fn place(&self, area: Rect, path: &mut Vec<bool>, panes: &mut Vec<(u64, Rect)>, dividers: &mut Vec<Divider>) {
+    fn place(
+        &self,
+        area: Rect,
+        col_gap: usize,
+        row_gap: usize,
+        path: &mut Vec<bool>,
+        panes: &mut Vec<(u64, Rect)>,
+        dividers: &mut Vec<Divider>,
+    ) {
         match self {
             Node::Leaf(id) => panes.push((*id, area)),
             Node::Split { dir, ratio, a, b } => {
-                let len = match dir {
-                    Dir::Right => area.cols,
-                    Dir::Down => area.rows,
+                let (len, want_gap) = match dir {
+                    Dir::Right => (area.cols, col_gap),
+                    Dir::Down => (area.rows, row_gap),
                 };
-                let (first, gap) = split_len(len, *ratio);
+                let (first, gap) = split_len(len, *ratio, want_gap);
                 let (ra, rd, rb) = match dir {
                     Dir::Right => (
                         Rect { cols: first, ..area },
@@ -86,10 +101,10 @@ impl Node {
                     dividers.push(Divider { rect: rd, dir: *dir, path: path.clone(), area });
                 }
                 path.push(false);
-                a.place(ra, path, panes, dividers);
+                a.place(ra, col_gap, row_gap, path, panes, dividers);
                 path.pop();
                 path.push(true);
-                b.place(rb, path, panes, dividers);
+                b.place(rb, col_gap, row_gap, path, panes, dividers);
                 path.pop();
             }
         }
@@ -199,28 +214,32 @@ impl Node {
 /// How `len` cells divide at `ratio`: the first half's cells and the
 /// divider's. Each half keeps at least `MIN` cells where there's room; with
 /// no room for a divider, the first half takes everything.
-fn split_len(len: usize, ratio: f32) -> (usize, usize) {
-    if len < 3 {
+fn split_len(len: usize, ratio: f32, want_gap: usize) -> (usize, usize) {
+    let gap = if want_gap >= 2 && len >= want_gap + 2 * MIN {
+        want_gap
+    } else if len >= 3 {
+        1
+    } else {
         return (len, 0);
-    }
-    let avail = len - 1;
+    };
+    let avail = len - gap;
     let first = (ratio * avail as f32).round() as usize;
     let lo = MIN.min(avail / 2).max(1);
     let hi = avail - lo;
-    (first.clamp(lo, hi.max(lo)), 1)
+    (first.clamp(lo, hi.max(lo)), gap)
 }
 
 /// The ratio that puts a split's divider at cell `at` of `area`, where a
 /// drag ended.
 pub fn ratio_at(divider: &Divider, col: usize, row: usize) -> f32 {
-    let (start, len, at) = match divider.dir {
-        Dir::Right => (divider.area.col, divider.area.cols, col),
-        Dir::Down => (divider.area.row, divider.area.rows, row),
+    let (start, len, gap, at) = match divider.dir {
+        Dir::Right => (divider.area.col, divider.area.cols, divider.rect.cols.max(1), col),
+        Dir::Down => (divider.area.row, divider.area.rows, divider.rect.rows.max(1), row),
     };
-    if len < 3 {
+    if len <= gap || len < 3 {
         return 0.5;
     }
-    (at.saturating_sub(start) as f32 / (len - 1) as f32).clamp(0.0, 1.0)
+    (at.saturating_sub(start) as f32 / (len - gap) as f32).clamp(0.0, 1.0)
 }
 
 /// Where focus goes from the pane at `from` in direction (`dx`, `dy`): the
@@ -347,5 +366,26 @@ mod tests {
         assert_eq!(neighbor(&panes, rect(2), 0, 1), Some(3));
         assert_eq!(neighbor(&panes, rect(3), 0, -1), Some(2));
         assert_eq!(neighbor(&panes, rect(1), -1, 0), None);
+    }
+
+    #[test]
+    fn layout_with_gap_reserves_card_gutter_and_drags_cleanly() {
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Dir::Right);
+        t.split(2, 3, Dir::Down);
+        let area = Rect { col: 0, row: 0, cols: 82, rows: 24 };
+        let (panes, dividers) = t.layout_with_gap(area, 2, 1);
+        assert_eq!(panes[0], (1, Rect { col: 0, row: 0, cols: 40, rows: 24 }));
+        assert_eq!(dividers[0].rect, Rect { col: 40, row: 0, cols: 2, rows: 24 });
+        assert_eq!(panes[1], (2, Rect { col: 42, row: 0, cols: 40, rows: 12 }));
+        assert_eq!(panes[2], (3, Rect { col: 42, row: 13, cols: 40, rows: 11 }));
+
+        let cells: usize = panes.iter().map(|(_, r)| r.cols * r.rows).sum::<usize>()
+            + dividers.iter().map(|d| d.rect.cols * d.rect.rows).sum::<usize>();
+        assert_eq!(cells, area.cols * area.rows);
+
+        let d0 = dividers[0].clone();
+        t.set_ratio(&d0.path, ratio_at(&d0, 25, 5));
+        assert_eq!(t.layout_with_gap(area, 2, 1).1[0].rect.col, 25);
     }
 }
