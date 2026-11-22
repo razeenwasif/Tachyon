@@ -266,6 +266,11 @@ impl Curve {
         self.by_step
     }
 
+    /// Total recorded samples before thinning.
+    pub fn seen(&self) -> u64 {
+        self.seen
+    }
+
     /// Its value at step `x`, between the points either side; `None` outside
     /// the steps it covers.
     pub fn at(&self, x: f64) -> Option<f64> {

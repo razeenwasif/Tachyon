@@ -52,12 +52,15 @@ pub enum SheetAction {
     NotchFullScreen,
     RewindBack,
     CopyOutput,
+    CopyMarkdown,
+    ExportMarkdown,
     FoldOutput,
     TrainingChart,
     FollowJob,
     KeepAwake,
     LatencyLedger,
     Find,
+    FindInCommand,
     ToggleCopyMode,
     ResetFont,
     AgentMissionControl,
@@ -106,6 +109,8 @@ pub const ENTRIES: &[SheetEntry] = &[
 
     // Commands, ML & HPC
     SheetEntry { category: "Commands, ML & HPC", keys: "⌥⌘O", title: "Copy command output", detail: "Copy selected or latest command block output", action: Some(SheetAction::CopyOutput) },
+    SheetEntry { category: "Commands, ML & HPC", keys: "⌥⌘M", title: "Copy command as Markdown", detail: "Copy command, exit, receipt, metrics & output", action: Some(SheetAction::CopyMarkdown) },
+    SheetEntry { category: "Commands, ML & HPC", keys: "⌥⌘E", title: "Export command as Markdown…", detail: "Save command report & receipt to a .md file", action: Some(SheetAction::ExportMarkdown) },
     SheetEntry { category: "Commands, ML & HPC", keys: "⌥⌘K", title: "Fold / unfold output", detail: "Collapse long command output (or ⌥-click bar)", action: Some(SheetAction::FoldOutput) },
     SheetEntry { category: "Commands, ML & HPC", keys: "⌥⌘C", title: "Training chart", detail: "Live loss/metric curves from training logs", action: Some(SheetAction::TrainingChart) },
     SheetEntry { category: "Commands, ML & HPC", keys: "⌘J", title: "Follow cluster job", detail: "Follow latest Slurm / Nexus job in its own tab", action: Some(SheetAction::FollowJob) },
@@ -115,7 +120,8 @@ pub const ENTRIES: &[SheetEntry] = &[
 
     // Editing, Find & Links
     SheetEntry { category: "Editing, Find & Links", keys: "⌘⇧X / ⌃⇧Space", title: "Vi Copy Mode", detail: "Keyboard scrollback navigation (hjkl, /, v/V, y)", action: Some(SheetAction::ToggleCopyMode) },
-    SheetEntry { category: "Editing, Find & Links", keys: "⌘F", title: "Find in scrollback", detail: "Regex & smart-case search (⌘G / ⌘⇧G)", action: Some(SheetAction::Find) },
+    SheetEntry { category: "Editing, Find & Links", keys: "⌘F", title: "Find in scrollback", detail: "Command scope, regex & smart-case search (⌘G / ⌘⇧G)", action: Some(SheetAction::Find) },
+    SheetEntry { category: "Editing, Find & Links", keys: "⌘⇧F", title: "Find in command block", detail: "Search inside selected or latest OSC 133 command", action: Some(SheetAction::FindInCommand) },
     SheetEntry { category: "Editing, Find & Links", keys: "Tab / → / ⌥→", title: "Accept suggestion", detail: "Take full inline history suggestion or one word", action: None },
     SheetEntry { category: "Editing, Find & Links", keys: "⌘-click", title: "Open URL, Quick Look, or traceback", detail: "File:line opens in your editor; ⌥⌘-click any file", action: None },
     SheetEntry { category: "Editing, Find & Links", keys: "⌘+ / ⌘- / ⌘0", title: "Zoom font size", detail: "Bigger, smaller, or reset to configured size", action: Some(SheetAction::ResetFont) },
@@ -130,6 +136,7 @@ pub const ENTRIES: &[SheetEntry] = &[
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon send --all --enter \"CMD\"", detail: "Broadcast input to every split pane in a window", action: Some(SheetAction::CopyCli("tachyon send --all --enter ")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon rewind --list", detail: "Inspect server-side Rewind frames across restarts & remote hosts", action: Some(SheetAction::CopyCli("tachyon rewind --list")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon receipts --all", detail: "Inspect server-side CPU, memory & wall-time command receipts across hosts", action: Some(SheetAction::CopyCli("tachyon receipts --all")) },
+    SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon receipts --markdown", detail: "Export command receipts & output as Markdown", action: Some(SheetAction::CopyCli("tachyon receipts --markdown --with-output")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon skill setup", detail: "Install Claude Code, Antigravity, Codex, OpenCode & Pi hooks", action: Some(SheetAction::CopyCli("tachyon skill setup")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon agents --all-hosts", detail: "List active & blocked coding agents across every host", action: Some(SheetAction::CopyCli("tachyon agents --all-hosts")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon status --state working --tty", detail: "Emit OSC 7501 status pill & notification", action: Some(SheetAction::CopyCli("tachyon status --state working --app agent --msg \"Working\" --tty")) },
@@ -642,12 +649,24 @@ fn execute_action(win_id: u64, action: SheetAction) {
         SheetAction::NotchFullScreen => with_window(win_id, |w| w.toggle_notch()),
         SheetAction::RewindBack => with_window(win_id, |w| w.rewind_step(true)),
         SheetAction::CopyOutput => with_window(win_id, |w| w.copy_command_output()),
+        SheetAction::CopyMarkdown => with_window(win_id, |w| w.copy_command_markdown(None)),
+        SheetAction::ExportMarkdown => {
+            super::export_command_markdown(win_id, None);
+            return;
+        }
         SheetAction::FoldOutput => with_window(win_id, |w| w.toggle_fold_output()),
         SheetAction::TrainingChart => with_window(win_id, |w| w.toggle_chart(None)),
         SheetAction::FollowJob => super::follow_job(win_id, None),
         SheetAction::KeepAwake => with_window(win_id, |w| w.toggle_awake()),
         SheetAction::LatencyLedger => with_window(win_id, |w| w.toggle_ledger()),
-        SheetAction::Find => with_window(win_id, |w| w.open_find()),
+        SheetAction::Find => {
+            with_window(win_id, |w| w.open_find());
+            return;
+        }
+        SheetAction::FindInCommand => {
+            with_window(win_id, |w| w.open_find_in_command(None));
+            return;
+        }
         SheetAction::ToggleCopyMode => with_window(win_id, |w| w.toggle_copy_mode()),
         SheetAction::ResetFont => with_window(win_id, |w| w.zoom_font(0.0)),
         SheetAction::AgentMissionControl => {

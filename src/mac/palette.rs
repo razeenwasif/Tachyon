@@ -51,6 +51,7 @@ pub enum PaletteAction {
     ZoomPane,
     ToggleBroadcast,
     Find,
+    FindInCommand,
     ToggleCopyMode,
     ToggleSoundCues,
     RewindBack,
@@ -64,6 +65,8 @@ pub enum PaletteAction {
     NotchFullScreen,
     ToggleTitleBar,
     CopyOutput,
+    CopyMarkdown,
+    ExportMarkdown,
     FoldOutput,
     FollowJob,
     SetupAgentIntegrations,
@@ -177,6 +180,12 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Search screen and scrollback with optional regex".into(),
             shortcut: "⌘F",
             action: PaletteAction::Find,
+        },
+        PaletteItem {
+            title: "Find in Command Block".into(),
+            subtitle: "Search only the selected or latest OSC 133 command output".into(),
+            shortcut: "⌘⇧F",
+            action: PaletteAction::FindInCommand,
         },
         PaletteItem {
             title: "Editing: Vi Copy Mode".into(),
@@ -305,6 +314,18 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Copy selected or latest command block output".into(),
             shortcut: "⌥⌘O",
             action: PaletteAction::CopyOutput,
+        },
+        PaletteItem {
+            title: "Copy Command & Receipt as Markdown".into(),
+            subtitle: "Copy command, exit status, receipt, metrics & output as Markdown".into(),
+            shortcut: "⌥⌘M",
+            action: PaletteAction::CopyMarkdown,
+        },
+        PaletteItem {
+            title: "Export Command & Receipt as Markdown…".into(),
+            subtitle: "Save selected or latest command report to a .md file".into(),
+            shortcut: "⌥⌘E",
+            action: PaletteAction::ExportMarkdown,
         },
         PaletteItem {
             title: "Fold / Unfold Command Output".into(),
@@ -951,6 +972,10 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
             with_window(win_id, |w| w.open_find());
             return;
         }
+        PaletteAction::FindInCommand => {
+            with_window(win_id, |w| w.open_find_in_command(None));
+            return;
+        }
         PaletteAction::ToggleCopyMode => with_window(win_id, |w| w.toggle_copy_mode()),
         PaletteAction::ToggleSoundCues => super::toggle_sound_cues(),
         PaletteAction::RewindBack => with_window(win_id, |w| w.rewind_step(true)),
@@ -964,6 +989,11 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
         PaletteAction::NotchFullScreen => with_window(win_id, |w| w.toggle_notch()),
         PaletteAction::ToggleTitleBar => with_window(win_id, |w| w.toggle_title_bar()),
         PaletteAction::CopyOutput => with_window(win_id, |w| w.copy_command_output()),
+        PaletteAction::CopyMarkdown => with_window(win_id, |w| w.copy_command_markdown(None)),
+        PaletteAction::ExportMarkdown => {
+            super::export_command_markdown(win_id, None);
+            return;
+        }
         PaletteAction::FoldOutput => with_window(win_id, |w| w.toggle_fold_output()),
         PaletteAction::FollowJob => super::follow_job(win_id, None),
         PaletteAction::SetupAgentIntegrations => {

@@ -1926,10 +1926,38 @@ fn cmd_rewind(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+fn render_server_receipt_markdown(
+    r: &crate::mux::model::CommandReceipt,
+    host: &str,
+    cwd: Option<&str>,
+    output: Option<&str>,
+) -> String {
+    use crate::term::export::{render_markdown, ExportBlock};
+    render_markdown(&ExportBlock {
+        cmdline: r.cmdline.as_deref(),
+        host: Some(host),
+        cwd,
+        running: false,
+        exit_code: r.exit_code,
+        elapsed: Some(r.wall_duration()),
+        receipt: Some(r.to_term_receipt()),
+        lens_summary: None,
+        metrics: Vec::new(),
+        rate: None,
+        percent: None,
+        rerun_changed_lines: None,
+        job: None,
+        output,
+    })
+}
+
 fn cmd_receipts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let mut block: Option<String> = None;
     let mut limit: usize = 20;
+    let mut limit_set = false;
     let mut all = false;
+    let mut markdown = false;
+    let mut with_output = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1941,17 +1969,31 @@ fn cmd_receipts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             "-n" | "--limit" => {
                 let v = args.get(i + 1).ok_or("-n/--limit requires a count")?;
                 limit = v.parse::<usize>().map_err(|_| format!("invalid --limit `{v}`"))?.max(1);
+                limit_set = true;
                 i += 2;
             }
             "--all" | "-a" => {
                 all = true;
                 i += 1;
             }
+            "--markdown" | "--md" => {
+                markdown = true;
+                i += 1;
+            }
+            "--with-output" => {
+                with_output = true;
+                i += 1;
+            }
             other => return Err(format!("unknown receipts option `{other}`")),
         }
     }
 
+    if markdown && !limit_set && !all {
+        limit = 1;
+    }
+
     let (target, c) = connect(opts, false)?;
+    let host_name = target.display_name();
     if all && block.is_none() {
         let snap = c.state().map_err(|e| e.to_string())?;
         let mut entries: Vec<_> = snap
@@ -1966,7 +2008,7 @@ fn cmd_receipts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                 .iter()
                 .map(|(b, r)| {
                     json!({
-                        "host": target.display_name(),
+                        "host": host_name,
                         "block_id": b.id,
                         "session_id": b.session_id,
                         "window_id": b.window_id,
@@ -1975,9 +2017,15 @@ fn cmd_receipts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                     })
                 })
                 .collect();
-            print_json(&json!({ "host": target.display_name(), "receipts": arr }));
+            print_json(&json!({ "host": host_name, "receipts": arr }));
         } else if entries.is_empty() {
-            println!("No captured command receipts on {}.", target.display_name());
+            println!("No captured command receipts on {host_name}.");
+        } else if markdown {
+            let rendered: Vec<String> = entries
+                .iter()
+                .map(|(b, r)| render_server_receipt_markdown(r, &host_name, b.cwd.as_deref(), None))
+                .collect();
+            print!("{}", rendered.join("\n---\n\n"));
         } else {
             for (b, r) in &entries {
                 let exit = r
@@ -2000,12 +2048,31 @@ fn cmd_receipts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     if opts.json {
         let arr: Vec<Value> = list.iter().map(|r| r.to_json()).collect();
         print_json(&json!({
-            "host": target.display_name(),
+            "host": host_name,
             "block_id": bid,
             "receipts": arr,
         }));
     } else if list.is_empty() {
         println!("No captured command receipts for `{bid}`.");
+    } else if markdown {
+        let cwd = c
+            .state()
+            .ok()
+            .and_then(|s| s.blocks.into_iter().find(|b| b.id == bid).and_then(|b| b.cwd));
+        let captured = if with_output {
+            c.capture(&bid, Some(200), false).ok()
+        } else {
+            None
+        };
+        let rendered: Vec<String> = list
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| {
+                let out = if idx == 0 { captured.as_deref() } else { None };
+                render_server_receipt_markdown(r, &host_name, cwd.as_deref(), out)
+            })
+            .collect();
+        print!("{}", rendered.join("\n---\n\n"));
     } else {
         for r in &list {
             let exit = r
@@ -3209,8 +3276,8 @@ Sessions, Windows & Automation:
   tachyon send [-b B | --all [-w W]] [--enter] <TEXT | ->
   tachyon capture [-b B] [--lines N] [--ansi]
   tachyon rewind [-b B] [--list | --frame N | --seq S] [--provenance C,R] [--ansi]
-  tachyon receipts [-b B | --all] [-n N] [--json]
-                                            inspect server-side CPU, memory & wall-time receipts
+  tachyon receipts [-b B | --all] [-n N] [--markdown [--with-output]] [--json]
+                                            inspect or export server-side command receipts
   tachyon events [-s SESSION] [--json]
   tachyon tui [-b B] [--agents-only] [--filter Q] [--readonly] [--once]
                                             narrow-screen-responsive SSH/mobile attach UI
