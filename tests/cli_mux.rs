@@ -536,6 +536,120 @@ fn cli_agents_lists_and_filters_live_osc7501_agents_by_urgency() {
 }
 
 #[test]
+fn cli_agents_zero_hook_detects_working_blocked_and_done_without_osc7501() {
+    let dir = temp_dir("zero-hook-agents-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // 1. Plain shell command mentioning "claude" in prose must NOT false-trigger.
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "new",
+            "plain-shell",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'reviewing claude notes\\n'; sleep 15",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // 2. Zero-hook interactive agent script emitting only screen banners/spinners/prompts.
+    let script = concat!(
+        "printf 'Welcome to Gemini CLI\\n⠋ Indexing repository...\\nesc to cancel\\n'; ",
+        "read _; ",
+        "printf '\\nRun shell command: cargo test\\nDo you want to proceed?\\n1. Yes\\n2. No (esc to cancel)\\n'; ",
+        "read _; ",
+        "printf '\\033[2J\\033[H⠋ Running cargo test...\\nesc to cancel\\n'; ",
+        "sleep 0.2; ",
+        "printf '\\033[2J\\033[HType your message\\n'; ",
+        "sleep 15",
+    );
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["new", "gemini-zero-hook", "--json", "--", "/bin/sh", "-c", script],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let created: Value = serde_json::from_str(&out).unwrap();
+    let bid = created["block"]["id"].as_str().unwrap().to_string();
+
+    // Expect `working` (`Gemini CLI`, `inferred: true`) and NO entry for `plain-shell`.
+    let mut saw_working = false;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(60));
+        let (c, out, _) = run_cli(&sock, &hosts, &["agents", "--json"]);
+        if c == 0 {
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let arr = v["agents"].as_array().unwrap();
+            if arr.len() == 1
+                && arr[0]["app"] == "gemini"
+                && arr[0]["state"] == "working"
+                && arr[0]["inferred"] == true
+            {
+                saw_working = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_working, "expected zero-hook `gemini` working entry (and zero false positive on plain-shell)");
+
+    // Advance mock agent to approval prompt -> immediate `blocked` via `--state attention`.
+    let (code, _, err) = run_cli(&sock, &hosts, &["send", "-b", &bid, "--enter", ""]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let mut saw_blocked = false;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(60));
+        let (c, out, _) = run_cli(&sock, &hosts, &["agents", "--state", "attention", "--json"]);
+        if c == 0 {
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let arr = v["agents"].as_array().unwrap();
+            if arr.len() == 1
+                && arr[0]["app"] == "gemini"
+                && arr[0]["state"] == "blocked"
+                && arr[0]["inferred"] == true
+            {
+                assert!(arr[0]["message"].as_str().unwrap_or("").contains("Do you want to proceed"));
+                saw_blocked = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_blocked, "expected zero-hook `blocked` transition on approval prompt");
+
+    // Approve -> brief work -> settles cleanly to `done` once ready prompt redraws.
+    let (code, _, err) = run_cli(&sock, &hosts, &["send", "-b", &bid, "--enter", "1"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let mut saw_done = false;
+    for _ in 0..35 {
+        std::thread::sleep(Duration::from_millis(100));
+        let (c, out, _) = run_cli(&sock, &hosts, &["agents", "--json"]);
+        if c == 0 {
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let arr = v["agents"].as_array().unwrap();
+            if arr.len() == 1
+                && arr[0]["app"] == "gemini"
+                && arr[0]["state"] == "done"
+                && arr[0]["inferred"] == true
+            {
+                saw_done = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_done, "expected zero-hook settle transition from working -> done");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn cli_send_all_broadcasts_input_to_all_split_panes_in_window() {
     let dir = temp_dir("broadcast-e2e");
     let sock = dir.join("server.sock");

@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 #[cfg(unix)]
-pub use unix_pty::{default_shell, integration, HostPty, Integration};
+pub use unix_pty::{default_shell, foreground_process_fd, integration, HostPty, Integration};
 
 #[cfg(windows)]
 pub use win_pty::{default_shell, integration, HostPty, Integration};
@@ -220,6 +220,34 @@ mod unix_pty {
             *guard = Some(code);
             code
         }
+
+        /// Inspect the active foreground process occupying this PTY.
+        ///
+        /// When `is_login_shell` is true, returns `None` while the shell itself
+        /// owns the foreground process group (idle prompt). Returns `Some` for
+        /// direct `cmd` blocks even before child forks.
+        pub fn foreground_process(&self, is_login_shell: bool) -> Option<crate::mux::agents::ForegroundProc> {
+            foreground_process_fd(self.master.as_raw_fd(), self.pid, is_login_shell)
+        }
+    }
+
+    /// Inspect the active foreground process on a raw PTY master fd.
+    pub fn foreground_process_fd(
+        master_fd: libc::c_int,
+        shell_pid: libc::pid_t,
+        is_login_shell: bool,
+    ) -> Option<crate::mux::agents::ForegroundProc> {
+        if master_fd < 0 {
+            return None;
+        }
+        let pgid = unsafe { libc::tcgetpgrp(master_fd) };
+        if pgid <= 0 {
+            return None;
+        }
+        if is_login_shell && pgid == shell_pid {
+            return None;
+        }
+        inspect_pgrp(pgid, shell_pid, is_login_shell)
     }
 
     impl Drop for HostPty {
@@ -372,6 +400,219 @@ mod unix_pty {
         }
         env
     }
+
+    #[cfg(target_os = "macos")]
+    fn inspect_pgrp(
+        pgid: libc::pid_t,
+        shell_pid: libc::pid_t,
+        exclude_shell: bool,
+    ) -> Option<crate::mux::agents::ForegroundProc> {
+        const PROC_PGRP_ONLY: u32 = 2;
+        let mut pids = [0 as libc::pid_t; 64];
+        let bytes = unsafe {
+            libc::proc_listpids(
+                PROC_PGRP_ONLY,
+                pgid as u32,
+                pids.as_mut_ptr().cast(),
+                std::mem::size_of_val(&pids) as libc::c_int,
+            )
+        };
+        let n = if bytes > 0 {
+            (bytes as usize / std::mem::size_of::<libc::pid_t>()).min(pids.len())
+        } else {
+            0
+        };
+        let mut candidates: Vec<libc::pid_t> = pids[..n]
+            .iter()
+            .copied()
+            .filter(|&p| p > 0 && (!exclude_shell || p != shell_pid))
+            .collect();
+        if candidates.is_empty() && (!exclude_shell || pgid != shell_pid) {
+            candidates.push(pgid);
+        }
+        // Scan highest PID first so the active leaf child (e.g. `node` under `sh`)
+        // is preferred while avoiding zombie/exiting ancestors.
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        for pid in candidates {
+            if let Some(proc) = inspect_macos_pid(pid) {
+                return Some(proc);
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn inspect_macos_pid(pid: libc::pid_t) -> Option<crate::mux::agents::ForegroundProc> {
+        let name = macos_pid_name(pid)?;
+        let cmdline = macos_pid_cmdline(pid).unwrap_or_else(|| name.clone());
+        Some(crate::mux::agents::ForegroundProc {
+            pid: pid.max(0) as u32,
+            name,
+            cmdline,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_pid_name(pid: libc::pid_t) -> Option<String> {
+        let mut path_buf = vec![0u8; 4096];
+        let len = unsafe {
+            libc::proc_pidpath(pid, path_buf.as_mut_ptr().cast(), path_buf.len() as u32)
+        };
+        if len > 0 {
+            let full = String::from_utf8_lossy(&path_buf[..len as usize]);
+            if let Some(base) = full.rsplit('/').next().filter(|s| !s.is_empty()) {
+                return Some(base.to_string());
+            }
+        }
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if got == size {
+            let comm = unsafe { std::ffi::CStr::from_ptr(info.pbi_comm.as_ptr()) };
+            let s = comm.to_string_lossy().trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_pid_cmdline(pid: libc::pid_t) -> Option<String> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut buf = vec![0u8; 8192];
+        let mut size = buf.len();
+        let mut rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            // Large inherited environments can exceed 8 KiB; probe exact kernel size.
+            let mut need: usize = 0;
+            let probe = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as u32,
+                    std::ptr::null_mut(),
+                    &mut need,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if probe != 0 || need < 4 {
+                return None;
+            }
+            buf.resize((need + 256).min(1024 * 1024), 0);
+            size = buf.len();
+            rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as u32,
+                    buf.as_mut_ptr().cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+        }
+        if rc != 0 || size < 4 {
+            return None;
+        }
+        let data = &buf[..size.min(buf.len())];
+        let argc = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]).max(0) as usize;
+        if argc == 0 {
+            return None;
+        }
+        let mut i = 4usize;
+        // Skip exec_path\0 and trailing NUL padding before argv[0].
+        while i < data.len() && data[i] != 0 {
+            i += 1;
+        }
+        while i < data.len() && data[i] == 0 {
+            i += 1;
+        }
+        let mut out = String::new();
+        for _ in 0..argc {
+            if i >= data.len() || out.len() >= 512 {
+                break;
+            }
+            let start = i;
+            while i < data.len() && data[i] != 0 {
+                i += 1;
+            }
+            if i > start {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                let piece = String::from_utf8_lossy(&data[start..i]);
+                out.push_str(&piece);
+                if out.len() > 512 {
+                    out.truncate(512);
+                    break;
+                }
+            }
+            i += 1;
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inspect_pgrp(
+        pgid: libc::pid_t,
+        shell_pid: libc::pid_t,
+        exclude_shell: bool,
+    ) -> Option<crate::mux::agents::ForegroundProc> {
+        if exclude_shell && pgid == shell_pid {
+            return None;
+        }
+        let pid = pgid;
+        let comm_path = format!("/proc/{pid}/comm");
+        let name = std::fs::read_to_string(&comm_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        let raw_cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let cap = raw_cmd.len().min(512);
+        let cmdline_joined: String = raw_cmd[..cap]
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cmdline = if cmdline_joined.is_empty() {
+            name.clone()
+        } else {
+            cmdline_joined
+        };
+        Some(crate::mux::agents::ForegroundProc {
+            pid: pid.max(0) as u32,
+            name,
+            cmdline,
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn inspect_pgrp(
+        _pgid: libc::pid_t,
+        _shell_pid: libc::pid_t,
+        _exclude_shell: bool,
+    ) -> Option<crate::mux::agents::ForegroundProc> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -460,5 +701,48 @@ mod win_pty {
         pub fn wait_exit(&self) -> i32 {
             self.inner.wait_exit()
         }
+
+        pub fn foreground_process(
+            &self,
+            _is_login_shell: bool,
+        ) -> Option<crate::mux::agents::ForegroundProc> {
+            None
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::HostPty;
+
+    #[test]
+    fn foreground_process_inspects_direct_child_command() {
+        let pty = HostPty::spawn(
+            80,
+            24,
+            "/bin/sh",
+            &["-c".into(), "sleep 2".into()],
+            false,
+            &[],
+            None,
+        )
+        .expect("spawn /bin/sh");
+        let mut found = None;
+        for _ in 0..40 {
+            if let Some(fg) = pty.foreground_process(false) {
+                if fg.name == "sh" || fg.name == "sleep" {
+                    found = Some(fg);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let fg = found.expect("expected active foreground process after execve");
+        assert!(
+            fg.cmdline.contains("sh") || fg.cmdline.contains("sleep"),
+            "unexpected fg cmdline: {fg:?}"
+        );
+        pty.hangup();
+        let _ = pty.wait_exit();
     }
 }

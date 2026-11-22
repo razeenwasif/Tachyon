@@ -937,6 +937,11 @@ impl Term {
         self.cwd_host.as_deref().filter(|h| from.as_deref() != Some(*h))
     }
 
+    /// Whether the alternate screen buffer (e.g. a full-screen TUI) is active.
+    pub fn in_alt_screen(&self) -> bool {
+        self.mode.contains(TermMode::ALT_SCREEN)
+    }
+
     pub fn running_cmdline(&self) -> Option<&str> {
         self.current_cmd
             .and_then(|id| self.commands.get(&id))

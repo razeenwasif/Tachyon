@@ -1469,6 +1469,7 @@ mod tests {
                     attached_clients: 1,
                     created_at: 0,
                     status: None,
+                    status_inferred: false,
                 },
                 BlockInfo {
                     id: "b2".into(),
@@ -1488,6 +1489,7 @@ mod tests {
                     attached_clients: 1,
                     created_at: 0,
                     status: None,
+                    status_inferred: false,
                 },
                 BlockInfo {
                     id: "b3".into(),
@@ -1507,6 +1509,7 @@ mod tests {
                     attached_clients: 1,
                     created_at: 0,
                     status: None,
+                    status_inferred: false,
                 },
             ],
             clients: Vec::new(),
