@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -658,6 +659,33 @@ impl MuxClient {
     fn detach_stream(&self, stream_id: u32) {
         self.inner.streams.lock().remove(&stream_id);
         let _ = self.rpc(json!({ "op": "block.detach", "stream_id": stream_id }));
+    }
+
+    /// Request an immediate atomic session snapshot flush (`tachyon server snapshot`).
+    pub fn server_snapshot(&self) -> io::Result<Value> {
+        self.rpc(json!({ "op": "server.snapshot" }))
+    }
+
+    /// Query persistence path, auto-resume setting, and last snapshot metadata.
+    pub fn server_persist_info(&self) -> io::Result<Value> {
+        self.rpc(json!({ "op": "server.persist_info" }))
+    }
+
+    /// Trigger idempotent session restoration from `state.json` (or `state_file`).
+    pub fn server_restore(
+        &self,
+        state_file: Option<&Path>,
+        auto_resume: Option<bool>,
+    ) -> io::Result<crate::server::persist::RestoreReport> {
+        let mut req = json!({ "op": "server.restore" });
+        if let Some(p) = state_file {
+            req["state_file"] = Value::String(p.to_string_lossy().into_owned());
+        }
+        if let Some(ar) = auto_resume {
+            req["auto_resume"] = Value::Bool(ar);
+        }
+        let v = self.rpc(req)?;
+        Ok(crate::server::persist::RestoreReport::from_json(&v))
     }
 
     /// Request a graceful server shutdown (`tachyon server stop`).

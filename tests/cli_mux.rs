@@ -803,3 +803,304 @@ fn cli_server_rewind_preserves_alt_screen_frames_and_provenance_without_gui() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn run_cli_with_env(
+    sock: &PathBuf,
+    hosts: &PathBuf,
+    home: &PathBuf,
+    path_env: &str,
+    args: &[&str],
+) -> (i32, String, String) {
+    let out = Command::new(bin())
+        .args(args)
+        .env("TACHYON_SOCKET", sock)
+        .env("TACHYON_HOSTS_FILE", hosts)
+        .env("HOME", home)
+        .env("PATH", path_env)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env_remove("TACHYON_SERVER")
+        .env_remove("TACHYON_SESSION")
+        .env_remove("TACHYON_WINDOW")
+        .env_remove("TACHYON_BLOCK")
+        .env_remove("TACHYON_STATE_FILE")
+        .output()
+        .expect("spawn tachyon cli");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn cli_server_persists_sessions_splits_cwds_and_auto_resumes_agents_across_restart() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("persist-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    let state_path = dir.join("server.state.json");
+
+    let home = dir.join("home");
+    let bin_dir = dir.join("bin");
+    let proj_a = dir.join("proj-a");
+    let proj_b = dir.join("proj-b");
+    let proj_agent = dir.join("proj-agent");
+    let proj_gone = dir.join("proj-gone");
+    for d in [&home, &bin_dir, &proj_a, &proj_b, &proj_agent, &proj_gone] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    // Isolate login shells from `/etc/zprofile` `path_helper` or user rc files so
+    // the hermetic stub `claude` binary is always resolved cleanly first.
+    let rc_content = format!("export PATH=\"{}:/usr/bin:/bin\"\n", bin_dir.display());
+    for rc in [".zshenv", ".zshrc", ".zprofile", ".bashrc", ".profile"] {
+        std::fs::write(home.join(rc), &rc_content).unwrap();
+    }
+
+    let claude_log = dir.join("claude.log");
+    let stub = bin_dir.join("claude");
+    let stub_script = format!(
+        "#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> '{}'\nprintf 'RESUMED:%s\\r\\n' \"$*\"\n'{}' status --state working --app claude --msg 'Running'\nsleep 20\n",
+        claude_log.display(),
+        bin(),
+    );
+    std::fs::write(&stub, stub_script).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_env = format!("{}:/usr/bin:/bin", bin_dir.display());
+
+    // 1. Start daemon and verify persistence metadata in `server status --json`.
+    let (code, _, err) = run_cli_with_env(&sock, &hosts, &home, &path_env, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, status_out, err) = run_cli_with_env(
+        &sock,
+        &hosts,
+        &home,
+        &path_env,
+        &["server", "status", "--json"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let status_json: Value = serde_json::from_str(&status_out).unwrap();
+    assert_eq!(status_json["persistence"]["enabled"], true);
+    assert_eq!(
+        status_json["persistence"]["path"].as_str(),
+        Some(state_path.to_string_lossy().as_ref())
+    );
+
+    // 2. Create session "work" with a 3-pane nested split (`right` + `down`), labels & cwds,
+    // plus an active `claude` pane in `proj-agent`, and session "temp" with `claude` in `proj-gone`.
+    let proj_a_s = proj_a.to_string_lossy().into_owned();
+    let proj_b_s = proj_b.to_string_lossy().into_owned();
+    let proj_agent_s = proj_agent.to_string_lossy().into_owned();
+    let proj_gone_s = proj_gone.to_string_lossy().into_owned();
+
+    let (code, out, err) = run_cli_with_env(
+        &sock,
+        &hosts,
+        &home,
+        &path_env,
+        &[
+            "new", "work", "--cwd", &proj_a_s, "--label", "main-pane", "--json", "--", "/bin/sh",
+            "-c", "sleep 20",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let s1: Value = serde_json::from_str(&out).unwrap();
+    let b1 = s1["block"]["id"].as_str().unwrap().to_string();
+
+    let (code, out, err) = run_cli_with_env(
+        &sock,
+        &hosts,
+        &home,
+        &path_env,
+        &[
+            "split", "--right", "-b", &b1, "--cwd", &proj_b_s, "--label", "side-pane", "--json",
+            "--", "/bin/sh", "-c", "sleep 20",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let s2: Value = serde_json::from_str(&out).unwrap();
+    let b2 = s2["block"]["id"].as_str().unwrap().to_string();
+
+    let (code, _, err) = run_cli_with_env(
+        &sock,
+        &hosts,
+        &home,
+        &path_env,
+        &[
+            "split", "--down", "-b", &b2, "--cwd", &proj_agent_s, "--label", "agent-pane", "--json",
+            "--", "claude",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let (code, _, err) = run_cli_with_env(
+        &sock,
+        &hosts,
+        &home,
+        &path_env,
+        &[
+            "new", "temp", "--cwd", &proj_gone_s, "--label", "gone-agent", "--json", "--",
+            "claude",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // Wait for both stub agents to start and emit OSC 7501 status before snapshotting.
+    for _ in 0..25 {
+        let log_txt = std::fs::read_to_string(&claude_log).unwrap_or_default();
+        if log_txt.lines().count() >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    let (code, snap_out, err) = run_cli_with_env(
+        &sock,
+        &hosts,
+        &home,
+        &path_env,
+        &["server", "snapshot", "--json"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let snap_res: Value = serde_json::from_str(&snap_out).unwrap();
+    assert_eq!(snap_res["saved"], true);
+    assert_eq!(snap_res["sessions"], 2);
+    assert_eq!(snap_res["panes"], 4);
+
+    // Inspect on-disk `server.state.json` permissions (`0600`) & schema.
+    let meta = std::fs::metadata(&state_path).expect("state.json must exist");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let saved_json: Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(saved_json["sessions"].as_array().unwrap().len(), 2);
+
+    // 3. Stop daemon, delete `proj-gone`, clear claude.log, and restart daemon!
+    let (code, _, err) = run_cli_with_env(&sock, &hosts, &home, &path_env, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    std::fs::remove_dir_all(&proj_gone).unwrap();
+    let _ = std::fs::remove_file(&claude_log);
+
+    // Allow old socket to finish cleanup cleanly before starting the new server.
+    for _ in 0..20 {
+        if !sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    let (code, _, err) = run_cli_with_env(&sock, &hosts, &home, &path_env, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // Verify `ls --json` restored both sessions, nested 3-pane split, labels, and surviving cwd.
+    let (code, ls_out, err) =
+        run_cli_with_env(&sock, &hosts, &home, &path_env, &["ls", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let ls_json: Value = serde_json::from_str(&ls_out).unwrap();
+    let sessions = ls_json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2, "restored sessions: {ls_json}");
+    let work_sess = sessions.iter().find(|s| s["name"] == "work").unwrap();
+    assert!(sessions.iter().any(|s| s["name"] == "temp"));
+    let work_win_id = work_sess["windows"][0].as_str().unwrap();
+    let work_win = ls_json["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"] == work_win_id)
+        .unwrap();
+    assert_eq!(work_win["layout"]["dir"], "right");
+    assert_eq!(work_win["layout"]["b"]["dir"], "down");
+
+    let blocks = ls_json["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 4);
+    let agent_block = blocks
+        .iter()
+        .find(|b| b["label"].as_str() == Some("agent-pane"))
+        .expect("restored agent-pane block");
+    let canon_proj_agent = std::fs::canonicalize(&proj_agent).unwrap();
+    assert_eq!(
+        agent_block["cwd"]
+            .as_str()
+            .and_then(|p| std::fs::canonicalize(p).ok()),
+        Some(canon_proj_agent),
+        "restored agent cwd"
+    );
+    let agent_bid = agent_block["id"].as_str().unwrap().to_string();
+
+    // Poll until `claude --continue` executes inside `proj-agent` ONLY (never in missing `proj-gone`).
+    let mut resumed_log = String::new();
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(80));
+        if let Ok(txt) = std::fs::read_to_string(&claude_log) {
+            if txt.contains("--continue") {
+                resumed_log = txt;
+                break;
+            }
+        }
+    }
+    assert!(
+        resumed_log.contains("--continue"),
+        "expected `claude --continue` invocation after restart, got: {resumed_log:?}"
+    );
+    // Give any rogue second invocation time to appear if it were going to happen, then assert count == 1.
+    std::thread::sleep(Duration::from_millis(250));
+    let final_resumed_log = std::fs::read_to_string(&claude_log).unwrap_or_default();
+    assert_eq!(
+        final_resumed_log.lines().count(),
+        1,
+        "deleted proj-gone pane must NOT auto-resume claude, log: {final_resumed_log:?}"
+    );
+    let cap = {
+        let mut got = String::new();
+        for _ in 0..20 {
+            let (c, out, _) = run_cli_with_env(
+                &sock,
+                &hosts,
+                &home,
+                &path_env,
+                &["capture", "-b", &agent_bid],
+            );
+            if c == 0 && out.contains("RESUMED:--continue") {
+                got = out;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        got
+    };
+    assert!(
+        cap.contains("RESUMED:--continue"),
+        "expected RESUMED:--continue in pane capture, got: {cap:?}"
+    );
+
+    // 4. Restart with `--no-resume`: sessions & layouts restore, but no coding agent starts.
+    let (code, _, err) = run_cli_with_env(&sock, &hosts, &home, &path_env, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_file(&claude_log);
+    for _ in 0..20 {
+        if !sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    let (code, _, err) = run_cli_with_env(
+        &sock,
+        &hosts,
+        &home,
+        &path_env,
+        &["server", "start", "--no-resume"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    std::thread::sleep(Duration::from_millis(450));
+    assert!(
+        !claude_log.exists(),
+        "--no-resume must suppress auto-resuming coding agents"
+    );
+
+    let (code, _, err) = run_cli_with_env(&sock, &hosts, &home, &path_env, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

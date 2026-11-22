@@ -172,6 +172,9 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let mut listen: Option<String> = None;
     let mut auth_token: Option<String> = None;
     let mut token_file: Option<PathBuf> = None;
+    let mut state_file: Option<PathBuf> = None;
+    let mut no_restore = false;
+    let mut no_resume = false;
     let mut regenerate = false;
 
     let mut i = 0;
@@ -199,6 +202,19 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                 token_file = Some(PathBuf::from(p));
                 i += 2;
             }
+            "--state-file" => {
+                let p = rest.get(i + 1).ok_or("--state-file requires a path")?;
+                state_file = Some(PathBuf::from(p));
+                i += 2;
+            }
+            "--no-restore" => {
+                no_restore = true;
+                i += 1;
+            }
+            "--no-resume" => {
+                no_resume = true;
+                i += 1;
+            }
             "--regenerate" => {
                 regenerate = true;
                 i += 1;
@@ -209,7 +225,14 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
 
     match sub {
         "run" => {
-            let run_opts = RunOptions { listen, auth_token, token_file };
+            let run_opts = RunOptions {
+                listen,
+                auth_token,
+                token_file,
+                state_file,
+                no_restore,
+                no_resume,
+            };
             server::run_with_options(&socket, run_opts).map_err(|e| e.to_string())?;
             Ok(0)
         }
@@ -219,8 +242,26 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             } else {
                 Target::Local { socket: socket.clone() }
             };
-            let c = MuxClient::connect(&target, true, "cli", "server-start")
-                .map_err(|e| e.to_string())?;
+            let c = if opts.server.is_none() && (state_file.is_some() || no_restore || no_resume) {
+                let mut extra = Vec::new();
+                if let Some(ref p) = state_file {
+                    extra.push("--state-file".into());
+                    extra.push(p.to_string_lossy().into_owned());
+                }
+                if no_restore {
+                    extra.push("--no-restore".into());
+                }
+                if no_resume {
+                    extra.push("--no-resume".into());
+                }
+                let transport = crate::mux::transport::connect_local_with_args(&socket, true, &extra)
+                    .map_err(|e| e.to_string())?;
+                MuxClient::from_transport(transport, "cli", "server-start")
+                    .map_err(|e| e.to_string())?
+            } else {
+                MuxClient::connect(&target, true, "cli", "server-start")
+                    .map_err(|e| e.to_string())?
+            };
             if opts.json {
                 print_json(&json!({
                     "running": true,
@@ -251,6 +292,57 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             }
             Ok(0)
         }
+        "snapshot" => {
+            let target = if opts.server.is_some() {
+                target_for(opts)?
+            } else {
+                Target::Local { socket }
+            };
+            let c = MuxClient::connect(&target, false, "cli", "server-snapshot")
+                .map_err(|e| format!("server not running on {}: {e}", target.display_name()))?;
+            let snap = c.server_snapshot().map_err(|e| e.to_string())?;
+            if opts.json {
+                print_json(&snap);
+            } else {
+                let s = snap.get("sessions").and_then(Value::as_u64).unwrap_or(0);
+                let w = snap.get("windows").and_then(Value::as_u64).unwrap_or(0);
+                let p = snap.get("panes").and_then(Value::as_u64).unwrap_or(0);
+                let path = snap.get("path").and_then(Value::as_str);
+                match path {
+                    Some(path) => {
+                        println!("saved snapshot ({s} sessions, {w} windows, {p} panes) -> {path}");
+                    }
+                    None => {
+                        println!("session persistence disabled (captured {s} sessions, {w} windows, {p} panes)");
+                    }
+                }
+            }
+            Ok(0)
+        }
+        "restore" => {
+            let target = if opts.server.is_some() {
+                target_for(opts)?
+            } else {
+                Target::Local { socket }
+            };
+            let c = MuxClient::connect(&target, false, "cli", "server-restore")
+                .map_err(|e| format!("server not running on {}: {e}", target.display_name()))?;
+            let rep = c
+                .server_restore(
+                    state_file.as_deref(),
+                    if no_resume { Some(false) } else { None },
+                )
+                .map_err(|e| e.to_string())?;
+            if opts.json {
+                print_json(&rep.to_json());
+            } else {
+                println!(
+                    "restored {} sessions, {} windows, {} panes ({} agents resumed)",
+                    rep.sessions, rep.windows, rep.panes, rep.resumed_agents
+                );
+            }
+            Ok(0)
+        }
         "status" => {
             let target = if opts.server.is_some() {
                 target_for(opts)?
@@ -261,6 +353,7 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                 Ok(c) => {
                     let rtt = c.ping(Duration::from_secs(3)).ok();
                     let snap = c.state().map_err(|e| e.to_string())?;
+                    let persist = c.server_persist_info().ok();
                     if opts.json {
                         print_json(&json!({
                             "running": true,
@@ -271,6 +364,7 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                             "windows": snap.windows.len(),
                             "blocks": snap.blocks.len(),
                             "clients": snap.clients.len(),
+                            "persistence": persist,
                         }));
                     } else {
                         let rtt_s = rtt
@@ -289,6 +383,19 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                             snap.blocks.len(),
                             snap.clients.len(),
                         );
+                        if let Some(p) = persist {
+                            let enabled = p.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                            let ar = p.get("auto_resume").and_then(Value::as_bool).unwrap_or(false);
+                            if enabled {
+                                let path = p.get("path").and_then(Value::as_str).unwrap_or("");
+                                println!(
+                                    "  state: {path} (auto-resume {})",
+                                    if ar { "on" } else { "off" }
+                                );
+                            } else {
+                                println!("  state: persistence disabled");
+                            }
+                        }
                     }
                     Ok(0)
                 }
@@ -2086,6 +2193,10 @@ Usage:
 Server & Hosts:
   tachyon server run|start|stop|status      manage the persistent local server
     [--socket PATH] [--listen ADDR|tailscale] [--token TOK | --token-file PATH]
+    [--state-file PATH] [--no-restore] [--no-resume]
+  tachyon server snapshot                   flush live sessions & agents to state.json now
+  tachyon server restore [--state-file P] [--no-resume]
+                                            restore saved sessions into a running server
   tachyon server token [--regenerate]       show or rotate the TCP bearer auth token
   tachyon server install-service            install launchd (macOS), systemd (Linux), or Task (Windows)
   tachyon server uninstall-service          remove the user service

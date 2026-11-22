@@ -3,9 +3,10 @@
 //! JSON RPC handler.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use base64::Engine;
@@ -20,6 +21,9 @@ use crate::mux::proto::{Frame, PROTOCOL_VERSION};
 use crate::mux::{local_hostname, unix_now};
 use crate::term::{Processor, Term};
 
+use super::persist::{
+    self, PersistedPane, PersistedSession, PersistedState, PersistedWindow, RestoreReport,
+};
 use super::pty::{default_shell, find_integration_dir, integration, HostPty};
 
 /// Output the server-side VT parser may fall behind by before reading pauses.
@@ -396,12 +400,68 @@ pub enum RpcOutcome {
     ShutdownServer,
 }
 
+/// Configuration for on-disk session persistence & agent auto-resume.
+#[derive(Clone, Debug)]
+pub struct PersistOptions {
+    pub path: Option<PathBuf>,
+    pub auto_resume: bool,
+}
+
+impl Default for PersistOptions {
+    fn default() -> Self {
+        Self {
+            path: None,
+            auto_resume: true,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PersistSignal {
+    dirty: bool,
+    shutdown: bool,
+}
+
+struct PersistCoordinator {
+    path: Option<PathBuf>,
+    auto_resume: bool,
+    signal: Mutex<PersistSignal>,
+    wake: Condvar,
+    save_lock: Mutex<()>,
+    last_saved_at: AtomicU64,
+    last_error: Mutex<Option<String>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl PersistCoordinator {
+    fn new(opts: PersistOptions) -> Self {
+        Self {
+            path: opts.path,
+            auto_resume: opts.auto_resume,
+            signal: Mutex::new(PersistSignal::default()),
+            wake: Condvar::new(),
+            save_lock: Mutex::new(()),
+            last_saved_at: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+            worker: Mutex::new(None),
+        }
+    }
+}
+
 pub struct ServerState {
     host_info: HostInfo,
     auth_token: Option<String>,
     next_id: AtomicU64,
     shutdown: AtomicBool,
     inner: Mutex<StateInner>,
+    persist: PersistCoordinator,
+}
+
+impl Drop for ServerState {
+    fn drop(&mut self) {
+        self.persist.signal.lock().shutdown = true;
+        self.persist.wake.notify_all();
+    }
 }
 
 impl ServerState {
@@ -410,10 +470,15 @@ impl ServerState {
     }
 
     pub fn with_auth_token(auth_token: Option<String>) -> Arc<Self> {
+        Self::with_options(auth_token, PersistOptions::default())
+    }
+
+    pub fn with_options(auth_token: Option<String>, persist: PersistOptions) -> Arc<Self> {
         if let Some(root) = server_rewind_root() {
             crate::term::rewind::remove_stale(&root);
         }
-        Arc::new(Self {
+        let spawn_worker = persist.path.is_some();
+        let state = Arc::new(Self {
             host_info: HostInfo {
                 hostname: local_hostname(),
                 os: std::env::consts::OS.to_string(),
@@ -433,7 +498,18 @@ impl ServerState {
                 recent_exits: VecDeque::new(),
                 exit_waiters: HashMap::new(),
             }),
-        })
+            persist: PersistCoordinator::new(persist),
+        });
+        if spawn_worker {
+            let weak: Weak<ServerState> = Arc::downgrade(&state);
+            if let Ok(handle) = std::thread::Builder::new()
+                .name("tachyon-srv-persist".into())
+                .spawn(move || persist_worker_loop(weak))
+            {
+                *state.persist.worker.lock() = Some(handle);
+            }
+        }
+        state
     }
 
     pub fn host_info(&self) -> &HostInfo {
@@ -442,6 +518,311 @@ impl ServerState {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Initiate orderly daemon shutdown and wake the persistence writer thread.
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.persist.signal.lock().shutdown = true;
+        self.persist.wake.notify_all();
+    }
+
+    /// Request shutdown and wait for the background persistence writer thread to finish.
+    pub fn stop_persist_worker(&self) {
+        self.request_shutdown();
+        if let Some(h) = self.persist.worker.lock().take() {
+            let _ = h.join();
+        }
+    }
+
+    /// Schedule an event-driven debounced snapshot write (zero idle wake-ups).
+    pub fn mark_persist_dirty(&self) {
+        if self.persist.path.is_none() || self.is_shutting_down() {
+            return;
+        }
+        let mut sig = self.persist.signal.lock();
+        if !sig.shutdown {
+            sig.dirty = true;
+            self.persist.wake.notify_one();
+        }
+    }
+
+    pub fn persist_info_json(&self) -> Value {
+        json!({
+            "enabled": self.persist.path.is_some(),
+            "path": self.persist.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "auto_resume": self.persist.auto_resume,
+            "last_saved_at": self.persist.last_saved_at.load(Ordering::Acquire),
+            "last_error": self.persist.last_error.lock().clone(),
+        })
+    }
+
+    /// Capture a portable, atomic snapshot of all live sessions, splits, directories,
+    /// and currently running coding agents without holding `self.inner` across block locks.
+    pub fn capture_persisted_state(&self) -> PersistedState {
+        struct WinSnap {
+            name: Option<String>,
+            zoomed: bool,
+            layout: LayoutNode,
+            focused_block: String,
+            blocks: Vec<Arc<Block>>,
+        }
+        struct SessSnap {
+            name: String,
+            active_window_index: usize,
+            windows: Vec<WinSnap>,
+        }
+
+        let captured: Vec<SessSnap> = {
+            let st = self.inner.lock();
+            let mut sessions: Vec<&SessionRecord> = st.sessions.values().collect();
+            sessions.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+            sessions
+                .into_iter()
+                .filter_map(|sess| {
+                    let mut windows = Vec::new();
+                    let mut active_window_index = 0usize;
+                    for wid in &sess.windows {
+                        let Some(win) = st.windows.get(wid) else {
+                            continue;
+                        };
+                        let leaf_ids = win.layout.leaves();
+                        let blocks: Vec<Arc<Block>> = leaf_ids
+                            .iter()
+                            .filter_map(|bid| st.blocks.get(bid).cloned())
+                            .collect();
+                        if blocks.is_empty() {
+                            continue;
+                        }
+                        if sess.active_window.as_deref() == Some(wid.as_str()) {
+                            active_window_index = windows.len();
+                        }
+                        windows.push(WinSnap {
+                            name: win.name.clone(),
+                            zoomed: win.zoomed,
+                            layout: win.layout.clone(),
+                            focused_block: win.focused_block.clone(),
+                            blocks,
+                        });
+                    }
+                    (!windows.is_empty()).then_some(SessSnap {
+                        name: sess.name.clone(),
+                        active_window_index,
+                        windows,
+                    })
+                })
+                .collect()
+        };
+
+        let mut persisted_sessions = Vec::with_capacity(captured.len());
+        for sess in captured {
+            let mut persisted_windows = Vec::with_capacity(sess.windows.len());
+            for win in sess.windows {
+                let mut block_index = HashMap::with_capacity(win.blocks.len());
+                let mut focused_pane = 0usize;
+                let mut panes = Vec::with_capacity(win.blocks.len());
+                for (idx, block) in win.blocks.iter().enumerate() {
+                    block_index.insert(block.id.clone(), idx);
+                    if block.id == win.focused_block {
+                        focused_pane = idx;
+                    }
+                    panes.push(capture_persisted_pane(block));
+                }
+                let Some(layout) = persist::layout_to_persisted(&win.layout, &block_index) else {
+                    continue;
+                };
+                persisted_windows.push(PersistedWindow {
+                    name: win.name,
+                    zoomed: win.zoomed,
+                    layout,
+                    focused_pane,
+                    panes,
+                });
+            }
+            if !persisted_windows.is_empty() {
+                let active_idx = sess
+                    .active_window_index
+                    .min(persisted_windows.len().saturating_sub(1));
+                persisted_sessions.push(PersistedSession {
+                    name: sess.name,
+                    active_window_index: active_idx,
+                    windows: persisted_windows,
+                });
+            }
+        }
+
+        PersistedState {
+            version: persist::STATE_VERSION,
+            saved_at: unix_now(),
+            hostname: self.host_info.hostname.clone(),
+            sessions: persisted_sessions,
+        }
+    }
+
+    /// Immediately capture and atomically flush the current state to disk (when enabled).
+    pub fn flush_persist_now(&self) -> Result<(Option<PathBuf>, PersistedState), String> {
+        let snap = self.capture_persisted_state();
+        if let Some(path) = self.persist.path.as_deref() {
+            let _guard = self.persist.save_lock.lock();
+            if let Err(e) = persist::save_atomic(path, &snap) {
+                let msg = format!("save {}: {e}", path.display());
+                *self.persist.last_error.lock() = Some(msg.clone());
+                return Err(msg);
+            }
+            self.persist.last_saved_at.store(snap.saved_at, Ordering::Release);
+            *self.persist.last_error.lock() = None;
+        }
+        Ok((self.persist.path.clone(), snap))
+    }
+
+    /// Restore persisted sessions, windows, split layouts, working directories,
+    /// and curated active coding agents from `path_override` or the configured state file.
+    pub fn restore_from_disk(
+        self: &Arc<Self>,
+        path_override: Option<&Path>,
+        auto_resume_override: Option<bool>,
+    ) -> Result<RestoreReport, String> {
+        let Some(path) = path_override.or(self.persist.path.as_deref()) else {
+            return Ok(RestoreReport::default());
+        };
+        let Some(persisted) = persist::load(path).map_err(|e| format!("load {}: {e}", path.display()))? else {
+            return Ok(RestoreReport::default());
+        };
+        let allow_resume = auto_resume_override.unwrap_or(self.persist.auto_resume);
+        let existing_names: HashSet<String> = {
+            let st = self.inner.lock();
+            st.sessions.values().map(|s| s.name.clone()).collect()
+        };
+
+        let mut report = RestoreReport::default();
+        let mut created_events = Vec::new();
+        let now = unix_now();
+
+        for sess in persisted.sessions {
+            if sess.windows.is_empty() || existing_names.contains(&sess.name) {
+                continue;
+            }
+            let session_id = self.alloc_id("s");
+            let mut window_ids = Vec::new();
+            let mut inserted_windows = Vec::new();
+            let mut inserted_blocks = Vec::new();
+
+            for win in &sess.windows {
+                if win.panes.is_empty() {
+                    continue;
+                }
+                let window_id = self.alloc_id("w");
+                let mut block_ids = Vec::with_capacity(win.panes.len());
+                for pane in &win.panes {
+                    let expanded = pane.cwd.as_deref().map(expand_tilde);
+                    let cwd_exists = expanded
+                        .as_deref()
+                        .is_some_and(|p| Path::new(p).is_dir());
+                    let effective_cwd = if cwd_exists { expanded.as_deref() } else { None };
+                    // Security invariant: never execute raw `resume_cmd` text from disk;
+                    // always resolve against the compiled `AgentManifest` allowlist.
+                    let initial_run = if allow_resume && cwd_exists {
+                        pane.agent_id
+                            .as_deref()
+                            .and_then(crate::mux::agents::resume_command_for_agent)
+                    } else {
+                        None
+                    };
+                    match self.spawn_block_with_options(
+                        &session_id,
+                        &window_id,
+                        pane.cols,
+                        pane.rows,
+                        effective_cwd,
+                        None,
+                        pane.label.clone(),
+                        false,
+                        initial_run,
+                        pane.awake,
+                    ) {
+                        Ok(block) => {
+                            if initial_run.is_some() {
+                                report.resumed_agents += 1;
+                            }
+                            block_ids.push(block.id.clone());
+                            inserted_blocks.push(block);
+                        }
+                        Err(e) => {
+                            crate::log!("mux persist restore pane failed: {e}");
+                        }
+                    }
+                }
+                if block_ids.is_empty() {
+                    continue;
+                }
+                let layout = persist::materialize_layout(&win.layout, &block_ids)
+                    .unwrap_or_else(|| LayoutNode::Leaf(block_ids[0].clone()));
+                let focused_block = block_ids
+                    .get(win.focused_pane)
+                    .cloned()
+                    .unwrap_or_else(|| block_ids[0].clone());
+                let win_rec = WindowRecord {
+                    id: window_id.clone(),
+                    session_id: session_id.clone(),
+                    name: win.name.clone(),
+                    layout,
+                    focused_block,
+                    zoomed: win.zoomed,
+                    created_at: now,
+                };
+                window_ids.push(window_id);
+                inserted_windows.push(win_rec);
+            }
+
+            if inserted_windows.is_empty() {
+                continue;
+            }
+            let active_idx = sess
+                .active_window_index
+                .min(window_ids.len().saturating_sub(1));
+            let active_window = Some(window_ids[active_idx].clone());
+            let sess_rec = SessionRecord {
+                id: session_id.clone(),
+                name: sess.name,
+                windows: window_ids,
+                active_window,
+                created_at: now,
+            };
+
+            let mut win_infos = Vec::with_capacity(inserted_windows.len());
+            let sess_info = sess_rec.info();
+            {
+                let mut st = self.inner.lock();
+                st.sessions.insert(session_id, sess_rec);
+                for win_rec in inserted_windows {
+                    win_infos.push(win_rec.info());
+                    st.windows.insert(win_rec.id.clone(), win_rec);
+                }
+                for block in &inserted_blocks {
+                    st.blocks.insert(block.id.clone(), Arc::clone(block));
+                }
+            }
+            report.sessions += 1;
+            report.windows += win_infos.len();
+            report.panes += inserted_blocks.len();
+            let block_infos: Vec<BlockInfo> = inserted_blocks.iter().map(|b| b.info()).collect();
+            created_events.push((sess_info, win_infos, block_infos));
+        }
+
+        for (sess_info, win_infos, block_infos) in created_events {
+            if let (Some(win_info), Some(block_info)) = (win_infos.first(), block_infos.first()) {
+                self.broadcast_event(json!({
+                    "event": "session.created",
+                    "session": sess_info.to_json(),
+                    "window": win_info.to_json(),
+                    "block": block_info.to_json(),
+                }));
+            }
+        }
+        if report.panes > 0 {
+            self.mark_persist_dirty();
+        }
+        Ok(report)
     }
 
     fn alloc_id(&self, prefix: &str) -> String {
@@ -617,7 +998,8 @@ impl ServerState {
             return RpcOutcome::Continue;
         }
         if op == "server.shutdown" {
-            self.shutdown.store(true, Ordering::Release);
+            let _ = self.flush_persist_now();
+            self.request_shutdown();
             let res = json!({ "ok": true, "data": { "shutting_down": true } });
             if let Ok(f) = Frame::rpc_res(req_id, &res) {
                 outbox.push_priority(f);
@@ -628,6 +1010,9 @@ impl ServerState {
         let result: Result<Value, String> = match op {
             "hello" => self.rpc_hello(outbox, req),
             "state.get" => Ok(self.snapshot().to_json()),
+            "server.snapshot" => self.rpc_server_snapshot(),
+            "server.persist_info" => Ok(self.persist_info_json()),
+            "server.restore" => self.rpc_server_restore(req),
             "events.subscribe" => {
                 outbox.subscribed_events.store(true, Ordering::Release);
                 Ok(json!({ "subscribed": true }))
@@ -655,6 +1040,25 @@ impl ServerState {
             "block.wait" => self.rpc_block_wait(req),
             _ => Err(format!("unknown op `{op}`")),
         };
+
+        let mutates_persist = matches!(
+            op,
+            "session.create"
+                | "session.rename"
+                | "session.kill"
+                | "window.create"
+                | "window.rename"
+                | "window.kill"
+                | "window.focus"
+                | "window.set_zoom"
+                | "window.set_ratio"
+                | "block.split"
+                | "block.kill"
+                | "block.set_awake"
+        );
+        if result.is_ok() && mutates_persist {
+            self.mark_persist_dirty();
+        }
 
         let failed_auth = op == "hello" && result.is_err() && !outbox.authenticated.load(Ordering::Acquire);
         let body = match result {
@@ -700,6 +1104,36 @@ impl ServerState {
         }))
     }
 
+    fn rpc_server_snapshot(&self) -> Result<Value, String> {
+        let (path, snap) = self.flush_persist_now()?;
+        let windows: usize = snap.sessions.iter().map(|s| s.windows.len()).sum();
+        let panes: usize = snap
+            .sessions
+            .iter()
+            .flat_map(|s| &s.windows)
+            .map(|w| w.panes.len())
+            .sum();
+        Ok(json!({
+            "saved": path.is_some(),
+            "path": path.map(|p| p.to_string_lossy().into_owned()),
+            "saved_at": snap.saved_at,
+            "sessions": snap.sessions.len(),
+            "windows": windows,
+            "panes": panes,
+        }))
+    }
+
+    fn rpc_server_restore(self: &Arc<Self>, req: &Value) -> Result<Value, String> {
+        let path = req
+            .get("state_file")
+            .or_else(|| req.get("path"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let auto_resume = req.get("auto_resume").and_then(Value::as_bool);
+        let report = self.restore_from_disk(path.as_deref(), auto_resume)?;
+        Ok(report.to_json())
+    }
+
     fn spawn_block(
         self: &Arc<Self>,
         session_id: &str,
@@ -711,17 +1145,46 @@ impl ServerState {
         label: Option<String>,
         keep_after_exit: bool,
     ) -> Result<Arc<Block>, String> {
+        self.spawn_block_with_options(
+            session_id,
+            window_id,
+            cols,
+            rows,
+            cwd,
+            cmd,
+            label,
+            keep_after_exit,
+            None,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_block_with_options(
+        self: &Arc<Self>,
+        session_id: &str,
+        window_id: &str,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&str>,
+        cmd: Option<&[String]>,
+        label: Option<String>,
+        keep_after_exit: bool,
+        initial_run: Option<&str>,
+        initial_awake: bool,
+    ) -> Result<Arc<Block>, String> {
         let block_id = self.alloc_id("b");
         let is_login_shell = cmd.is_none_or(|parts| parts.is_empty());
         let spawn_cmdline = cmd
             .filter(|parts| !parts.is_empty())
             .map(|parts| parts.join(" "));
-        let (program, args, login, mut extra_env) = match cmd {
+        let (program, args, login, mut extra_env, used_zsh_integration) = match cmd {
             Some(parts) if !parts.is_empty() => (
                 parts[0].clone(),
                 parts[1..].to_vec(),
                 false,
                 Vec::new(),
+                false,
             ),
             _ => {
                 let shell = default_shell();
@@ -739,9 +1202,14 @@ impl ServerState {
                         }
                     }
                 };
+                let zsh_int = maybe_int.is_some()
+                    && shell
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .is_some_and(|b| b.eq_ignore_ascii_case("zsh"));
                 match maybe_int {
-                    Some(i) => (shell, i.args, i.login, i.env),
-                    None => (shell, Vec::new(), true, Vec::new()),
+                    Some(i) => (shell, i.args, i.login, i.env, zsh_int),
+                    None => (shell, Vec::new(), true, Vec::new(), false),
                 }
             }
         };
@@ -752,6 +1220,11 @@ impl ServerState {
         extra_env.push(("TACHYON_SESSION".into(), session_id.to_string()));
         extra_env.push(("TACHYON_WINDOW".into(), window_id.to_string()));
         extra_env.push(("TACHYON_BLOCK".into(), block_id.clone()));
+        if let Some(run_cmd) = initial_run {
+            if used_zsh_integration {
+                extra_env.push(("TACHYON_RUN".into(), run_cmd.to_string()));
+            }
+        }
 
         let cols = cols.max(2);
         let rows = rows.max(1);
@@ -766,6 +1239,18 @@ impl ServerState {
             expanded_cwd.as_deref(),
         )
         .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
+
+        if let Some(run_cmd) = initial_run {
+            if !used_zsh_integration {
+                let _ = pty.write(format!("{run_cmd}\r").as_bytes());
+            }
+        }
+
+        let mut term = Term::new(cols as usize, rows as usize, DEFAULT_SCROLLBACK);
+        term.cwd = expanded_cwd;
+        if initial_awake {
+            term.set_keep_awake(true);
+        }
 
         let block = Arc::new(Block {
             id: block_id.clone(),
@@ -783,7 +1268,7 @@ impl ServerState {
             work: Condvar::new(),
             space: Condvar::new(),
             parsed: Mutex::new(ParsedBlock {
-                term: Term::new(cols as usize, rows as usize, DEFAULT_SCROLLBACK),
+                term,
                 processor: Processor::new(),
                 rewind: crate::term::rewind::RewindLog::new(
                     Term::new(cols as usize, rows as usize, 0),
@@ -792,7 +1277,7 @@ impl ServerState {
                 size: (cols, rows),
                 last_title_rev: 0,
                 last_status_rev: 0,
-                awake: false,
+                awake: initial_awake,
                 agent_tracker: crate::mux::agents::AgentTracker::new(),
                 inferred_status: None,
                 last_agent_eval: None,
@@ -1610,9 +2095,121 @@ impl ServerState {
             "exit_code": code,
         }));
 
-        if !block.keep_after_exit {
-            self.remove_block_from_tree(&block.id);
+        if !block.keep_after_exit && !self.is_shutting_down() {
+            if self.remove_block_from_tree(&block.id).is_some() {
+                self.mark_persist_dirty();
+            }
         }
+    }
+}
+
+fn persist_worker_loop(weak: Weak<ServerState>) {
+    const DEBOUNCE: Duration = Duration::from_millis(500);
+    loop {
+        let Some(state) = weak.upgrade() else {
+            break;
+        };
+        {
+            let mut sig = state.persist.signal.lock();
+            loop {
+                if sig.shutdown {
+                    return;
+                }
+                if sig.dirty {
+                    break;
+                }
+                state.persist.wake.wait(&mut sig);
+            }
+            // Coalesce bursty updates (splits, OSC cwd/title bursts, agent inference)
+            // without any periodic idle wake-ups.
+            let _ = state.persist.wake.wait_for(&mut sig, DEBOUNCE);
+            if sig.shutdown {
+                return;
+            }
+            if !sig.dirty {
+                continue;
+            }
+            sig.dirty = false;
+        }
+        let _ = state.flush_persist_now();
+    }
+}
+
+fn capture_persisted_pane(block: &Block) -> PersistedPane {
+    let fg = block.pty.foreground_process(block.is_login_shell);
+    let label = block.label.lock().clone();
+    let mut p = block.parsed.lock();
+    block.drain_queue_into(&mut p);
+
+    let (cols, rows) = (p.term.cols() as u16, p.term.rows() as u16);
+    let title = p.term.title.clone();
+    let cwd = p.term.cwd.clone();
+    let awake = p.awake;
+
+    let agent_active = (!block.is_login_shell && block.alive.load(Ordering::Acquire))
+        || p.term.command_running()
+        || fg.is_some()
+        || p.term.in_alt_screen();
+
+    let (agent_id, resume_cmd, last_state) = if agent_active {
+        let status = p
+            .term
+            .program_status
+            .as_ref()
+            .or(p.inferred_status.as_ref());
+        let last_state = status.map(|s| s.state.as_str().to_string());
+        let manifest_from_status = status
+            .and_then(|s| s.app.as_deref())
+            .and_then(crate::mux::agents::find_manifest);
+        let manifest = manifest_from_status.or_else(|| {
+            let cmdline = p
+                .term
+                .running_cmdline()
+                .or(block.spawn_cmdline.as_deref());
+            let allow_screen = crate::mux::agents::should_allow_screen_fallback(
+                fg.as_ref(),
+                cmdline,
+                p.term.in_alt_screen(),
+            );
+            let lines = if allow_screen {
+                crate::mux::agents::extract_visible_lines(
+                    &p.term,
+                    crate::mux::agents::MAX_SCREEN_LINES,
+                )
+            } else {
+                Vec::new()
+            };
+            crate::mux::agents::identify_agent(
+                fg.as_ref(),
+                cmdline,
+                title.as_deref(),
+                label.as_deref(),
+                &lines,
+                allow_screen,
+            )
+        });
+        match manifest {
+            Some(m) => (
+                Some(m.id.to_string()),
+                m.resume_cmd.map(str::to_string),
+                last_state,
+            ),
+            None => (None, None, None),
+        }
+    } else {
+        (None, None, None)
+    };
+
+    PersistedPane {
+        label,
+        title,
+        cwd,
+        cols,
+        rows,
+        awake,
+        agent_id,
+        resume_cmd,
+        last_state,
     }
 }
 
@@ -1752,6 +2349,9 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
                 "block": info.to_json(),
                 "status": info.status.as_ref().map(crate::mux::model::status_to_json),
             }));
+        }
+        if meta_changed || status_changed || inferred_changed {
+            state.mark_persist_dirty();
         }
         if meta_changed {
             state.broadcast_event(json!({

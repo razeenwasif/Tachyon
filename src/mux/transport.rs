@@ -95,13 +95,22 @@ pub fn connect_tcp(addr: &str) -> io::Result<Transport> {
 
 #[cfg(unix)]
 pub fn connect_local(socket: &Path, auto_start: bool) -> io::Result<Transport> {
+    connect_local_with_args(socket, auto_start, &[])
+}
+
+#[cfg(unix)]
+pub fn connect_local_with_args(
+    socket: &Path,
+    auto_start: bool,
+    extra_args: &[String],
+) -> io::Result<Transport> {
     use std::os::unix::net::UnixStream;
 
     let stream = match UnixStream::connect(socket) {
         Ok(s) => s,
         Err(e) if !auto_start => return Err(e),
         Err(_) => {
-            spawn_local_daemon(socket)?;
+            spawn_local_daemon_with_args(socket, extra_args)?;
             let deadline = Instant::now() + Duration::from_secs(4);
             loop {
                 match UnixStream::connect(socket) {
@@ -129,11 +138,20 @@ pub fn connect_local(socket: &Path, auto_start: bool) -> io::Result<Transport> {
 
 #[cfg(windows)]
 pub fn connect_local(socket: &Path, auto_start: bool) -> io::Result<Transport> {
+    connect_local_with_args(socket, auto_start, &[])
+}
+
+#[cfg(windows)]
+pub fn connect_local_with_args(
+    socket: &Path,
+    auto_start: bool,
+    extra_args: &[String],
+) -> io::Result<Transport> {
     let pipe = match win_pipe::connect_named_pipe(socket) {
         Ok(p) => p,
         Err(e) if !auto_start => return Err(e),
         Err(_) => {
-            spawn_local_daemon(socket)?;
+            spawn_local_daemon_with_args(socket, extra_args)?;
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match win_pipe::connect_named_pipe(socket) {
@@ -169,6 +187,18 @@ pub fn connect_local(_socket: &Path, _auto_start: bool) -> io::Result<Transport>
     ))
 }
 
+#[cfg(not(any(unix, windows)))]
+pub fn connect_local_with_args(
+    _socket: &Path,
+    _auto_start: bool,
+    _extra_args: &[String],
+) -> io::Result<Transport> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "local server transport is unsupported on this OS",
+    ))
+}
+
 #[cfg(unix)]
 pub fn tune_unix_socket(sock: &std::os::unix::net::UnixStream) {
     use std::os::fd::AsRawFd;
@@ -188,8 +218,12 @@ pub fn tune_unix_socket(sock: &std::os::unix::net::UnixStream) {
 
 /// Start `tachyon server run --socket <path>` detached in its own session so
 /// it outlives the invoking CLI or GUI process.
-#[cfg(unix)]
 pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
+    spawn_local_daemon_with_args(socket, &[])
+}
+
+#[cfg(unix)]
+pub fn spawn_local_daemon_with_args(socket: &Path, extra_args: &[String]) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
 
     if let Some(parent) = socket.parent() {
@@ -199,6 +233,7 @@ pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
     let mut cmd = Command::new(exe);
     cmd.args(["server", "run", "--socket"])
         .arg(socket)
+        .args(extra_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -219,7 +254,7 @@ pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
+pub fn spawn_local_daemon_with_args(socket: &Path, extra_args: &[String]) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -227,8 +262,9 @@ pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
     // Prefer launching the installed Scheduled Task when using the default pipe
-    // so the server outlives Windows OpenSSH's per-session Job Object.
-    if socket == crate::mux::default_socket_path() {
+    // (without custom startup flags) so the server outlives Windows OpenSSH's
+    // per-session Job Object.
+    if extra_args.is_empty() && socket == crate::mux::default_socket_path() {
         let ok = Command::new("schtasks.exe")
             .args(["/Run", "/TN", "Tachyon Server"])
             .stdin(Stdio::null())
@@ -245,6 +281,7 @@ pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
     let mut cmd = Command::new(exe);
     cmd.args(["server", "run", "--socket"])
         .arg(socket)
+        .args(extra_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -262,7 +299,7 @@ pub fn spawn_local_daemon(socket: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn spawn_local_daemon(_socket: &Path) -> io::Result<()> {
+pub fn spawn_local_daemon_with_args(_socket: &Path, _extra_args: &[String]) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "detached daemon spawn is unsupported on this OS",

@@ -9,6 +9,7 @@
 //! and keeps sessions, split windows, and PTYs alive across disconnects and
 //! app restarts.
 
+pub mod persist;
 pub mod pty;
 pub mod state;
 
@@ -32,6 +33,12 @@ pub struct RunOptions {
     pub auth_token: Option<String>,
     /// File storing the bearer token when `--listen` is enabled.
     pub token_file: Option<PathBuf>,
+    /// Override persistent snapshot path (`none` / `off` disables persistence).
+    pub state_file: Option<PathBuf>,
+    /// Do not auto-restore sessions from `state.json` on startup.
+    pub no_restore: bool,
+    /// Do not auto-resume coding agents during startup restoration.
+    pub no_resume: bool,
 }
 
 /// Information reported once listeners are bound (used by tests and CLI logging).
@@ -106,7 +113,37 @@ pub(crate) fn run_with_ready(
         token_created = created;
     }
 
-    let state = ServerState::with_auth_token(resolved_token.clone());
+    let cfg = crate::config::Config::load_default();
+    let state_path = if opts.state_file.is_some() || cfg.server.persist_sessions {
+        persist::resolve_state_path(socket, opts.state_file.as_deref())
+    } else {
+        None
+    };
+    let auto_resume = cfg.server.auto_resume_agents && !opts.no_resume;
+    let state = ServerState::with_options(
+        resolved_token.clone(),
+        state::PersistOptions {
+            path: state_path.clone(),
+            auto_resume,
+        },
+    );
+    if state_path.is_some() && !opts.no_restore {
+        match state.restore_from_disk(None, None) {
+            Ok(rep) if rep.panes > 0 => {
+                crate::log!(
+                    "mux server: restored {} session(s), {} window(s), {} pane(s) ({} agent(s) resumed)",
+                    rep.sessions,
+                    rep.windows,
+                    rep.panes,
+                    rep.resumed_agents
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::log!("mux server: skipped state restore: {e}");
+            }
+        }
+    }
     let tcp_addr = tcp_listener.as_ref().map(|(_, a)| *a);
     let info = BoundInfo {
         tcp_addr,
@@ -214,6 +251,8 @@ fn run_unix(
         None => None,
     };
 
+    let _sig_guard = install_unix_signal_guard(&state, &wake_all);
+
     on_ready(info);
 
     for conn in listener.incoming() {
@@ -233,6 +272,12 @@ fn run_unix(
             .spawn(move || serve_connection(st, stream, writer, true, wake));
     }
 
+    drop(_sig_guard);
+    if !state.is_shutting_down() {
+        let _ = state.flush_persist_now();
+    }
+    state.stop_persist_worker();
+
     if let Some(addr) = tcp_wake {
         let _ = TcpStream::connect(addr);
     }
@@ -242,6 +287,151 @@ fn run_unix(
     let _ = std::fs::remove_file(socket);
     crate::log!("mux server: stopped");
     Ok(())
+}
+
+#[cfg(unix)]
+static UNIX_SIG_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn unix_term_signal_handler(_sig: libc::c_int) {
+    let fd = UNIX_SIG_WAKE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let b = 1u8;
+        unsafe {
+            let _ = libc::write(fd, (&b as *const u8).cast::<libc::c_void>(), 1);
+        }
+    }
+}
+
+#[cfg(unix)]
+struct UnixSignalGuard {
+    claimed: bool,
+    read_fd: libc::c_int,
+    write_fd: libc::c_int,
+    old_term: libc::sigaction,
+    old_int: libc::sigaction,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for UnixSignalGuard {
+    fn drop(&mut self) {
+        if !self.claimed {
+            return;
+        }
+        unsafe {
+            libc::sigaction(libc::SIGTERM, &self.old_term, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &self.old_int, std::ptr::null_mut());
+        }
+        UNIX_SIG_WAKE_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            libc::close(self.write_fd);
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        unsafe {
+            libc::close(self.read_fd);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn install_unix_signal_guard(
+    state: &Arc<ServerState>,
+    wake_all: &Arc<dyn Fn() + Send + Sync>,
+) -> UnixSignalGuard {
+    use std::sync::atomic::Ordering;
+
+    let zero_sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut fds = [-1 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return UnixSignalGuard {
+            claimed: false,
+            read_fd: -1,
+            write_fd: -1,
+            old_term: zero_sa,
+            old_int: zero_sa,
+            thread: None,
+        };
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    unsafe {
+        libc::fcntl(read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(write_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        let flags = libc::fcntl(write_fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    if UNIX_SIG_WAKE_FD
+        .compare_exchange(-1, write_fd, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return UnixSignalGuard {
+            claimed: false,
+            read_fd: -1,
+            write_fd: -1,
+            old_term: zero_sa,
+            old_int: zero_sa,
+            thread: None,
+        };
+    }
+
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = unix_term_signal_handler as *const () as libc::sighandler_t;
+    sa.sa_flags = libc::SA_RESTART;
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+    }
+    let mut old_term = zero_sa;
+    let mut old_int = zero_sa;
+    unsafe {
+        libc::sigaction(libc::SIGTERM, &sa, &mut old_term);
+        libc::sigaction(libc::SIGINT, &sa, &mut old_int);
+    }
+
+    let st = Arc::clone(state);
+    let wake = Arc::clone(wake_all);
+    let thread = std::thread::Builder::new()
+        .name("tachyon-srv-sig".into())
+        .spawn(move || {
+            let mut b = 0u8;
+            loop {
+                let n = unsafe {
+                    libc::read(read_fd, (&mut b as *mut u8).cast::<libc::c_void>(), 1)
+                };
+                if n > 0 {
+                    if !st.is_shutting_down() {
+                        let _ = st.flush_persist_now();
+                    }
+                    st.request_shutdown();
+                    wake();
+                    break;
+                }
+                if n == 0 {
+                    break;
+                }
+                if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        })
+        .ok();
+
+    UnixSignalGuard {
+        claimed: true,
+        read_fd,
+        write_fd,
+        old_term,
+        old_int,
+        thread,
+    }
 }
 
 #[cfg(windows)]
@@ -346,6 +536,8 @@ fn run_windows(
         None => None,
     };
 
+    let _ctrl_guard = install_win_ctrl_guard(&state, &wake_all);
+
     crate::log!("mux server: listening on {}", pipe_path.display());
     on_ready(info);
 
@@ -401,6 +593,12 @@ fn run_windows(
         }
     }
 
+    drop(_ctrl_guard);
+    if !state.is_shutting_down() {
+        let _ = state.flush_persist_now();
+    }
+    state.stop_persist_worker();
+
     unsafe {
         let _ = CloseHandle(connect_ev);
         if has_sd && !sd.0.is_null() {
@@ -415,6 +613,76 @@ fn run_windows(
     }
     crate::log!("mux server: stopped");
     Ok(())
+}
+
+#[cfg(windows)]
+static WIN_CTRL_TARGET: std::sync::OnceLock<
+    parking_lot::Mutex<Option<(Arc<ServerState>, Arc<dyn Fn() + Send + Sync>)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn win_ctrl_handler(ctrl_type: u32) -> windows::core::BOOL {
+    use windows::core::BOOL;
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    if matches!(
+        ctrl_type,
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    ) {
+        if let Some(slot) = WIN_CTRL_TARGET.get() {
+            let pair = slot.lock().clone();
+            if let Some((st, wake)) = pair {
+                if !st.is_shutting_down() {
+                    let _ = st.flush_persist_now();
+                }
+                st.request_shutdown();
+                wake();
+                return BOOL(1);
+            }
+        }
+    }
+    BOOL(0)
+}
+
+#[cfg(windows)]
+struct WinCtrlGuard {
+    registered: bool,
+}
+
+#[cfg(windows)]
+impl Drop for WinCtrlGuard {
+    fn drop(&mut self) {
+        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+        if self.registered {
+            unsafe {
+                let _ = SetConsoleCtrlHandler(Some(win_ctrl_handler), false);
+            }
+            if let Some(slot) = WIN_CTRL_TARGET.get() {
+                *slot.lock() = None;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn install_win_ctrl_guard(
+    state: &Arc<ServerState>,
+    wake_all: &Arc<dyn Fn() + Send + Sync>,
+) -> WinCtrlGuard {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    let slot = WIN_CTRL_TARGET.get_or_init(|| parking_lot::Mutex::new(None));
+    let mut guard = slot.lock();
+    if guard.is_some() {
+        return WinCtrlGuard { registered: false };
+    }
+    *guard = Some((Arc::clone(state), Arc::clone(wake_all)));
+    drop(guard);
+    let registered = unsafe { SetConsoleCtrlHandler(Some(win_ctrl_handler), true) }.is_ok();
+    if !registered {
+        *slot.lock() = None;
+    }
+    WinCtrlGuard { registered }
 }
 
 fn serve_connection<R, W>(
@@ -1098,6 +1366,7 @@ mod tests {
                     listen: Some("127.0.0.1:0".into()),
                     auth_token: None,
                     token_file: Some(tok_srv),
+                    ..RunOptions::default()
                 },
                 |info| {
                     let _ = tx.send(info.clone());

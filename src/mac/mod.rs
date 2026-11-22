@@ -8646,6 +8646,31 @@ fn mux_refresh_all() {
     }
 }
 
+fn mux_save_server_snapshot() {
+    std::thread::Builder::new()
+        .name("tachyon-ui-snapshot".into())
+        .spawn(|| {
+            let client = host_mgr()
+                .and_then(|m| m.client("local").or_else(|| m.connect_local_now()));
+            match client {
+                Some(c) => match c.server_snapshot() {
+                    Ok(v) => {
+                        let s = v.get("sessions").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        let w = v.get("windows").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        let p = v.get("panes").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        let path = v.get("path").and_then(serde_json::Value::as_str).unwrap_or("disabled");
+                        crate::log::force(&format!(
+                            "server snapshot saved ({s} sessions, {w} windows, {p} panes) -> {path}"
+                        ));
+                    }
+                    Err(e) => crate::log::force(&format!("server snapshot failed: {e}")),
+                },
+                None => crate::log::force("server snapshot skipped: local server unavailable"),
+            }
+        })
+        .ok();
+}
+
 fn mux_add_host(alias: String, uri: String) {
     mux_add_host_with_token(alias, uri, None);
 }

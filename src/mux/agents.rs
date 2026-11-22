@@ -50,6 +50,9 @@ pub struct AgentManifest {
     pub working_patterns: &'static [&'static str],
     pub error_patterns: &'static [&'static str],
     pub ready_patterns: &'static [&'static str],
+    /// Curated interactive command used by `tachyon server` to resume an active
+    /// conversation across reboots/restarts (`None` when CLI lacks a resume flag).
+    pub resume_cmd: Option<&'static str>,
 }
 
 /// Supported zero-hook coding-agent CLIs (24 agents).
@@ -72,6 +75,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["esc to interrupt", "thinking…", "thinking...", "compacting conversation"],
         error_patterns: &["credit balance is too low", "anthropic api error", "overloaded_error"],
         ready_patterns: &["try \"", "? for shortcuts", "shift+tab to cycle"],
+        resume_cmd: Some("claude --continue"),
     },
     AgentManifest {
         id: "antigravity",
@@ -85,6 +89,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["esc to interrupt", "generating…", "generating..."],
         error_patterns: &["gemini api error"],
         ready_patterns: &["ask antigravity", "/help for commands"],
+        resume_cmd: Some("agy --continue"),
     },
     AgentManifest {
         id: "codex",
@@ -103,6 +108,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["working...", "working…", "esc to interrupt"],
         error_patterns: &["openai api error"],
         ready_patterns: &["? for shortcuts", "send message", "100% context left"],
+        resume_cmd: Some("codex resume --last"),
     },
     AgentManifest {
         id: "opencode",
@@ -116,6 +122,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["generating...", "generating…", "esc to cancel"],
         error_patterns: &["provider error", "api key missing"],
         ready_patterns: &["ask anything...", "ctrl+p commands"],
+        resume_cmd: Some("opencode --continue"),
     },
     AgentManifest {
         id: "pi",
@@ -129,6 +136,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["streaming...", "streaming…", "esc to abort"],
         error_patterns: &[],
         ready_patterns: &["pi >", "/help"],
+        resume_cmd: Some("pi --continue"),
     },
     AgentManifest {
         id: "gemini",
@@ -147,6 +155,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["esc to cancel", "responding...", "responding…"],
         error_patterns: &["quota exceeded", "gemini error"],
         ready_patterns: &["type your message", "context left"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "cursor",
@@ -161,6 +170,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["generating...", "esc to interrupt"],
         error_patterns: &[],
         ready_patterns: &["ask anything"],
+        resume_cmd: Some("cursor-agent resume"),
     },
     AgentManifest {
         id: "aider",
@@ -174,6 +184,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["waiting for llm", "streaming"],
         error_patterns: &["litellm.", "aider error"],
         ready_patterns: &["tokens:", "> ask", "/help"],
+        resume_cmd: Some("aider --restore-chat-history"),
     },
     AgentManifest {
         id: "copilot",
@@ -187,6 +198,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["thinking...", "esc to cancel"],
         error_patterns: &["copilot error"],
         ready_patterns: &["ask copilot"],
+        resume_cmd: Some("copilot --continue"),
     },
     AgentManifest {
         id: "grok",
@@ -200,6 +212,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["thinking...", "esc to interrupt"],
         error_patterns: &[],
         ready_patterns: &["ask grok"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "goose",
@@ -213,6 +226,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["working on it...", "ctrl+c to cancel"],
         error_patterns: &["provider failed"],
         ready_patterns: &["goose >"],
+        resume_cmd: Some("goose session --resume"),
     },
     AgentManifest {
         id: "amp",
@@ -226,6 +240,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["esc to interrupt", "streaming"],
         error_patterns: &[],
         ready_patterns: &["amp >"],
+        resume_cmd: Some("amp threads continue"),
     },
     AgentManifest {
         id: "cline",
@@ -239,6 +254,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["api request...", "thinking"],
         error_patterns: &[],
         ready_patterns: &["type a task"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "roo",
@@ -252,6 +268,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["working...", "esc to cancel"],
         error_patterns: &[],
         ready_patterns: &["roo >"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "hermes",
@@ -265,6 +282,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["reasoning...", "esc to interrupt"],
         error_patterns: &[],
         ready_patterns: &["hermes >"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "kiro",
@@ -279,6 +297,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["thinking...", "ctrl+c to stop"],
         error_patterns: &[],
         ready_patterns: &["kiro >"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "crush",
@@ -292,6 +311,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["working...", "esc to cancel"],
         error_patterns: &[],
         ready_patterns: &["enter to send"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "auggie",
@@ -305,6 +325,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["thinking...", "esc to interrupt"],
         error_patterns: &[],
         ready_patterns: &["auggie >"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "droid",
@@ -318,6 +339,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["working...", "esc to interrupt"],
         error_patterns: &[],
         ready_patterns: &["droid >"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "qwen",
@@ -331,6 +353,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["esc to cancel", "responding..."],
         error_patterns: &[],
         ready_patterns: &["type your message"],
+        resume_cmd: Some("qwen --continue"),
     },
     AgentManifest {
         id: "windsurf",
@@ -344,6 +367,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["generating...", "esc to cancel"],
         error_patterns: &[],
         ready_patterns: &["cascade >"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "openhands",
@@ -357,6 +381,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["running action", "thinking..."],
         error_patterns: &[],
         ready_patterns: &["openhands >"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "forge",
@@ -371,6 +396,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["thinking...", "esc to interrupt"],
         error_patterns: &[],
         ready_patterns: &["forge >"],
+        resume_cmd: None,
     },
     AgentManifest {
         id: "plandex",
@@ -384,6 +410,7 @@ pub const AGENTS: &[AgentManifest] = &[
         working_patterns: &["building plan", "streaming"],
         error_patterns: &[],
         ready_patterns: &["plandex >"],
+        resume_cmd: None,
     },
 ];
 
@@ -551,6 +578,11 @@ pub fn find_manifest(id_or_alias: &str) -> Option<&'static AgentManifest> {
     AGENTS
         .iter()
         .find(|m| m.display_name.to_ascii_lowercase() == low)
+}
+
+/// Curated non-arbitrary resume command for `agent_id` across server restarts/reboots.
+pub fn resume_command_for_agent(agent_id: &str) -> Option<&'static str> {
+    find_manifest(agent_id).and_then(|m| m.resume_cmd)
 }
 
 /// Resolve canonical `(app_id, display_name, glyph)` for an agent identifier.
@@ -1262,6 +1294,10 @@ mod tests {
         assert_eq!(agent_identity("pi"), ("pi".into(), "Pi".into(), "π"));
         assert_eq!(agent_identity("hermes"), ("hermes".into(), "Hermes".into(), "☤"));
         assert_eq!(agent_identity("custom-bot"), ("custom-bot".into(), "Custom-bot".into(), "●"));
+        assert_eq!(resume_command_for_agent("claude"), Some("claude --continue"));
+        assert_eq!(resume_command_for_agent("codex"), Some("codex resume --last"));
+        assert_eq!(resume_command_for_agent("antigravity"), Some("agy --continue"));
+        assert_eq!(resume_command_for_agent("gemini"), None);
     }
 
     #[test]
