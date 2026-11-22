@@ -9,6 +9,7 @@
 //! and keeps sessions, split windows, and PTYs alive across disconnects and
 //! app restarts.
 
+pub mod alerts;
 pub mod persist;
 pub mod pty;
 pub mod receipts;
@@ -40,6 +41,12 @@ pub struct RunOptions {
     pub no_restore: bool,
     /// Do not auto-resume coding agents during startup restoration.
     pub no_resume: bool,
+    /// Optional webhook URL override for `agent.alert` notifications.
+    pub alert_webhook: Option<String>,
+    /// Optional shell command hook override for `agent.alert` notifications.
+    pub alert_command: Option<String>,
+    /// Optional comma-separated states triggering `agent.alert` notifications.
+    pub alert_states: Option<String>,
 }
 
 /// Information reported once listeners are bound (used by tests and CLI logging).
@@ -121,12 +128,30 @@ pub(crate) fn run_with_ready(
         None
     };
     let auto_resume = cfg.server.auto_resume_agents && !opts.no_resume;
-    let state = ServerState::with_options(
+    let mut alert_cfg = alerts::AlertConfig::from_server_config(&cfg.server);
+    if let Some(ref raw) = opts.alert_webhook {
+        alert_cfg.webhook = alerts::normalize_webhook_url(raw)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    }
+    if let Some(ref raw) = opts.alert_command {
+        let t = raw.trim();
+        alert_cfg.command = (!t.is_empty()).then(|| t.to_string());
+    }
+    if let Some(ref raw) = opts.alert_states {
+        alert_cfg.states = alerts::parse_alert_states(raw)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    }
+    let listen_addr_str = tcp_listener.as_ref().map(|(_, a)| a.to_string());
+    let persisted_token_path = token_path.clone().or_else(|| opts.token_file.clone());
+    let state = ServerState::with_full_options(
         resolved_token.clone(),
+        persisted_token_path,
+        listen_addr_str,
         state::PersistOptions {
             path: state_path.clone(),
             auto_resume,
         },
+        alert_cfg,
     );
     if state_path.is_some() && !opts.no_restore {
         match state.restore_from_disk(None, None) {

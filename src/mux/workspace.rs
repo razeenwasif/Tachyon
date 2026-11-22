@@ -1670,6 +1670,7 @@ mod tests {
                 build: None,
                 capabilities: Vec::new(),
                 auth_enabled: None,
+                listen_addr: None,
             },
             sessions: vec![SessionInfo {
                 id: "s1".into(),

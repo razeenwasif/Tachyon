@@ -299,6 +299,7 @@ impl MuxClient {
                 build: None,
                 capabilities: Vec::new(),
                 auth_enabled: None,
+                listen_addr: None,
             },
             client_id: String::new(),
         };
@@ -875,6 +876,39 @@ impl MuxClient {
         }
         let v = self.rpc(req)?;
         Ok(crate::server::persist::RestoreReport::from_json(&v))
+    }
+
+    /// Update or rotate the running server's bearer auth token in place (`server.set_token`).
+    pub fn server_set_token(&self, token: Option<&str>) -> io::Result<Value> {
+        let req = match token.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(tok) => json!({ "op": "server.set_token", "token": tok }),
+            None => json!({ "op": "server.set_token", "regenerate": true }),
+        };
+        self.rpc(req)
+    }
+
+    /// Inspect server away-from-desk alert hook configuration (`server.alerts.get`).
+    pub fn server_alerts_get(&self) -> io::Result<Value> {
+        self.rpc(json!({ "op": "server.alerts.get" }))
+    }
+
+    /// Update server away-from-desk alert hook configuration at runtime (`server.alerts.set`).
+    pub fn server_alerts_set(&self, patch: Value) -> io::Result<Value> {
+        let mut req = match patch {
+            Value::Object(map) => map,
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "alert config must be an object")),
+        };
+        req.insert("op".into(), Value::String("server.alerts.set".into()));
+        self.rpc(Value::Object(req))
+    }
+
+    /// Trigger a test `agent.alert` event & synchronous webhook/command delivery (`server.alerts.test`).
+    pub fn server_alerts_test(&self, state: Option<&str>, message: Option<&str>) -> io::Result<Value> {
+        self.rpc(json!({
+            "op": "server.alerts.test",
+            "state": state.unwrap_or("blocked"),
+            "message": message.unwrap_or("Test alert from Tachyon"),
+        }))
     }
 
     /// Request a graceful server shutdown (`tachyon server stop`).

@@ -1991,3 +1991,295 @@ fn cli_receipts_markdown_export_renders_command_receipt_and_output() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_mobile_pairing_token_rotation_and_agent_alert_hooks() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    let dir = temp_dir("pair-alert");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    let token_file = dir.join("server.token");
+
+    // 1. Start a loopback HTTP webhook collector for away-from-desk agent alerts.
+    let hook_listener = TcpListener::bind("127.0.0.1:0").expect("bind webhook listener");
+    let hook_port = hook_listener.local_addr().unwrap().port();
+    hook_listener.set_nonblocking(true).unwrap();
+    let stop_hook = Arc::new(AtomicBool::new(false));
+    let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop_hook_t = Arc::clone(&stop_hook);
+    let received_t = Arc::clone(&received);
+    let hook_thread = std::thread::spawn(move || {
+        while !stop_hook_t.load(Ordering::Acquire) {
+            match hook_listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    let mut header_end = None;
+                    let mut content_len = 0usize;
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if header_end.is_none() {
+                                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                        let end = pos + 4;
+                                        header_end = Some(end);
+                                        let hdr = String::from_utf8_lossy(&buf[..end]);
+                                        for line in hdr.lines() {
+                                            if let Some((k, v)) = line.split_once(':') {
+                                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                                    content_len = v.trim().parse().unwrap_or(0);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(end) = header_end {
+                                    if buf.len() >= end + content_len {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if let Some(end) = header_end {
+                        let body = &buf[end..(end + content_len).min(buf.len())];
+                        if let Ok(val) = serde_json::from_slice::<Value>(body) {
+                            received_t.lock().unwrap().push(val);
+                        }
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let hook_url = format!("http://127.0.0.1:{hook_port}/hook");
+    let sock_s = sock.to_string_lossy().into_owned();
+    let tok_s = token_file.to_string_lossy().into_owned();
+
+    // 2. Launch an isolated TCP-enabled daemon (`--listen 127.0.0.1:0`) with the alert webhook.
+    let child = Command::new(bin())
+        .args([
+            "server",
+            "run",
+            "--socket",
+            &sock_s,
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            &tok_s,
+            "--alert-webhook",
+            &hook_url,
+        ])
+        .env("HOME", &dir)
+        .env("TACHYON_SOCKET", &sock)
+        .env("TACHYON_HOSTS_FILE", &hosts)
+        .env("TACHYON_TOKEN_FILE", &token_file)
+        .env("TACHYON_ALERT_COOLDOWN_SECS", "0")
+        .env_remove("TACHYON_SERVER")
+        .env_remove("TACHYON_SESSION")
+        .env_remove("TACHYON_WINDOW")
+        .env_remove("TACHYON_BLOCK")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server run --listen");
+    let mut server_guard = ChildGuard(Some(child));
+
+    let run_iso = |args: &[&str]| -> (i32, String, String) {
+        let out = Command::new(bin())
+            .args(args)
+            .env("HOME", &dir)
+            .env("TACHYON_SOCKET", &sock)
+            .env("TACHYON_HOSTS_FILE", &hosts)
+            .env("TACHYON_TOKEN_FILE", &token_file)
+            .env_remove("TACHYON_SERVER")
+            .env_remove("TACHYON_SESSION")
+            .env_remove("TACHYON_WINDOW")
+            .env_remove("TACHYON_BLOCK")
+            .output()
+            .expect("spawn tachyon cli");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // Wait for daemon status to report running + bound TCP listen_addr.
+    let mut listen_addr = String::new();
+    for _ in 0..80 {
+        if let Some(st) = server_guard.0.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+            let mut err_s = String::new();
+            if let Some(mut se) = server_guard.0.as_mut().and_then(|c| c.stderr.take()) {
+                let _ = std::io::Read::read_to_string(&mut se, &mut err_s);
+            }
+            panic!("server run exited early ({st}): {err_s}");
+        }
+        let (code, out, _) = run_iso(&["server", "status", "--json"]);
+        if code == 0 {
+            if let Ok(v) = serde_json::from_str::<Value>(&out) {
+                if let Some(a) = v["host"]["listen_addr"].as_str() {
+                    listen_addr = a.to_string();
+                    assert_eq!(v["host"]["auth_enabled"], true);
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(listen_addr.starts_with("127.0.0.1:"), "listen_addr={listen_addr:?}");
+    let tcp_port: u16 = listen_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    // 3. `server token --uri --json` and `pair --json` expose the bound port & QR matrix.
+    let (code, tok_out, err) = run_iso(&["server", "token", "--uri", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let tok_v: Value = serde_json::from_str(&tok_out).unwrap();
+    let old_token = tok_v["token"].as_str().unwrap().to_string();
+    assert_eq!(tok_v["tcp_ready"], true);
+    assert!(tok_v["pairing_uri"].as_str().unwrap().starts_with("tachyon://pair?"));
+    assert!(tok_v["qr_size"].as_u64().unwrap() >= 21);
+
+    let (code, pair_out, err) = run_iso(&["pair", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let pair_v: Value = serde_json::from_str(&pair_out).unwrap();
+    assert_eq!(pair_v["tcp_ready"], true);
+    assert_eq!(pair_v["pairing"]["port"], tcp_port);
+    let uri_v1 = pair_v["pairing_uri"].as_str().unwrap().to_string();
+    assert_eq!(pair_v["pairing"]["token"], old_token);
+
+    // 4. Import pairing URI (`pair --import`) and verify authenticated TCP RPC succeeds.
+    let (code, imp_out, err) = run_iso(&[
+        "pair",
+        "--import",
+        &uri_v1,
+        "--alias",
+        "mobile-loopback",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let imp_v: Value = serde_json::from_str(&imp_out).unwrap();
+    assert_eq!(imp_v["imported"], true);
+    assert_eq!(imp_v["host"]["alias"], "mobile-loopback");
+
+    let (code, ls_out, err) = run_iso(&["ls", "--server", "mobile-loopback", "--json"]);
+    assert_eq!(code, 0, "TCP ls should succeed before rotation, stderr: {err}");
+    let ls_v: Value = serde_json::from_str(&ls_out).unwrap();
+    assert_eq!(ls_v["host"]["listen_addr"], listen_addr);
+
+    // 5. Hot token rotation via `server token --regenerate` invalidates old token immediately.
+    let (code, rot_out, err) = run_iso(&["server", "token", "--regenerate", "--uri", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let rot_v: Value = serde_json::from_str(&rot_out).unwrap();
+    let new_token = rot_v["token"].as_str().unwrap().to_string();
+    assert_ne!(new_token, old_token);
+    let uri_v2 = rot_v["pairing_uri"].as_str().unwrap().to_string();
+
+    let (code, _, _) = run_iso(&["ls", "--server", "mobile-loopback", "--json"]);
+    assert_ne!(code, 0, "stale pairing token must be rejected after hot rotation");
+
+    // Updating the saved entry via `hosts add <alias> <tachyon://pair?...>` restores TCP auth cleanly.
+    let (code, _, err) = run_iso(&[
+        "hosts",
+        "add",
+        "mobile-loopback",
+        &uri_v2,
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, _, err) = run_iso(&["ls", "--server", "mobile-loopback", "--json"]);
+    assert_eq!(code, 0, "re-paired TCP ls should succeed without daemon restart, stderr: {err}");
+
+    // 6. Inspect alert hooks and trigger a synchronous test webhook dispatch.
+    let (code, alerts_out, err) = run_iso(&["server", "alerts", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let alerts_v: Value = serde_json::from_str(&alerts_out).unwrap();
+    assert_eq!(alerts_v["webhook"], hook_url);
+    assert_eq!(alerts_v["cooldown_secs"], 0);
+
+    let (code, test_out, err) = run_iso(&[
+        "server",
+        "alerts",
+        "--webhook",
+        &hook_url,
+        "--no-save",
+        "--test",
+        "--state",
+        "blocked",
+        "--message",
+        "manual-probe",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let test_v: Value = serde_json::from_str(&test_out).unwrap();
+    assert_eq!(test_v["delivery"]["webhook_ok"], true);
+    assert!(received.lock().unwrap().iter().any(|p| {
+        p["event"] == "agent.alert" && p["state"] == "blocked" && p["message"] == "manual-probe"
+    }));
+
+    // 7. Create a live block, emit OSC 7501 blocked status, and verify live webhook firing.
+    let (code, new_out, err) = run_iso(&["new", "alert-sess", "--json", "--", "/bin/sh"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let new_v: Value = serde_json::from_str(&new_out).unwrap();
+    let bid = new_v["block"]["id"].as_str().unwrap().to_string();
+    std::thread::sleep(Duration::from_millis(120));
+    let (code, _, err) = run_iso(&[
+        "send",
+        "-b",
+        &bid,
+        "--enter",
+        "printf '\\033]7501;state=blocked;app=claude;msg=approve-deploy\\007\\n'",
+    ]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let mut live_hit = false;
+    for _ in 0..80 {
+        if received.lock().unwrap().iter().any(|p| {
+            p["event"] == "agent.alert"
+                && p["state"] == "blocked"
+                && p["app"] == "claude"
+                && p["message"] == "approve-deploy"
+        }) {
+            live_hit = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live_hit, "expected live agent.alert webhook, got: {:?}", *received.lock().unwrap());
+
+    let (code, _, err) = run_iso(&["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    stop_hook.store(true, Ordering::Release);
+    if let Some(mut c) = server_guard.0.take() {
+        let _ = c.wait();
+    }
+    let _ = hook_thread.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}

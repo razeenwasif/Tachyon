@@ -72,6 +72,7 @@ pub enum PaletteAction {
     SetupAgentIntegrations,
     RefreshHosts,
     FleetDoctor,
+    MobilePairing,
     SaveServerSnapshot,
     LaunchWorkspace(String),
     StopWorkspace(String),
@@ -362,6 +363,12 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Audit versions, build SHAs, capabilities & RTT across all hosts".into(),
             shortcut: "",
             action: PaletteAction::FleetDoctor,
+        },
+        PaletteItem {
+            title: "Mobile: Pair iPhone (QR & Tailscale Link)".into(),
+            subtitle: "Show QR code, pairing URI & bearer token for Tailscale TCP hosts".into(),
+            shortcut: "",
+            action: PaletteAction::MobilePairing,
         },
         PaletteItem {
             title: "Server: Save Session Snapshot Now".into(),
@@ -1007,6 +1014,10 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
         PaletteAction::FleetDoctor => {
             super::open_settings_section(1);
             super::settings::trigger_fleet_doctor();
+            return;
+        }
+        PaletteAction::MobilePairing => {
+            super::open_settings_section(1);
             return;
         }
         PaletteAction::SaveServerSnapshot => super::mux_save_server_snapshot(),

@@ -16,7 +16,8 @@ use crate::mux::client::{HandoffSpec, MuxClient};
 use crate::mux::model::{HostColor, HostEntry, SplitDir};
 use crate::mux::{
     default_local_uri, default_socket_path, default_token_path, generate_auth_token, load_hosts,
-    load_or_create_token, resolve_target, save_hosts, transport, write_token_file, Target,
+    load_or_create_token, local_hostname, resolve_target, save_hosts, transport, write_token_file,
+    Target,
 };
 use crate::server::{self, RunOptions, ServiceOptions};
 
@@ -41,7 +42,7 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 i += 1;
                 continue;
             }
-            "server" | "bridge" | "hosts" | "doctor" | "workspace" | "ws" | "worktree" | "wt" | "agents"
+            "server" | "bridge" | "hosts" | "pair" | "doctor" | "workspace" | "ws" | "worktree" | "wt" | "agents"
             | "agent" | "tui" | "ls" | "new" | "session" | "window" | "split" | "run" | "wait"
             | "send" | "capture" | "rewind" | "receipts" | "events" | "skill" | "status" | "hook"
             | "help" | "--help" | "-h" => {
@@ -112,6 +113,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "bridge" => cmd_bridge(tail),
         "server" => cmd_server(&opts, tail),
         "hosts" => cmd_hosts(&opts, tail),
+        "pair" => cmd_pair(&opts, tail),
         "doctor" => cmd_doctor(&opts, tail),
         "workspace" | "ws" => cmd_workspace(&opts, tail),
         "worktree" | "wt" => cmd_worktree(&opts, tail),
@@ -176,6 +178,10 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let sub = args.first().map(String::as_str).unwrap_or("status");
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
 
+    if sub == "alerts" {
+        return cmd_server_alerts(opts, rest);
+    }
+
     let mut socket = default_socket_path();
     let mut listen: Option<String> = None;
     let mut auth_token: Option<String> = None;
@@ -184,6 +190,14 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let mut no_restore = false;
     let mut no_resume = false;
     let mut regenerate = false;
+    let mut alert_webhook: Option<String> = None;
+    let mut alert_command: Option<String> = None;
+    let mut alert_states: Option<String> = None;
+    let mut qr_mode = false;
+    let mut uri_mode = false;
+    let mut pair_addr: Option<String> = None;
+    let mut pair_alias: Option<String> = None;
+    let mut no_qr = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -227,6 +241,43 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                 regenerate = true;
                 i += 1;
             }
+            "--alert-webhook" => {
+                let u = rest.get(i + 1).ok_or("--alert-webhook requires a URL")?;
+                alert_webhook = Some(u.clone());
+                i += 2;
+            }
+            "--alert-command" => {
+                let c = rest.get(i + 1).ok_or("--alert-command requires a command")?;
+                alert_command = Some(c.clone());
+                i += 2;
+            }
+            "--alert-states" => {
+                let s = rest.get(i + 1).ok_or("--alert-states requires states")?;
+                alert_states = Some(s.clone());
+                i += 2;
+            }
+            "--qr" => {
+                qr_mode = true;
+                i += 1;
+            }
+            "--uri" => {
+                uri_mode = true;
+                i += 1;
+            }
+            "--no-qr" => {
+                no_qr = true;
+                i += 1;
+            }
+            "--addr" => {
+                let a = rest.get(i + 1).ok_or("--addr requires host[:port]")?;
+                pair_addr = Some(a.clone());
+                i += 2;
+            }
+            "--alias" => {
+                let a = rest.get(i + 1).ok_or("--alias requires a name")?;
+                pair_alias = Some(a.clone());
+                i += 2;
+            }
             other => return Err(format!("unknown server option `{other}`")),
         }
     }
@@ -240,6 +291,9 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                 state_file,
                 no_restore,
                 no_resume,
+                alert_webhook,
+                alert_command,
+                alert_states,
             };
             server::run_with_options(&socket, run_opts).map_err(|e| e.to_string())?;
             Ok(0)
@@ -391,6 +445,14 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                             snap.blocks.len(),
                             snap.clients.len(),
                         );
+                        if let Some(ref addr) = snap.host.listen_addr {
+                            let auth = if snap.host.auth_enabled == Some(true) {
+                                "auth on"
+                            } else {
+                                "auth off"
+                            };
+                            println!("  tcp: {addr} ({auth})");
+                        }
                         if let Some(p) = persist {
                             let enabled = p.get("enabled").and_then(Value::as_bool).unwrap_or(false);
                             let ar = p.get("auto_resume").and_then(Value::as_bool).unwrap_or(false);
@@ -422,11 +484,66 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             let (token, created) = if regenerate {
                 let tok = generate_auth_token().map_err(|e| e.to_string())?;
                 write_token_file(&path, &tok).map_err(|e| e.to_string())?;
+                // Best-effort hot rotation if local daemon is already running.
+                if let Ok(c) = MuxClient::connect(
+                    &Target::Local { socket: socket.clone() },
+                    false,
+                    "cli",
+                    "server-token",
+                ) {
+                    let _ = c.server_set_token(Some(&tok));
+                }
                 (tok, true)
             } else {
                 load_or_create_token(&path).map_err(|e| e.to_string())?
             };
-            if opts.json {
+            if qr_mode || uri_mode || pair_addr.is_some() || pair_alias.is_some() {
+                let live_info = MuxClient::connect(
+                    &Target::Local { socket: socket.clone() },
+                    false,
+                    "cli",
+                    "server-token-qr",
+                )
+                .ok()
+                .map(|c| c.host.clone());
+                let hostname = live_info
+                    .as_ref()
+                    .map(|h| h.hostname.clone())
+                    .unwrap_or_else(local_hostname);
+                let running_listen = live_info.as_ref().and_then(|h| h.listen_addr.as_deref());
+                let (payload, ready) = crate::mux::pairing::build_local_pairing(
+                    &token,
+                    pair_addr.as_deref(),
+                    running_listen,
+                    pair_alias.as_deref(),
+                    &hostname,
+                );
+                let uri = payload.to_uri();
+                let qr = crate::mux::qr::QrCode::encode(uri.as_bytes()).map_err(|e| e.to_string())?;
+                if opts.json {
+                    print_json(&json!({
+                        "token": token,
+                        "path": path.to_string_lossy(),
+                        "created": created,
+                        "tcp_ready": ready,
+                        "pairing_uri": uri,
+                        "pairing": payload.to_json(),
+                        "qr_version": qr.version(),
+                        "qr_size": qr.size(),
+                    }));
+                } else if uri_mode && !qr_mode {
+                    println!("{uri}");
+                } else {
+                    println!("Pairing `{}` -> {}", payload.alias, payload.tcp_uri());
+                    if !ready {
+                        println!("  note: start/install TCP listener with `--listen tailscale` for phone access");
+                    }
+                    println!("  uri: {uri}");
+                    if !no_qr {
+                        print!("{}", qr.render_unicode(true));
+                    }
+                }
+            } else if opts.json {
                 print_json(&json!({
                     "token": token,
                     "path": path.to_string_lossy(),
@@ -459,6 +576,345 @@ fn cmd_server(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
         }
         other => Err(format!("unknown server subcommand `{other}`")),
     }
+}
+
+fn cmd_server_alerts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    let mut socket = default_socket_path();
+    let mut webhook: Option<Option<String>> = None;
+    let mut command: Option<Option<String>> = None;
+    let mut states: Option<Vec<String>> = None;
+    let mut cooldown_secs: Option<u64> = None;
+    let mut when_detached: Option<bool> = None;
+    let mut no_save = false;
+    let mut test = false;
+    let mut test_state: Option<String> = None;
+    let mut test_msg: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => {
+                let p = args.get(i + 1).ok_or("--socket requires a path")?;
+                socket = PathBuf::from(p);
+                i += 2;
+            }
+            "--webhook" => {
+                let u = args.get(i + 1).ok_or("--webhook requires a URL (or empty string to clear)")?;
+                webhook = Some(crate::server::alerts::normalize_webhook_url(u)?);
+                i += 2;
+            }
+            "--command" => {
+                let c = args.get(i + 1).ok_or("--command requires a command (or empty string to clear)")?;
+                let t = c.trim();
+                command = Some((!t.is_empty()).then(|| t.to_string()));
+                i += 2;
+            }
+            "--states" => {
+                let s = args.get(i + 1).ok_or("--states requires comma-separated states")?;
+                states = Some(crate::server::alerts::parse_alert_states(s)?);
+                i += 2;
+            }
+            "--cooldown" => {
+                let s = args.get(i + 1).ok_or("--cooldown requires seconds (0..=3600)")?;
+                let n: u64 = s.parse().map_err(|_| format!("invalid `--cooldown` `{s}`"))?;
+                if n > 3600 {
+                    return Err("--cooldown must be <= 3600 seconds".into());
+                }
+                cooldown_secs = Some(n);
+                i += 2;
+            }
+            "--when-detached" => {
+                let b = args.get(i + 1).ok_or("--when-detached requires true|false")?;
+                let parsed = match b.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    _ => return Err(format!("invalid boolean `{b}` for --when-detached")),
+                };
+                when_detached = Some(parsed);
+                i += 2;
+            }
+            "--no-save" => {
+                no_save = true;
+                i += 1;
+            }
+            "--test" => {
+                test = true;
+                i += 1;
+            }
+            "--state" => {
+                test_state = Some(args.get(i + 1).ok_or("--state requires a state")?.clone());
+                i += 2;
+            }
+            "--message" | "--msg" => {
+                test_msg = Some(args.get(i + 1).ok_or("--message requires text")?.clone());
+                i += 2;
+            }
+            other => return Err(format!("unknown alerts option `{other}`")),
+        }
+    }
+
+    let mut patch = serde_json::Map::new();
+    if let Some(ref w) = webhook {
+        patch.insert("webhook".into(), w.as_ref().map_or(Value::Null, |s| Value::String(s.clone())));
+        if !no_save {
+            crate::config::Config::update_default_key("server.alert_webhook", w.as_deref().unwrap_or(""))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(ref c) = command {
+        patch.insert("command".into(), c.as_ref().map_or(Value::Null, |s| Value::String(s.clone())));
+        if !no_save {
+            crate::config::Config::update_default_key("server.alert_command", c.as_deref().unwrap_or(""))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(ref s) = states {
+        let joined = if s.is_empty() { "none".to_string() } else { s.join(",") };
+        patch.insert("states".into(), Value::String(joined.clone()));
+        if !no_save {
+            crate::config::Config::update_default_key("server.alert_states", &joined)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(cd) = cooldown_secs {
+        patch.insert("cooldown_secs".into(), json!(cd));
+        if !no_save {
+            crate::config::Config::update_default_key("server.alert_cooldown_secs", &cd.to_string())
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(wd) = when_detached {
+        patch.insert("when_detached".into(), Value::Bool(wd));
+        if !no_save {
+            crate::config::Config::update_default_key("server.alert_when_detached", if wd { "true" } else { "false" })
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let target = if opts.server.is_some() {
+        target_for(opts)?
+    } else {
+        Target::Local { socket }
+    };
+    let live_client = MuxClient::connect(&target, false, "cli", "server-alerts").ok();
+
+    let live_cfg = if !patch.is_empty() {
+        if let Some(ref c) = live_client {
+            Some(c.server_alerts_set(Value::Object(patch)).map_err(|e| e.to_string())?)
+        } else {
+            None
+        }
+    } else if let Some(ref c) = live_client {
+        Some(c.server_alerts_get().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+
+    if test {
+        let c = live_client.ok_or_else(|| format!("server not running on {}", target.display_name()))?;
+        let res = c
+            .server_alerts_test(test_state.as_deref(), test_msg.as_deref())
+            .map_err(|e| e.to_string())?;
+        if opts.json {
+            print_json(&res);
+        } else {
+            let del = &res["delivery"];
+            println!(
+                "dispatched test `agent.alert` on {} (webhook={:?}, command={:?})",
+                target.display_name(),
+                del.get("webhook_ok").and_then(Value::as_bool),
+                del.get("command_ok").and_then(Value::as_bool),
+            );
+        }
+        return Ok(0);
+    }
+
+    let final_cfg = live_cfg.unwrap_or_else(|| {
+        crate::server::alerts::AlertConfig::from_server_config(&crate::config::Config::load_default().server)
+            .to_json()
+    });
+    if opts.json {
+        print_json(&final_cfg);
+    } else {
+        println!(
+            "alerts on {} ({}):",
+            target.display_name(),
+            if live_client.is_some() { "live daemon" } else { "saved config" }
+        );
+        println!(
+            "  webhook: {}",
+            final_cfg.get("webhook").and_then(Value::as_str).unwrap_or("(none)")
+        );
+        println!(
+            "  command: {}",
+            final_cfg.get("command").and_then(Value::as_str).unwrap_or("(none)")
+        );
+        let st_list = final_cfg
+            .get("states")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
+            .unwrap_or_default();
+        println!(
+            "  states: {} (cooldown {}s, when_detached={})",
+            st_list,
+            final_cfg.get("cooldown_secs").and_then(Value::as_u64).unwrap_or(30),
+            final_cfg.get("when_detached").and_then(Value::as_bool).unwrap_or(false),
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_pair(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    let mut host_arg: Option<String> = None;
+    let mut addr: Option<String> = None;
+    let mut alias_override: Option<String> = None;
+    let mut regenerate = false;
+    let mut no_qr = false;
+    let mut import_uri: Option<String> = None;
+    let mut socket = default_socket_path();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--import" => {
+                import_uri = Some(args.get(i + 1).ok_or("--import requires a tachyon://pair?... URI")?.clone());
+                i += 2;
+            }
+            "--addr" => {
+                addr = Some(args.get(i + 1).ok_or("--addr requires host[:port]")?.clone());
+                i += 2;
+            }
+            "--alias" => {
+                alias_override = Some(args.get(i + 1).ok_or("--alias requires a name")?.clone());
+                i += 2;
+            }
+            "--socket" => {
+                socket = PathBuf::from(args.get(i + 1).ok_or("--socket requires a path")?);
+                i += 2;
+            }
+            "--regenerate" => {
+                regenerate = true;
+                i += 1;
+            }
+            "--no-qr" => {
+                no_qr = true;
+                i += 1;
+            }
+            other if !other.starts_with('-') && host_arg.is_none() => {
+                host_arg = Some(other.to_string());
+                i += 1;
+            }
+            other => return Err(format!("unknown pair option `{other}`")),
+        }
+    }
+
+    if let Some(uri_raw) = import_uri {
+        let mut parsed = crate::mux::pairing::PairingPayload::from_uri(&uri_raw)?;
+        if let Some(a) = alias_override.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            parsed.alias = a.to_string();
+        }
+        let mut entry = parsed.to_host_entry();
+        let mut hosts = load_hosts();
+        if entry.color.is_none() {
+            entry.color = hosts.iter().find(|h| h.alias == entry.alias).and_then(|h| h.color.clone());
+        }
+        if let Some(existing) = hosts.iter_mut().find(|h| h.alias == entry.alias) {
+            *existing = entry.clone();
+        } else {
+            hosts.push(entry.clone());
+        }
+        save_hosts(&hosts).map_err(|e| e.to_string())?;
+        if opts.json {
+            print_json(&json!({
+                "imported": true,
+                "host": entry.to_json(),
+                "pairing": parsed.to_json(),
+            }));
+        } else {
+            println!("imported paired host `{}` -> {}", entry.alias, entry.uri);
+        }
+        return Ok(0);
+    }
+
+    let target_host = host_arg
+        .as_deref()
+        .or(opts.server.as_deref())
+        .unwrap_or("local");
+
+    let (payload, ready) = if target_host == "local" {
+        let token_path = default_token_path();
+        let (token, _) = if regenerate {
+            let tok = generate_auth_token().map_err(|e| e.to_string())?;
+            write_token_file(&token_path, &tok).map_err(|e| e.to_string())?;
+            if let Ok(c) = MuxClient::connect(&Target::Local { socket: socket.clone() }, false, "cli", "pair") {
+                let _ = c.server_set_token(Some(&tok));
+            }
+            (tok, true)
+        } else {
+            load_or_create_token(&token_path).map_err(|e| e.to_string())?
+        };
+        let live_info = MuxClient::connect(&Target::Local { socket }, false, "cli", "pair")
+            .ok()
+            .map(|c| c.host.clone());
+        let hostname = live_info
+            .as_ref()
+            .map(|h| h.hostname.clone())
+            .unwrap_or_else(local_hostname);
+        let running_listen = live_info.as_ref().and_then(|h| h.listen_addr.as_deref());
+        crate::mux::pairing::build_local_pairing(
+            &token,
+            addr.as_deref(),
+            running_listen,
+            alias_override.as_deref(),
+            &hostname,
+        )
+    } else {
+        let hosts = load_hosts();
+        let entry = hosts
+            .into_iter()
+            .find(|h| h.alias == target_host)
+            .ok_or_else(|| format!("unknown host `{target_host}` (check `tachyon hosts ls`)"))?;
+        let live_info = resolve_target(Some(&entry.alias), std::slice::from_ref(&entry))
+            .ok()
+            .and_then(|t| MuxClient::connect(&t, false, "cli", "pair").ok())
+            .map(|c| c.host.clone());
+        let mut p = crate::mux::pairing::build_remote_pairing(&entry, live_info.as_ref())?;
+        if let Some(a) = alias_override.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            p.alias = a.to_string();
+        }
+        if let Some(over_addr) = addr.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let (h, port) = crate::mux::pairing::parse_host_port(over_addr)?;
+            p.host = h;
+            p.port = port;
+        }
+        let ready = live_info
+            .as_ref()
+            .is_some_and(|i| i.listen_addr.is_some() || entry.uri.starts_with("tcp://"));
+        (p, ready)
+    };
+
+    let uri = payload.to_uri();
+    let qr = crate::mux::qr::QrCode::encode(uri.as_bytes()).map_err(|e| e.to_string())?;
+    if opts.json {
+        print_json(&json!({
+            "host": target_host,
+            "tcp_ready": ready,
+            "pairing_uri": uri,
+            "pairing": payload.to_json(),
+            "qr_version": qr.version(),
+            "qr_size": qr.size(),
+        }));
+    } else {
+        println!("Pair iPhone with `{}` ({})", payload.alias, payload.tcp_uri());
+        if !ready {
+            println!("  note: enable direct TCP on host (`tachyon server install-service --listen tailscale`)");
+        }
+        println!("  uri: {uri}");
+        if !no_qr {
+            print!("{}", qr.render_unicode(true));
+        }
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -503,8 +959,42 @@ fn cmd_hosts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "add" => {
-            let usage = "usage: tachyon hosts add <alias> <uri> [--bin PATH] [--token TOKEN] [--color COLOR]";
-            let alias = rest.first().ok_or(usage)?;
+            let usage = "usage: tachyon hosts add <alias> <uri> [--bin PATH] [--token TOKEN] [--color COLOR]\n       tachyon hosts add [alias] <tachyon://pair?...>";
+            let first = rest.first().ok_or(usage)?;
+            if first.starts_with("tachyon://pair?")
+                || rest.get(1).is_some_and(|u| u.starts_with("tachyon://pair?"))
+            {
+                let (alias_opt, pair_uri) = if first.starts_with("tachyon://pair?") {
+                    (None, first.as_str())
+                } else {
+                    (Some(first.as_str()), rest[1].as_str())
+                };
+                let mut parsed = crate::mux::pairing::PairingPayload::from_uri(pair_uri)?;
+                if let Some(a) = alias_opt {
+                    parsed.alias = a.to_string();
+                }
+                let mut entry = parsed.to_host_entry();
+                let mut hosts = load_hosts();
+                if entry.color.is_none() {
+                    entry.color = hosts
+                        .iter()
+                        .find(|h| h.alias == entry.alias)
+                        .and_then(|h| h.color.clone());
+                }
+                if let Some(existing) = hosts.iter_mut().find(|h| h.alias == entry.alias) {
+                    *existing = entry.clone();
+                } else {
+                    hosts.push(entry.clone());
+                }
+                save_hosts(&hosts).map_err(|e| e.to_string())?;
+                if opts.json {
+                    print_json(&entry.to_json());
+                } else {
+                    println!("saved host `{}` -> {}", entry.alias, entry.uri);
+                }
+                return Ok(0);
+            }
+            let alias = first;
             let uri = rest.get(1).ok_or(usage)?;
             let mut remote_bin = None;
             let mut token = None;
@@ -3227,17 +3717,25 @@ Usage:
 Server & Hosts:
   tachyon server run|start|stop|status      manage the persistent local server
     [--socket PATH] [--listen ADDR|tailscale] [--token TOK | --token-file PATH]
+    [--alert-webhook URL] [--alert-command CMD] [--alert-states S]
     [--state-file PATH] [--no-restore] [--no-resume]
   tachyon server snapshot                   flush live sessions & agents to state.json now
   tachyon server restore [--state-file P] [--no-resume]
                                             restore saved sessions into a running server
-  tachyon server token [--regenerate]       show or rotate the TCP bearer auth token
-  tachyon server install-service            install launchd (macOS), systemd (Linux), or Task (Windows)
+  tachyon server token [--regenerate] [--qr | --uri] [--addr HOST[:PORT]] [--alias NAME]
+                                            show, rotate, or render mobile QR/URI for TCP bearer auth
+  tachyon server alerts [--webhook URL] [--command CMD] [--states S] [--cooldown S] [--when-detached BOOL] [--test]
+                                            inspect, configure, or test away-from-desk alert hooks
+  tachyon pair [HOST] [--addr HOST[:PORT]] [--alias NAME] [--regenerate] [--no-qr] [--json]
+  tachyon pair --import <tachyon://pair?...>
+                                            generate iPhone pairing QR/URI or import a pairing link
+  tachyon server install-service [--listen ADDR|tailscale]
+                                            install launchd (macOS), systemd (Linux), or Task (Windows)
   tachyon server uninstall-service          remove the user service
   tachyon bridge                            stdio <-> local socket/pipe bridge (invoked over SSH)
   tachyon hosts ls                          list local & configured remote hosts
-  tachyon hosts add <alias> <uri> [--bin P] [--token T] [--color C]
-                                            save an ssh:// or direct tcp:// remote host
+  tachyon hosts add <alias> <uri> [--bin P] [--token T] [--color C] | <tachyon://pair?...>
+                                            save an ssh://, tcp://, or paired remote host
   tachyon hosts color <alias> <color|auto|none>
                                             set accent or danger colour for a saved host
   tachyon hosts remove <alias>              remove a saved host

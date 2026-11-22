@@ -178,6 +178,7 @@ pub struct HostInfo {
     pub build: Option<String>,
     pub capabilities: Vec<String>,
     pub auth_enabled: Option<bool>,
+    pub listen_addr: Option<String>,
 }
 
 impl HostInfo {
@@ -192,6 +193,7 @@ impl HostInfo {
             "build": self.build,
             "capabilities": self.capabilities,
             "auth_enabled": self.auth_enabled,
+            "listen_addr": self.listen_addr,
         })
     }
 
@@ -214,6 +216,10 @@ impl HostInfo {
                 })
                 .unwrap_or_default(),
             auth_enabled: v.get("auth_enabled").and_then(Value::as_bool),
+            listen_addr: v
+                .get("listen_addr")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 }
@@ -1457,6 +1463,7 @@ mod tests {
                 build: None,
                 capabilities: Vec::new(),
                 auth_enabled: None,
+                listen_addr: None,
             },
             sessions: vec![SessionInfo {
                 id: "s1".into(),
