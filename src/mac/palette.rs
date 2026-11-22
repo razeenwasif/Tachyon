@@ -26,19 +26,22 @@ use objc2_foundation::{
 
 use super::host_mgr::HostView;
 use super::{panes, with_window};
-use crate::config::{ChromeStyle, ThemePreset};
+use crate::config::{ChromeStyle, PaneStyle, ThemePreset};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     OpenCheatsheet,
     OpenAgents,
+    OpenWorkspaceSwitcher,
     OpenSettings,
     ToggleSidebar,
     SetAppearanceBundle {
         preset: ThemePreset,
         chrome: ChromeStyle,
         sidebar: Option<bool>,
+        pane_style: Option<PaneStyle>,
     },
+    SetPaneStyle(PaneStyle),
     NewTab,
     NewWindow,
     ClosePane,
@@ -90,6 +93,12 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Live cross-host coding-agent inbox (blocked, working & finished)".into(),
             shortcut: "⌘⇧A",
             action: PaletteAction::OpenAgents,
+        },
+        PaletteItem {
+            title: "Workspace Switcher".into(),
+            subtitle: "Switch live multi-host workspaces or launch saved JSON templates".into(),
+            shortcut: "⌘⇧W",
+            action: PaletteAction::OpenWorkspaceSwitcher,
         },
         PaletteItem {
             title: "Keyboard Cheatsheet".into(),
@@ -225,12 +234,13 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
         },
         PaletteItem {
             title: "Appearance: Herdr Dark Minimal".into(),
-            subtitle: "Neutral charcoal #101114 / #17191d, calm ANSI & sidebar".into(),
+            subtitle: "Neutral charcoal #0C0D0F / #111214, calm ANSI, sidebar & inset cards".into(),
             shortcut: "",
             action: PaletteAction::SetAppearanceBundle {
                 preset: ThemePreset::Obsidian,
                 chrome: ChromeStyle::Herdr,
                 sidebar: Some(true),
+                pane_style: Some(PaneStyle::Cards),
             },
         },
         PaletteItem {
@@ -241,6 +251,7 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
                 preset: ThemePreset::Obsidian,
                 chrome: ChromeStyle::Terminals,
                 sidebar: Some(false),
+                pane_style: Some(PaneStyle::Seamless),
             },
         },
         PaletteItem {
@@ -251,6 +262,7 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
                 preset: ThemePreset::Obsidian,
                 chrome: ChromeStyle::Core,
                 sidebar: Some(false),
+                pane_style: Some(PaneStyle::Seamless),
             },
         },
         PaletteItem {
@@ -261,7 +273,20 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
                 preset: ThemePreset::Default,
                 chrome: ChromeStyle::Glass,
                 sidebar: None,
+                pane_style: Some(PaneStyle::Seamless),
             },
+        },
+        PaletteItem {
+            title: "Pane Style: Inset Cards".into(),
+            subtitle: "Render split panes as rounded 10pt cards with focus outlines".into(),
+            shortcut: "",
+            action: PaletteAction::SetPaneStyle(PaneStyle::Cards),
+        },
+        PaletteItem {
+            title: "Pane Style: Seamless Splits".into(),
+            subtitle: "Edge-to-edge split panes with hairline dividers".into(),
+            shortcut: "",
+            action: PaletteAction::SetPaneStyle(PaneStyle::Seamless),
         },
         PaletteItem {
             title: "Copy Command Output".into(),
@@ -859,14 +884,19 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
             with_window(win_id, |w| w.open_agents_card());
             return;
         }
+        PaletteAction::OpenWorkspaceSwitcher => {
+            with_window(win_id, |w| w.open_workspaces_card());
+            return;
+        }
         PaletteAction::OpenSettings => {
             super::open_settings();
             return;
         }
         PaletteAction::ToggleSidebar => with_window(win_id, |w| w.toggle_sidebar()),
-        PaletteAction::SetAppearanceBundle { preset, chrome, sidebar } => {
-            super::apply_appearance_bundle(preset, chrome, sidebar);
+        PaletteAction::SetAppearanceBundle { preset, chrome, sidebar, pane_style } => {
+            super::apply_appearance_bundle(preset, chrome, sidebar, pane_style);
         }
+        PaletteAction::SetPaneStyle(style) => super::apply_interface_pane_style(style),
         PaletteAction::NewTab => super::open_tab(win_id),
         PaletteAction::NewWindow => super::open_window(),
         PaletteAction::ClosePane => super::close_active_tab(win_id),

@@ -80,16 +80,18 @@ window.padding_y = 6.0
 # window.start_fullscreen = false
 
 # macOS: window chrome & surface preset. glass (the default) uses translucent
-# Liquid Glass; herdr (neutral charcoal #101114 chrome / #17191d panes / 28pt
+# Liquid Glass; herdr (neutral charcoal #0C0D0F chrome / #111214 panes / 28pt
 # status strip), terminals (minimal top pill tabs), and core (zero decorative
 # chrome + dashed 1px dividers) give a crisp opaque dark minimal workspace.
 # window.chrome = glass
 
-# macOS: collapsible Rex-style multi-host sidebar (`⌘B` toggles at runtime)
-# and optional minimal per-pane header strip (`never` by default, or `auto`/`always`).
+# macOS: collapsible Rex-style multi-host sidebar (`⌘B` toggles at runtime),
+# optional minimal per-pane header strip (`never`, `auto`, or `always`), and
+# split-pane container style (`seamless` edge dividers or `cards` inset rounded cards).
 # window.sidebar       = true
 # window.sidebar_width = 240
 # window.pane_headers  = never
+# window.pane_style    = seamless
 
 # macOS: Liquid Glass's style. clear (the default) is less frosted and bends
 # more of what's behind at its edges; regular frosts it more and adapts its

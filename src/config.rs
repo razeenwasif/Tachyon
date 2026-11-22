@@ -132,7 +132,7 @@ pub enum ChromeStyle {
     /// Liquid Glass translucency (default on macOS).
     #[default]
     Glass,
-    /// Herdr-inspired dark clean minimal charcoal (`#101114` chrome, `#17191d` pane, `28pt` bottom status strip).
+    /// Herdr-inspired dark clean minimal charcoal (`#0C0D0F` chrome/canvas, `#111214` pane, `28pt` bottom status strip).
     Herdr,
     /// Minimal dark chrome (`#0C0D0F` top/track, `#111214` pane) with pill tabs and no sidebar clutter.
     Terminals,
@@ -152,6 +152,29 @@ impl ChromeStyle {
 
     pub const fn is_minimal(&self) -> bool {
         !matches!(self, Self::Glass)
+    }
+}
+
+/// Split-pane rendering style (`window.pane_style` in `tachyon.conf`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PaneStyle {
+    /// Edge-to-edge splits separated by hairline dividers (default).
+    #[default]
+    Seamless,
+    /// Rounded inset pane cards separated by canvas gaps and crisp 1px focus outlines.
+    Cards,
+}
+
+impl PaneStyle {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Seamless => "seamless",
+            Self::Cards => "cards",
+        }
+    }
+
+    pub const fn is_cards(&self) -> bool {
+        matches!(self, Self::Cards)
     }
 }
 
@@ -184,6 +207,8 @@ pub struct WindowConfig {
     pub start_fullscreen: bool,
     /// macOS: window chrome & surface preset (`glass`, `herdr`, `terminals`, `core`).
     pub chrome: ChromeStyle,
+    /// macOS: split-pane container rendering (`seamless` or `cards`).
+    pub pane_style: PaneStyle,
     /// macOS: a band along the bottom with shortcut hints.
     pub hints: bool,
     /// macOS: collapsible multi-host left sidebar (Rex style). Toggle with ⌘B.
@@ -221,6 +246,7 @@ impl Default for WindowConfig {
             notch_full_screen: false,
             start_fullscreen: false,
             chrome: ChromeStyle::Glass,
+            pane_style: PaneStyle::Seamless,
             hints: true,
             sidebar: cfg!(target_os = "macos"),
             sidebar_width: 240.0,
@@ -865,6 +891,13 @@ impl Config {
                     _ => return Err(format!("window.pane_headers: expected always, auto or never, got `{value}`")),
                 }
             }
+            "window.pane_style" => {
+                self.window.pane_style = match value.to_ascii_lowercase().as_str() {
+                    "seamless" | "edge" | "flat" => PaneStyle::Seamless,
+                    "cards" | "card" | "inset" => PaneStyle::Cards,
+                    _ => return Err(format!("window.pane_style: expected seamless or cards, got `{value}`")),
+                }
+            }
             "fairy.enabled" => self.macos.fairy = parse_bool(value)?,
             "fairy.socket" => self.macos.fairy_socket = value.to_string(),
             "editor" => self.macos.editor = value.to_string(),
@@ -1286,5 +1319,28 @@ mod contrast_tests {
 
         let bad = Config::parse("theme.preset = neon\nwindow.chrome = Acrylic98\nwindow.start_fullscreen = maybe\n");
         assert_eq!(bad.warnings.len(), 3);
+    }
+
+    #[test]
+    fn pane_style_parses_and_validates() {
+        let def = Config::default();
+        assert_eq!(def.window.pane_style, PaneStyle::Seamless);
+        assert!(!def.window.pane_style.is_cards());
+
+        let cards = Config::parse("window.pane_style = cards\n");
+        assert!(cards.warnings.is_empty());
+        assert_eq!(cards.window.pane_style, PaneStyle::Cards);
+        assert!(cards.window.pane_style.is_cards());
+
+        let inset = Config::parse("window.pane_style = inset\n");
+        assert!(inset.warnings.is_empty());
+        assert_eq!(inset.window.pane_style, PaneStyle::Cards);
+
+        let edge = Config::parse("window.pane_style = seamless\n");
+        assert!(edge.warnings.is_empty());
+        assert_eq!(edge.window.pane_style, PaneStyle::Seamless);
+
+        let bad = Config::parse("window.pane_style = floating\n");
+        assert_eq!(bad.warnings.len(), 1);
     }
 }

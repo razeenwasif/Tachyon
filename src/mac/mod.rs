@@ -48,6 +48,7 @@ mod sidebar;
 mod strip;
 mod suggest;
 mod sysmon;
+mod workspaces;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -87,7 +88,7 @@ use objc2_quartz_core::{
 };
 use parking_lot::Mutex;
 
-use crate::config::{Appearance, Backdrop, ChromeStyle, Config, Contrast, OptionAsMeta, PaneHeaders, ThemeConfig, ThemePreset};
+use crate::config::{Appearance, Backdrop, ChromeStyle, Config, Contrast, OptionAsMeta, PaneHeaders, PaneStyle, ThemeConfig, ThemePreset};
 use crate::term::jobs::JobRef;
 use crate::term::rewind::RewindLog;
 use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
@@ -543,6 +544,11 @@ define_class!(
         #[unsafe(method(tachyonAgents:))]
         fn toggle_agents(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), TermWindow::toggle_agents_card);
+        }
+
+        #[unsafe(method(tachyonWorkspaces:))]
+        fn toggle_workspaces(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_workspaces_card);
         }
 
         #[unsafe(method(tachyonMonitor:))]
@@ -2126,12 +2132,12 @@ impl Tab {
     /// Lay the panes out in a grid of `cols` by `rows`, resizing each whose
     /// size changed. When `header_rows > 0`, reserves that many top rows of
     /// each pane for its subtle header bar.
-    fn lay_out(&mut self, cols: usize, rows: usize, cell: (u32, u32), header_rows: usize) {
+    fn lay_out(&mut self, cols: usize, rows: usize, cell: (u32, u32), header_rows: usize, gap: (usize, usize)) {
         let area = panes::Rect { col: 0, row: 0, cols, rows };
         let (rects, dividers) = if self.zoomed {
             (vec![(self.pane().id, area)], Vec::new())
         } else {
-            self.layout.layout(area)
+            self.layout.layout_with_gap(area, gap.0, gap.1)
         };
         self.dividers = dividers;
         for (id, outer) in rects {
@@ -2336,6 +2342,7 @@ struct TermWindow {
     theme_light: ThemeConfig,
     theme_preset: ThemePreset,
     chrome_style: ChromeStyle,
+    pane_style: PaneStyle,
     appearance: Appearance,
     /// Use the high-contrast themes: always, never, or with Increase
     /// Contrast.
@@ -2413,6 +2420,8 @@ struct TermWindow {
     agents_button: Option<Retained<objc2_app_kit::NSButton>>,
     /// Floating Liquid Glass Command Palette (⌘⇧P).
     palette_card: Option<palette::PaletteCard>,
+    /// Floating Liquid Glass Workspace Switcher (⌘⇧W).
+    workspaces_card: Option<workspaces::WorkspacesCard>,
     /// The quick terminal: borderless, dropping from the screen's top, and
     /// whether it's showing; the app that was in front, to go back to.
     quick: bool,
@@ -2589,6 +2598,7 @@ impl TermWindow {
             .enumerate()
             .map(|(k, &p)| {
                 let rect = tab.panes[p].rect;
+                let card_top_rows = tab.panes[p].header_rect.map(|h| h.rows).unwrap_or(0);
                 let focused = p == tab.focus;
                 match (&self.rewound, focused) {
                     // An earlier screen: no selection, marks or cursor layer,
@@ -2597,6 +2607,7 @@ impl TermWindow {
                         term: &rw.term,
                         col: rect.col,
                         row: rect.row,
+                        card_top_rows,
                         focused: self.focused,
                         selection: None,
                         cursor_on_layer: false,
@@ -2607,11 +2618,12 @@ impl TermWindow {
                         term: &guards[k],
                         col: rect.col,
                         row: rect.row,
+                        card_top_rows,
                         focused: self.focused && (focused || broadcasting),
                         selection: selections[k],
                         cursor_on_layer: focused && blink,
                         decor: &decors[k],
-                        dim: self.focused && !focused && !broadcasting,
+                        dim: !self.pane_style.is_cards() && self.focused && !focused && !broadcasting,
                     },
                 }
             })
@@ -2719,15 +2731,25 @@ impl TermWindow {
         self.schedule_a11y_notify(true, false, false);
     }
 
-    /// A divider as a hairline down (or across) the middle of its cells, in
+    /// A divider as a hairline down (or across) the middle of its gap, in
     /// drawable pixels.
     fn divider_pixels(&self, d: &panes::Divider) -> [f32; 4] {
         let m = self.renderer.metrics();
         let (x, y) = self.renderer.pane_origin(d.rect.col, d.rect.row);
         let hair = (self.scale() as f32).round().max(1.0);
         match d.dir {
-            panes::Dir::Right => [(x + (m.width - hair) / 2.0).round(), y, hair, d.rect.rows as f32 * m.height],
-            panes::Dir::Down => [x, (y + (m.height - hair) / 2.0).round(), d.rect.cols as f32 * m.width, hair],
+            panes::Dir::Right => [
+                (x + (d.rect.cols as f32 * m.width - hair) / 2.0).round(),
+                y,
+                hair,
+                d.rect.rows as f32 * m.height,
+            ],
+            panes::Dir::Down => [
+                x,
+                (y + (d.rect.rows as f32 * m.height - hair) / 2.0).round(),
+                d.rect.cols as f32 * m.width,
+                hair,
+            ],
         }
     }
 
@@ -2847,6 +2869,9 @@ impl TermWindow {
         }
         if let Some(cap) = &self.capsule {
             cap.set_chrome(self.chrome_style);
+        }
+        if let Some(ws) = &self.workspaces_card {
+            ws.set_chrome(self.chrome_style);
         }
 
         if minimal {
@@ -3233,11 +3258,16 @@ impl TermWindow {
         self.window.makeFirstResponder(Some(&self.view));
     }
 
+    fn pane_gap(&self) -> (usize, usize) {
+        if self.pane_style.is_cards() { (2, 1) } else { (1, 1) }
+    }
+
     /// ⌘⌥ and an arrow: focus the pane on that side.
     fn move_focus(&mut self, dx: i32, dy: i32) {
+        let (col_gap, row_gap) = self.pane_gap();
         let tab = &self.tabs[self.active];
         let area = panes::Rect { col: 0, row: 0, cols: self.grid.0, rows: self.grid.1 };
-        let (rects, _) = tab.layout.layout(area);
+        let (rects, _) = tab.layout.layout_with_gap(area, col_gap, row_gap);
         let from = rects.iter().find(|r| r.0 == tab.pane().id).map(|r| r.1).unwrap_or(area);
         match panes::neighbor(&rects, from, dx, dy).and_then(|id| tab.index_of(id)) {
             Some(p) => self.focus_pane(p),
@@ -3629,6 +3659,7 @@ impl TermWindow {
         self.close_cheatsheet();
         self.close_agents_card();
         self.close_palette();
+        self.close_workspaces_card();
         if self.monitor_card.is_none() {
             self.monitor_card = Some(MonitorCard::new(mtm, &self.view));
         }
@@ -3763,6 +3794,7 @@ impl TermWindow {
         let Some(mtm) = MainThreadMarker::new() else { return };
         self.close_palette();
         self.close_agents_card();
+        self.close_workspaces_card();
         if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_fairy();
         }
@@ -3904,6 +3936,7 @@ impl TermWindow {
         let Some(mtm) = MainThreadMarker::new() else { return };
         self.close_palette();
         self.close_cheatsheet();
+        self.close_workspaces_card();
         if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_fairy();
         }
@@ -3971,6 +4004,7 @@ impl TermWindow {
         }
         self.close_cheatsheet();
         self.close_agents_card();
+        self.close_workspaces_card();
         if self.palette_card.is_none() {
             self.palette_card = Some(palette::PaletteCard::new(mtm, &self.view, self.id));
         }
@@ -3980,6 +4014,78 @@ impl TermWindow {
             card.place(self.view.bounds().size, self.title_bar_height());
             card.host.setHidden(false);
             self.window.makeFirstResponder(Some(&card.search));
+        }
+    }
+
+    fn place_workspaces_card(&self) {
+        if let Some(card) = &self.workspaces_card {
+            card.place(self.view.bounds().size, self.title_bar_height());
+        }
+    }
+
+    fn close_workspaces_card(&mut self) {
+        if let Some(card) = &self.workspaces_card {
+            if !card.host.isHidden() {
+                card.host.setHidden(true);
+            }
+        }
+    }
+
+    fn refresh_workspaces_card(&self) {
+        if let Some(card) = &self.workspaces_card {
+            if !card.host.isHidden() {
+                let hosts = mux_host_views();
+                let active = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.mux_target.as_ref().map(|(h, _, w)| (h.clone(), w.clone())));
+                card.refresh(&hosts, &self.host_colors, active.as_ref(), false);
+            }
+        }
+    }
+
+    fn open_workspaces_card(&mut self) {
+        if self.quick {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        self.close_palette();
+        self.close_cheatsheet();
+        self.close_agents_card();
+        if self.fairy_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_fairy();
+        }
+        if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_monitor();
+        }
+        if self.neutrino_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.toggle_neutrino();
+        }
+        if self.workspaces_card.is_none() {
+            let card = workspaces::WorkspacesCard::new(mtm, &self.view, self.id);
+            card.set_chrome(self.chrome_style);
+            self.workspaces_card = Some(card);
+        }
+        let hosts = mux_host_views();
+        let active = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.mux_target.as_ref().map(|(h, _, w)| (h.clone(), w.clone())));
+        if let Some(card) = &self.workspaces_card {
+            card.set_chrome(self.chrome_style);
+            card.refresh(&hosts, &self.host_colors, active.as_ref(), true);
+            card.place(self.view.bounds().size, self.title_bar_height());
+            card.host.setHidden(false);
+            self.window.makeFirstResponder(Some(&card.search));
+        }
+    }
+
+    fn toggle_workspaces_card(&mut self) {
+        if self.workspaces_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.close_workspaces_card();
+            self.focus_terminal();
+        } else {
+            self.open_workspaces_card();
         }
     }
 
@@ -4034,6 +4140,7 @@ impl TermWindow {
         self.close_cheatsheet();
         self.close_agents_card();
         self.close_palette();
+        self.close_workspaces_card();
         if self.monitor_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.toggle_monitor();
         }
@@ -4149,6 +4256,7 @@ impl TermWindow {
         self.close_cheatsheet();
         self.close_agents_card();
         self.close_palette();
+        self.close_workspaces_card();
         if self.fairy_card.is_none() {
             self.fairy_card = Some(FairyCard::new(mtm, &self.view));
         }
@@ -4435,11 +4543,12 @@ impl TermWindow {
         let (fx, fy) = self.grid_point(event);
         let ratio = panes::ratio_at(&d, fx.max(0.0) as usize, fy.max(0.0) as usize);
         let header_rows = self.pane_header_rows(&self.tabs[self.active]);
+        let gap = self.pane_gap();
         let tab = &mut self.tabs[self.active];
         let before = tab.dividers.clone();
         tab.layout.set_ratio(&d.path, ratio);
         let (cols, rows) = self.grid;
-        tab.lay_out(cols, rows, cell_pixels(&self.renderer), header_rows);
+        tab.lay_out(cols, rows, cell_pixels(&self.renderer), header_rows, gap);
         if let Some((host, _, wid)) = tab.mux_target.clone() {
             let path = d.path.clone();
             if let Some(client) = mux_client(&host) {
@@ -4726,6 +4835,7 @@ impl TermWindow {
         self.place_cheatsheet();
         self.place_agents();
         self.place_palette();
+        self.place_workspaces_card();
         let grid = self.renderer.grid_size_for(w, h);
         if grid != self.grid {
             crate::log!("window {}: grid {}x{} -> {}x{}", self.id, self.grid.0, self.grid.1, grid.0, grid.1);
@@ -4736,6 +4846,7 @@ impl TermWindow {
         let pane_headers_mode = self.pane_headers_mode;
         let quick = self.quick;
         let sb_shown = self.sidebar_shown();
+        let gap = self.pane_gap();
         for tab in &mut self.tabs {
             let hdr = if quick {
                 0
@@ -4749,7 +4860,7 @@ impl TermWindow {
                     }
                 }
             };
-            tab.lay_out(grid.0, grid.1, cell, hdr);
+            tab.lay_out(grid.0, grid.1, cell, hdr, gap);
         }
         self.place_pane_headers();
         self.sync_sidebar();
@@ -5125,6 +5236,11 @@ impl TermWindow {
             }
             if self.agents_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
                 self.close_agents_card();
+                self.focus_terminal();
+                return false;
+            }
+            if self.workspaces_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+                self.close_workspaces_card();
                 self.focus_terminal();
                 return false;
             }
@@ -5533,6 +5649,10 @@ impl TermWindow {
         }
         if self.agents_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
             self.close_agents_card();
+            self.focus_terminal();
+        }
+        if self.workspaces_card.as_ref().is_some_and(|c| !c.host.isHidden()) {
+            self.close_workspaces_card();
             self.focus_terminal();
         }
         // Rewound: Option-click tells where a cell came from; other clicks
@@ -6595,6 +6715,7 @@ impl App {
             theme_light: cfg.theme_light.clone(),
             theme_preset: cfg.theme_preset,
             chrome_style: cfg.window.chrome,
+            pane_style: cfg.window.pane_style,
             appearance: cfg.appearance,
             contrast: cfg.contrast,
             glass,
@@ -6639,6 +6760,7 @@ impl App {
             agents_card: None,
             agents_button: None,
             palette_card: None,
+            workspaces_card: None,
             quick: false,
             quick_shown: false,
             quick_inset: 0.0,
@@ -6727,8 +6849,9 @@ impl App {
         let mut layout = tab.layout.clone();
         let from_id = from.id;
         layout.split(from_id, NEW, dir);
+        let (col_gap, row_gap) = w.pane_gap();
         let area = panes::Rect { col: 0, row: 0, cols: w.grid.0, rows: w.grid.1 };
-        let rect = layout.layout(area).0.into_iter().find(|r| r.0 == NEW).map(|r| r.1).unwrap_or_default();
+        let rect = layout.layout_with_gap(area, col_gap, row_gap).0.into_iter().find(|r| r.0 == NEW).map(|r| r.1).unwrap_or_default();
         if rect.cols < 2 || rect.rows < 1 {
             // No room for another pane.
             objc2_app_kit::NSBeep();
@@ -7179,8 +7302,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     file.addItem(&NSMenuItem::separatorItem(mtm));
     item(&file, "Close", sel!(tachyonCloseTab:), "w");
-    // A capital letter means Shift as well: ⌘⇧W.
-    item(&file, "Close Window", sel!(performClose:), "W");
+    item(&file, "Close Window", sel!(performClose:), "w")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     submenu(&main, &file);
 
     let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns("Edit"));
@@ -7209,6 +7332,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     item(&view, "Toggle Sidebar", sel!(tachyonToggleSidebar:), "b");
     item(&view, "Command Palette…", sel!(tachyonPalette:), "P");
     item(&view, "Agent Mission Control", sel!(tachyonAgents:), "A");
+    item(&view, "Workspace Switcher", sel!(tachyonWorkspaces:), "W");
     item(&view, "Keyboard Cheatsheet", sel!(tachyonCheatsheet:), "/");
     item(&view, "Show Title Bar", sel!(tachyonTitleBar:), "");
     item(&view, "Full Screen Around the Notch", sel!(tachyonNotch:), "f")
@@ -7919,6 +8043,7 @@ fn sync_all_sidebars() {
             w.sync_sidebar();
             w.sync_pane_headers();
             w.refresh_agents_ui();
+            w.refresh_workspaces_card();
             w.request_redraw();
         }
     });
@@ -8038,17 +8163,40 @@ pub(super) fn apply_interface_chrome(style: ChromeStyle) {
     });
 }
 
-pub(super) fn apply_appearance_bundle(preset: ThemePreset, chrome: ChromeStyle, sidebar: Option<bool>) {
+pub(super) fn apply_interface_pane_style(style: PaneStyle) {
+    let _ = Config::update_default_key("window.pane_style", style.as_str());
+    with_app(|app| {
+        app.cfg.window.pane_style = style;
+        for w in &mut app.windows {
+            w.pane_style = style;
+            w.renderer.set_pane_style(style);
+            w.layout();
+        }
+    });
+}
+
+pub(super) fn apply_appearance_bundle(
+    preset: ThemePreset,
+    chrome: ChromeStyle,
+    sidebar: Option<bool>,
+    pane_style: Option<PaneStyle>,
+) {
     let _ = Config::update_default_key("theme.preset", preset.as_str());
     let _ = Config::update_default_key("window.chrome", chrome.as_str());
     if let Some(sb) = sidebar {
         let _ = Config::update_default_key("window.sidebar", if sb { "true" } else { "false" });
+    }
+    if let Some(ps) = pane_style {
+        let _ = Config::update_default_key("window.pane_style", ps.as_str());
     }
     with_app(|app| {
         app.cfg.theme_preset = preset;
         app.cfg.window.chrome = chrome;
         if let Some(sb) = sidebar {
             app.cfg.window.sidebar = sb;
+        }
+        if let Some(ps) = pane_style {
+            app.cfg.window.pane_style = ps;
         }
         let dark_theme = match preset {
             ThemePreset::Default => app
@@ -8070,6 +8218,10 @@ pub(super) fn apply_appearance_bundle(preset: ThemePreset, chrome: ChromeStyle, 
                 if !w.quick && w.sidebar.is_some() {
                     w.sidebar_open = sb;
                 }
+            }
+            if let Some(ps) = pane_style {
+                w.pane_style = ps;
+                w.renderer.set_pane_style(ps);
             }
             w.apply_appearance();
             w.layout();

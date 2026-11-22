@@ -31,13 +31,13 @@ use objc2_foundation::{
 
 use super::host_mgr::HostStatus;
 use super::machines;
-use crate::config::{ChromeStyle, Config, PaneHeaders, ThemePreset};
+use crate::config::{ChromeStyle, Config, PaneHeaders, PaneStyle, ThemePreset};
 use crate::integrations;
 use crate::mux::default_socket_path;
 use crate::server;
 
 const WIN_W: f64 = 690.0;
-const WIN_H: f64 = 524.0;
+const WIN_H: f64 = 560.0;
 const RAIL_W: f64 = 186.0;
 const NAV_ROW_H: f64 = 32.0;
 
@@ -582,6 +582,21 @@ define_class!(
             };
             super::apply_interface_chrome(style);
             self.set_note(&format!("Saved `window.chrome = {}`.", style.as_str()));
+            refresh_if_open();
+        }
+
+        #[unsafe(method(changePaneStyle:))]
+        fn change_pane_style(&self, sender: Option<&AnyObject>) {
+            let idx = sender
+                .and_then(|s| s.downcast_ref::<NSPopUpButton>())
+                .map(|p| p.indexOfSelectedItem())
+                .unwrap_or(0);
+            let style = match idx {
+                1 => PaneStyle::Cards,
+                _ => PaneStyle::Seamless,
+            };
+            super::apply_interface_pane_style(style);
+            self.set_note(&format!("Saved `window.pane_style = {}`.", style.as_str()));
             refresh_if_open();
         }
 
@@ -1154,10 +1169,10 @@ impl SettingsWindow {
         let target: &AnyObject = self.actions.as_ref();
         let cfg = Config::load_default();
         let row_h = 43.0;
-        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 402.0)));
+        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 445.0)));
 
-        // Theme Preset popup (row 0) & Chrome Style popup (row 1).
-        let popups: [(&str, &str, &[&str], isize, objc2::runtime::Sel); 2] = [
+        // Theme Preset (row 0), Chrome Style (row 1), and Pane Style (row 2).
+        let popups: [(&str, &str, &[&str], isize, objc2::runtime::Sel); 3] = [
             (
                 "Theme Preset",
                 "Dark colour palette (obsidian matches Herdr's low-glare charcoal)",
@@ -1179,6 +1194,16 @@ impl SettingsWindow {
                     ChromeStyle::Core => 3,
                 },
                 sel!(changeChromeStyle:),
+            ),
+            (
+                "Pane Style",
+                "Split pane geometry: edge-to-edge dividers or rounded inset cards (`window.pane_style`)",
+                &["Seamless Splits", "Inset Cards"],
+                match cfg.window.pane_style {
+                    PaneStyle::Seamless => 0,
+                    PaneStyle::Cards => 1,
+                },
+                sel!(changePaneStyle:),
             ),
         ];
 
@@ -1216,7 +1241,7 @@ impl SettingsWindow {
         ];
 
         for (i, (title, sub, val, action)) in rows.iter().enumerate() {
-            let ry = 12.0 + (i + 2) as f64 * row_h;
+            let ry = 12.0 + (i + 3) as f64 * row_h;
             let t = label(mtm, title, 12.5, true, &NSColor::labelColor());
             t.setFrame(NSRect::new(NSPoint::new(14.0, ry), NSSize::new(w - 86.0, 16.0)));
             let d = label(mtm, sub, 11.0, false, &NSColor::secondaryLabelColor());
@@ -1228,8 +1253,8 @@ impl SettingsWindow {
             card.addSubview(&sw);
         }
 
-        // Pane headers mode popup (row 8).
-        let ry = 12.0 + 8.0 * row_h;
+        // Pane headers mode popup (row 9).
+        let ry = 12.0 + 9.0 * row_h;
         let pt = label(mtm, "Per-Pane Header Bars", 12.5, true, &NSColor::labelColor());
         pt.setFrame(NSRect::new(NSPoint::new(14.0, ry), NSSize::new(w - 160.0, 16.0)));
         let pd = label(mtm, "Optional title, OSC 7501 status pill & host badge (off by default)", 11.0, false, &NSColor::secondaryLabelColor());
@@ -1256,7 +1281,7 @@ impl SettingsWindow {
         card.addSubview(&popup);
 
         self.detail.addSubview(&card);
-        *y += 418.0;
+        *y += 461.0;
     }
 
     fn build_notifications(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {

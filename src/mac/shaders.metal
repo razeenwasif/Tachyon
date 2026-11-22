@@ -155,3 +155,53 @@ fragment float4 fs_image(ImageOut in [[stage_in]],
     constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);
     return tex.sample(s, in.uv);
 }
+
+// ---- rounded inset pane cards (SDF fill + crisp 1px border) -----------------
+
+struct CardInstance {
+    float4 rect;         // x, y, w, h in pixels
+    float4 fill_color;   // straight sRGB
+    float4 border_color; // straight sRGB
+    float4 params;       // x = corner_radius_px, y = border_width_px
+};
+
+struct CardOut {
+    float4 pos [[position]];
+    float2 local;
+    float2 half_size;
+    float  radius;
+    float  border_w;
+    float4 fill;
+    float4 border;
+};
+
+vertex CardOut vs_card(uint vid [[vertex_id]],
+                       uint iid [[instance_id]],
+                       const device CardInstance* cards [[buffer(0)]],
+                       constant Globals& g [[buffer(1)]]) {
+    CardInstance c = cards[iid];
+    float2 half_size = c.rect.zw * 0.5;
+    float2 px = (c.rect.xy - 1.0) + corner(vid) * (c.rect.zw + 2.0);
+    CardOut o;
+    o.pos = to_clip(px, g.viewport);
+    o.local = px - (c.rect.xy + half_size);
+    o.half_size = half_size;
+    o.radius = min(c.params.x, min(half_size.x, half_size.y));
+    o.border_w = c.params.y;
+    o.fill = float4(srgb_to_linear(c.fill_color.rgb), c.fill_color.a);
+    o.border = float4(srgb_to_linear(c.border_color.rgb), c.border_color.a);
+    return o;
+}
+
+fragment float4 fs_card(CardOut in [[stage_in]]) {
+    float2 q = abs(in.local) - (in.half_size - in.radius);
+    float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - in.radius;
+    float outer = 1.0 - smoothstep(-0.5, 0.5, dist);
+    float inner = 1.0 - smoothstep(-0.5, 0.5, dist + in.border_w);
+    float ring = saturate(outer - inner);
+    float fill_a = in.fill.a * inner;
+    float border_a = in.border.a * ring;
+    float3 rgb = in.fill.rgb * fill_a + in.border.rgb * border_a;
+    float a = saturate(fill_a + border_a);
+    return float4(rgb, a);
+}
