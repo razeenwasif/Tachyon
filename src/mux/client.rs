@@ -22,10 +22,99 @@ use base64::Engine;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use super::model::{BlockInfo, HostInfo, ServerSnapshot, SessionInfo, SplitDir, WindowInfo};
+use super::model::{
+    status_from_json, status_to_json, BlockInfo, HostInfo, ServerSnapshot, SessionInfo, SplitDir,
+    WindowInfo,
+};
 use super::proto::{self, Frame, FrameKind, PROTOCOL_VERSION};
 use super::transport::{self, ChildGuard, Transport};
 use super::Target;
+use crate::term::ProgramStatus;
+
+/// Handoff specification instructing a helper block to report completion or
+/// attention transitions back into a parent block as sanitized `<tachyon ...>` XML.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffSpec {
+    pub report_to: String,
+    pub from: Option<String>,
+    pub notify_on: Vec<String>,
+    pub capture_lines: Option<usize>,
+    pub send_enter: bool,
+}
+
+impl HandoffSpec {
+    pub fn to_json(&self) -> Value {
+        let mut obj = json!({
+            "report_to": self.report_to,
+            "send_enter": self.send_enter,
+        });
+        if let Some(ref f) = self.from {
+            obj["from"] = json!(f);
+        }
+        if !self.notify_on.is_empty() {
+            obj["notify_on"] = json!(self.notify_on);
+        }
+        if let Some(n) = self.capture_lines {
+            obj["capture_lines"] = json!(n);
+        }
+        obj
+    }
+}
+
+/// Outcome returned by `MuxClient::wait_block_until` / `block.wait` RPC.
+#[derive(Clone, Debug)]
+pub struct WaitOutcome {
+    pub block_id: String,
+    pub matched: String,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+    pub status: Option<ProgramStatus>,
+    pub status_inferred: bool,
+}
+
+impl WaitOutcome {
+    pub fn from_json(v: &Value) -> Self {
+        let exit_code = v
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .map(|c| c as i32);
+        let exited = v
+            .get("exited")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| exit_code.is_some());
+        let matched = v
+            .get("matched")
+            .and_then(Value::as_str)
+            .unwrap_or(if exited { "exit" } else { "done" })
+            .to_string();
+        Self {
+            block_id: v
+                .get("block_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            matched,
+            exited,
+            exit_code,
+            status: v.get("status").and_then(status_from_json),
+            status_inferred: v
+                .get("status_inferred")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "block_id": self.block_id,
+            "matched": self.matched,
+            "exited": self.exited,
+            "exit_code": self.exit_code,
+            "status": self.status.as_ref().map(status_to_json),
+            "status_inferred": self.status_inferred,
+        })
+    }
+}
 
 /// Incoming event on an attached block stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +415,20 @@ impl MuxClient {
         cols: u16,
         rows: u16,
     ) -> io::Result<(SessionInfo, WindowInfo, BlockInfo)> {
+        self.create_session_with_handoff(name, cwd, cmd, label, cols, rows, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_handoff(
+        &self,
+        name: Option<&str>,
+        cwd: Option<&str>,
+        cmd: Option<&[String]>,
+        label: Option<&str>,
+        cols: u16,
+        rows: u16,
+        handoff: Option<&HandoffSpec>,
+    ) -> io::Result<(SessionInfo, WindowInfo, BlockInfo)> {
         let mut req = json!({
             "op": "session.create",
             "cols": cols,
@@ -342,6 +445,9 @@ impl MuxClient {
         }
         if let Some(l) = label {
             req["label"] = json!(l);
+        }
+        if let Some(h) = handoff {
+            req["handoff"] = h.to_json();
         }
         let data = self.rpc(req)?;
         let session = SessionInfo::from_json(data.get("session").unwrap_or(&Value::Null))
@@ -379,6 +485,21 @@ impl MuxClient {
         cols: u16,
         rows: u16,
     ) -> io::Result<(WindowInfo, BlockInfo)> {
+        self.create_window_with_handoff(session_id, name, cwd, cmd, label, cols, rows, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_window_with_handoff(
+        &self,
+        session_id: &str,
+        name: Option<&str>,
+        cwd: Option<&str>,
+        cmd: Option<&[String]>,
+        label: Option<&str>,
+        cols: u16,
+        rows: u16,
+        handoff: Option<&HandoffSpec>,
+    ) -> io::Result<(WindowInfo, BlockInfo)> {
         let mut req = json!({
             "op": "window.create",
             "session_id": session_id,
@@ -396,6 +517,9 @@ impl MuxClient {
         }
         if let Some(l) = label {
             req["label"] = json!(l);
+        }
+        if let Some(h) = handoff {
+            req["handoff"] = h.to_json();
         }
         let data = self.rpc(req)?;
         let window = WindowInfo::from_json(data.get("window").unwrap_or(&Value::Null))
@@ -455,6 +579,21 @@ impl MuxClient {
         cols: u16,
         rows: u16,
     ) -> io::Result<(WindowInfo, BlockInfo)> {
+        self.split_block_with_handoff(target_block, dir, cwd, cmd, label, cols, rows, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_block_with_handoff(
+        &self,
+        target_block: &str,
+        dir: SplitDir,
+        cwd: Option<&str>,
+        cmd: Option<&[String]>,
+        label: Option<&str>,
+        cols: u16,
+        rows: u16,
+        handoff: Option<&HandoffSpec>,
+    ) -> io::Result<(WindowInfo, BlockInfo)> {
         let mut req = json!({
             "op": "block.split",
             "block_id": target_block,
@@ -471,12 +610,22 @@ impl MuxClient {
         if let Some(l) = label {
             req["label"] = json!(l);
         }
+        if let Some(h) = handoff {
+            req["handoff"] = h.to_json();
+        }
         let data = self.rpc(req)?;
         let window = WindowInfo::from_json(data.get("window").unwrap_or(&Value::Null))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing window"))?;
         let block = BlockInfo::from_json(data.get("block").unwrap_or(&Value::Null))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing block"))?;
         Ok((window, block))
+    }
+
+    pub fn set_block_handoff(&self, block_id: &str, spec: &HandoffSpec) -> io::Result<Value> {
+        let mut req = spec.to_json();
+        req["op"] = json!("block.set_handoff");
+        req["block_id"] = json!(block_id);
+        self.rpc(req)
     }
 
     pub fn kill_block(&self, block_id: &str) -> io::Result<()> {
@@ -520,15 +669,30 @@ impl MuxClient {
 
     /// Block until `block_id` exits (or optional `timeout_ms` elapses) and return its exit code.
     pub fn wait_block(&self, block_id: &str, timeout_ms: Option<u64>) -> io::Result<i32> {
+        let out = self.wait_block_until(block_id, &["exit"], timeout_ms, false)?;
+        Ok(out.exit_code.unwrap_or(0))
+    }
+
+    /// Block until `block_id` satisfies any condition in `until` (`exit`, `blocked`,
+    /// `done`, `error`, `idle`, `working`), or `timeout_ms` elapses.
+    pub fn wait_block_until(
+        &self,
+        block_id: &str,
+        until: &[&str],
+        timeout_ms: Option<u64>,
+        after_change: bool,
+    ) -> io::Result<WaitOutcome> {
         let mut req = json!({
             "op": "block.wait",
             "block_id": block_id,
+            "until": until,
+            "after_change": after_change,
         });
         if let Some(ms) = timeout_ms {
             req["timeout_ms"] = json!(ms);
         }
         let data = self.rpc(req)?;
-        Ok(data.get("exit_code").and_then(Value::as_i64).unwrap_or(0) as i32)
+        Ok(WaitOutcome::from_json(&data))
     }
 
     /// List server-side Rewind frames for `block_id` as `(seq, age_ms)` oldest first.

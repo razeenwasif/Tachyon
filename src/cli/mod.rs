@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::mux::client::MuxClient;
+use crate::mux::client::{HandoffSpec, MuxClient};
 use crate::mux::model::{HostColor, HostEntry, SplitDir};
 use crate::mux::{
     default_local_uri, default_socket_path, default_token_path, generate_auth_token, load_hosts,
@@ -40,9 +40,9 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 continue;
             }
             "server" | "bridge" | "hosts" | "workspace" | "ws" | "worktree" | "wt" | "agents"
-            | "agent" | "ls" | "new" | "session" | "window" | "split" | "run" | "send"
-            | "capture" | "rewind" | "events" | "skill" | "status" | "hook" | "help"
-            | "--help" | "-h" => {
+            | "agent" | "ls" | "new" | "session" | "window" | "split" | "run" | "wait"
+            | "send" | "capture" | "rewind" | "events" | "skill" | "status" | "hook"
+            | "help" | "--help" | "-h" => {
                 return true;
             }
             _ => return false,
@@ -119,6 +119,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "window" => cmd_window(&opts, tail),
         "split" => cmd_split(&opts, tail),
         "run" => cmd_run(&opts, tail),
+        "wait" => cmd_wait(&opts, tail),
         "send" => cmd_send(&opts, tail),
         "capture" => cmd_capture(&opts, tail),
         "rewind" => cmd_rewind(&opts, tail),
@@ -1025,6 +1026,25 @@ fn cmd_split(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+fn parse_condition_list(raw: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let cond = crate::server::state::WaitCondition::parse(trimmed).ok_or_else(|| {
+            format!(
+                "invalid condition `{trimmed}` (expected exit|blocked|done|error|idle|working)"
+            )
+        })?;
+        let canon = cond.as_str().to_string();
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    Ok(())
+}
+
 fn cmd_run(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let mut session: Option<String> = None;
     let mut split: Option<SplitDir> = None;
@@ -1032,8 +1052,13 @@ fn cmd_run(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let mut cwd: Option<String> = None;
     let mut label: Option<String> = None;
     let mut wait = false;
+    let mut bg = false;
     let mut capture = false;
     let mut timeout_ms: Option<u64> = None;
+    let mut report_to: Option<String> = None;
+    let mut report_on: Vec<String> = Vec::new();
+    let mut report_lines: Option<usize> = None;
+    let mut send_enter = true;
     let mut cols: u16 = 120;
     let mut rows: u16 = 32;
     let mut cmd: Vec<String> = Vec::new();
@@ -1062,6 +1087,10 @@ fn cmd_run(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                 wait = true;
                 i += 1;
             }
+            "--bg" | "--background" => {
+                bg = true;
+                i += 1;
+            }
             "--capture" => {
                 capture = true;
                 i += 1;
@@ -1074,6 +1103,34 @@ fn cmd_run(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
                         .map_err(|_| "bad --timeout")?,
                 );
                 i += 2;
+            }
+            "--report-to" => {
+                report_to = Some(
+                    args.get(i + 1)
+                        .ok_or("--report-to requires a block ID or `self`")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--report-on" => {
+                let val = args
+                    .get(i + 1)
+                    .ok_or("--report-on requires states (e.g. exit,blocked,done,error)")?;
+                parse_condition_list(val, &mut report_on)?;
+                i += 2;
+            }
+            "--report-lines" => {
+                let n: usize = args
+                    .get(i + 1)
+                    .ok_or("--report-lines requires a line count")?
+                    .parse()
+                    .map_err(|_| "bad --report-lines")?;
+                report_lines = Some(n);
+                i += 2;
+            }
+            "--no-enter" => {
+                send_enter = false;
+                i += 1;
             }
             "--cwd" => {
                 cwd = Some(args.get(i + 1).ok_or("--cwd requires a path")?.clone());
@@ -1100,15 +1157,54 @@ fn cmd_run(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     }
 
     if cmd.is_empty() {
-        return Err("usage: tachyon run [--wait] [--split right|down] -- <command...>".into());
+        return Err(
+            "usage: tachyon run [--wait | --bg] [--report-to B|self] [--split right|down] -- <command...>"
+                .into(),
+        );
     }
+    if bg && wait {
+        return Err("`--bg` and `--wait` cannot be combined".into());
+    }
+    if !report_on.is_empty() && report_to.is_none() {
+        return Err("`--report-on` requires `--report-to <block_id|self>`".into());
+    }
+
+    let handoff = match report_to {
+        Some(raw) => {
+            let resolved = if raw.eq_ignore_ascii_case("self") {
+                std::env::var("TACHYON_BLOCK")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .ok_or("`--report-to self` requires `$TACHYON_BLOCK` to be set (pass an explicit block ID)")?
+            } else {
+                raw
+            };
+            Some(HandoffSpec {
+                report_to: resolved,
+                from: label.clone(),
+                notify_on: report_on,
+                capture_lines: report_lines,
+                send_enter,
+            })
+        }
+        None => None,
+    };
 
     let (_, c) = connect(opts, true)?;
 
     let blk = if let Some(dir) = split {
         let target_block = resolve_block_id(block, &c)?;
         let (_, blk) = c
-            .split_block(&target_block, dir, cwd.as_deref(), Some(&cmd), label.as_deref(), cols, rows)
+            .split_block_with_handoff(
+                &target_block,
+                dir,
+                cwd.as_deref(),
+                Some(&cmd),
+                label.as_deref(),
+                cols,
+                rows,
+                handoff.as_ref(),
+            )
             .map_err(|e| e.to_string())?;
         blk
     } else {
@@ -1117,20 +1213,37 @@ fn cmd_run(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
         match chosen.as_deref() {
             Some("new") | None => {
                 let (_, _, blk) = c
-                    .create_session(None, cwd.as_deref(), Some(&cmd), label.as_deref(), cols, rows)
+                    .create_session_with_handoff(
+                        None,
+                        cwd.as_deref(),
+                        Some(&cmd),
+                        label.as_deref(),
+                        cols,
+                        rows,
+                        handoff.as_ref(),
+                    )
                     .map_err(|e| e.to_string())?;
                 blk
             }
             Some(sid) => {
                 let (_, blk) = c
-                    .create_window(sid, label.as_deref(), cwd.as_deref(), Some(&cmd), label.as_deref(), cols, rows)
+                    .create_window_with_handoff(
+                        sid,
+                        label.as_deref(),
+                        cwd.as_deref(),
+                        Some(&cmd),
+                        label.as_deref(),
+                        cols,
+                        rows,
+                        handoff.as_ref(),
+                    )
                     .map_err(|e| e.to_string())?;
                 blk
             }
         }
     };
 
-    if wait {
+    if wait && !bg {
         let code = c.wait_block(&blk.id, timeout_ms).map_err(|e| e.to_string())?;
         let text = if capture || opts.json {
             c.capture(&blk.id, Some(200), false).ok()
@@ -1152,11 +1265,141 @@ fn cmd_run(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     }
 
     if opts.json {
-        print_json(&json!({ "block": blk.to_json() }));
+        let mut v = json!({ "block": blk.to_json() });
+        if let Some(ref h) = handoff {
+            v["handoff"] = h.to_json();
+        }
+        print_json(&v);
     } else {
-        println!("block={} session={} window={}", blk.id, blk.session_id, blk.window_id);
+        let rep = handoff
+            .as_ref()
+            .map(|h| format!(" report_to={}", h.report_to))
+            .unwrap_or_default();
+        println!(
+            "block={} session={} window={}{rep}",
+            blk.id, blk.session_id, blk.window_id
+        );
     }
     Ok(0)
+}
+
+fn cmd_wait(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    let mut block: Option<String> = None;
+    let mut until: Vec<String> = Vec::new();
+    let mut timeout_ms: Option<u64> = None;
+    let mut after_change = false;
+    let mut capture = false;
+    let mut capture_lines: Option<usize> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-b" | "--block" => {
+                block = Some(args.get(i + 1).ok_or("-b/--block requires an id")?.clone());
+                i += 2;
+            }
+            "--until" | "-u" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or("--until requires exit|blocked|done|error|idle|working")?;
+                parse_condition_list(raw, &mut until)?;
+                i += 2;
+            }
+            "--timeout" | "-t" => {
+                timeout_ms = Some(
+                    args.get(i + 1)
+                        .ok_or("--timeout requires milliseconds")?
+                        .parse()
+                        .map_err(|_| "bad --timeout")?,
+                );
+                i += 2;
+            }
+            "--after-change" => {
+                after_change = true;
+                i += 1;
+            }
+            "--capture" => {
+                capture = true;
+                i += 1;
+            }
+            "--lines" => {
+                let n: usize = args
+                    .get(i + 1)
+                    .ok_or("--lines requires a line count")?
+                    .parse()
+                    .map_err(|_| "bad --lines")?;
+                capture_lines = Some(n);
+                capture = true;
+                i += 2;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown wait option `{other}`"));
+            }
+            other => {
+                if block.is_none() {
+                    block = Some(other.to_string());
+                    i += 1;
+                } else {
+                    return Err(format!("unexpected argument `{other}`"));
+                }
+            }
+        }
+    }
+
+    if until.is_empty() {
+        until.push("exit".into());
+    }
+
+    let (_, c) = connect(opts, false)?;
+    let bid = match block {
+        Some(id) => id,
+        None => std::env::var("TACHYON_BLOCK")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or("usage: tachyon wait -b <block_id> [--until blocked|done|error|idle|exit] [--timeout MS]")?,
+    };
+    let until_refs: Vec<&str> = until.iter().map(String::as_str).collect();
+    let out = c
+        .wait_block_until(&bid, &until_refs, timeout_ms, after_change)
+        .map_err(|e| e.to_string())?;
+    let text = if capture {
+        c.capture(&bid, Some(capture_lines.unwrap_or(80)), false).ok()
+    } else {
+        None
+    };
+
+    if opts.json {
+        let mut v = out.to_json();
+        if let Some(ref txt) = text {
+            v["output"] = Value::String(txt.clone());
+        }
+        print_json(&v);
+    } else {
+        let code_s = out
+            .exit_code
+            .map(|ec| format!(" exit_code={ec}"))
+            .unwrap_or_default();
+        let msg_s = out
+            .status
+            .as_ref()
+            .and_then(|s| s.msg.as_deref())
+            .map(|m| format!(" msg={m:?}"))
+            .unwrap_or_default();
+        println!("block={} matched={}{code_s}{msg_s}", out.block_id, out.matched);
+        if let Some(ref txt) = text {
+            if !txt.is_empty() {
+                println!("{txt}");
+            }
+        }
+    }
+
+    if !until.iter().any(|u| u == "exit") && out.exited && out.matched == "exited" {
+        Ok(out.exit_code.filter(|&ec| ec != 0).unwrap_or(2))
+    } else if until.len() == 1 && until[0] == "exit" {
+        Ok(out.exit_code.unwrap_or(0))
+    } else {
+        Ok(0)
+    }
 }
 
 fn cmd_send(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
@@ -2619,7 +2862,8 @@ Sessions, Windows & Automation:
   tachyon session ls|new|rename|kill|inspect
   tachyon window  ls|new|rename|kill|focus
   tachyon split [--right|--down] [-b B] [-- CMD...]
-  tachyon run [--session S] [--split right|down] [--wait] [--capture] -- CMD...
+  tachyon run [--session S] [--split right|down] [--wait | --bg] [--report-to B|self] [--report-on S] [--capture] -- CMD...
+  tachyon wait [-b B] [--until exit|blocked|done|error|idle|working] [--timeout MS] [--after-change] [--capture]
   tachyon send [-b B | --all [-w W]] [--enter] <TEXT | ->
   tachyon capture [-b B] [--lines N] [--ansi]
   tachyon rewind [-b B] [--list | --frame N | --seq S] [--provenance C,R] [--ansi]
