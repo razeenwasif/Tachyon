@@ -64,6 +64,27 @@ pub fn encoded_size(data: &[u8]) -> Option<(u32, u32)> {
     if data.len() >= 10 && (data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")) {
         return Some((u16::from_le_bytes([data[6], data[7]]) as u32, u16::from_le_bytes([data[8], data[9]]) as u32));
     }
+    if data.len() >= 26 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        match &data[12..16] {
+            b"VP8X" if data.len() >= 30 => {
+                let w = u32::from_le_bytes([data[24], data[25], data[26], 0]) + 1;
+                let h = u32::from_le_bytes([data[27], data[28], data[29], 0]) + 1;
+                return Some((w, h));
+            }
+            b"VP8L" if data[20] == 0x2F => {
+                let bits = u32::from_le_bytes([data[21], data[22], data[23], data[24]]);
+                return Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1));
+            }
+            b"VP8 " if data.len() >= 30 && data[23] == 0x9D && data[24] == 0x01 && data[25] == 0x2A => {
+                let w = (u16::from_le_bytes([data[26], data[27]]) & 0x3FFF) as u32;
+                let h = (u16::from_le_bytes([data[28], data[29]]) & 0x3FFF) as u32;
+                if w > 0 && h > 0 {
+                    return Some((w, h));
+                }
+            }
+            _ => {}
+        }
+    }
     if data.starts_with(&[0xFF, 0xD8]) {
         // JPEG: walk the segments to a start-of-frame marker.
         let mut i = 2;
@@ -179,11 +200,17 @@ pub struct Kitty {
     pub quiet: u32,
     pub width: u32,
     pub height: u32,
+    pub size: Option<usize>,
+    pub offset: u64,
     pub cols: Option<usize>,
     pub rows: Option<usize>,
     pub stay: bool,
     pub delete: u8,
     pub compressed: bool,
+    /// Tachyon-internal snapshot restore placement hints (`Term::to_vt()`).
+    pub restore_line: Option<i64>,
+    pub restore_col: Option<usize>,
+    pub restore_in_cells: Option<bool>,
 }
 
 /// A kitty graphics command's keys and its (still base64) payload.
@@ -207,41 +234,199 @@ pub fn parse_kitty(apc: &[u8]) -> Option<(Kitty, &[u8])> {
             b"q" => k.quiet = num().unwrap_or(0),
             b"s" => k.width = num().unwrap_or(0),
             b"v" => k.height = num().unwrap_or(0),
+            b"S" => k.size = std::str::from_utf8(val).ok().and_then(|s| s.parse::<usize>().ok()),
+            b"O" => k.offset = std::str::from_utf8(val).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
             b"c" => k.cols = num().map(|n| n as usize).filter(|&n| n > 0),
             b"r" => k.rows = num().map(|n| n as usize).filter(|&n| n > 0),
             b"C" => k.stay = num() == Some(1),
             b"d" => k.delete = *val.first().unwrap_or(&b'a'),
             b"o" => k.compressed = val == b"z",
+            b"ty" => k.restore_line = std::str::from_utf8(val).ok().and_then(|s| s.parse::<i64>().ok()),
+            b"tx" => k.restore_col = std::str::from_utf8(val).ok().and_then(|s| s.parse::<usize>().ok()),
+            b"tc" => {
+                k.restore_in_cells = match val {
+                    b"1" => Some(true),
+                    b"0" => Some(false),
+                    _ => None,
+                };
+            }
             _ => {}
         }
     }
     Some((k, payload))
 }
 
+const MAX_KITTY_DATA: usize = 64 << 20;
+
+/// Compress bytes into zlib format for `o=z` kitty graphics transfers.
+pub fn compress_zlib(data: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
+}
+
+fn is_safe_temp_image_path(path: &std::path::Path) -> bool {
+    let has_marker = path
+        .to_string_lossy()
+        .contains("tty-graphics-protocol");
+    if !has_marker {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(canon_parent) = std::fs::canonicalize(parent) else {
+        return false;
+    };
+    let mut roots: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
+    for extra in ["/tmp", "/var/tmp", "/dev/shm"] {
+        let p = std::path::PathBuf::from(extra);
+        if p.exists() {
+            roots.push(p);
+        }
+    }
+    roots
+        .into_iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .any(|r| canon_parent.starts_with(r))
+}
+
 /// A kitty image's pixels, once all its chunks have arrived: its format and
-/// size, or why not.
-pub fn kitty_image(k: &Kitty, base64: &[u8]) -> Result<(Format, u32, u32, Vec<u8>), &'static str> {
-    if k.medium != b'd' {
-        return Err("ENOTSUPPORTED:only direct transmission");
-    }
+/// size, or why not. Supports `t=d` (direct), `t=f` (file), `t=t` (temp file
+/// unlinked when `unlink_temp` is true), and `o=z` zlib decompression.
+pub fn kitty_image(
+    k: &Kitty,
+    base64: &[u8],
+    unlink_temp: bool,
+) -> Result<(Format, u32, u32, Vec<u8>), &'static str> {
+    let mut data = match k.medium {
+        b'd' => decode_base64(base64).ok_or("EINVAL:bad base64")?,
+        b'f' | b't' => {
+            use std::io::{Read, Seek, SeekFrom};
+            let path_bytes = decode_base64(base64).ok_or("EINVAL:bad base64")?;
+            let path_str = std::str::from_utf8(&path_bytes).map_err(|_| "EINVAL:bad path")?;
+            let path = std::path::Path::new(path_str);
+            let meta = std::fs::metadata(path).map_err(|_| "ENOENT:file not found")?;
+            if !meta.is_file() {
+                return Err("EINVAL:not a regular file");
+            }
+            if k.size.is_none() && meta.len() > MAX_KITTY_DATA as u64 {
+                return Err("EFBIG:file too large");
+            }
+            let max_read = k.size.unwrap_or(MAX_KITTY_DATA).min(MAX_KITTY_DATA);
+            let mut file = std::fs::File::open(path).map_err(|_| "ENOENT:file open failed")?;
+            if k.offset > 0 {
+                file.seek(SeekFrom::Start(k.offset))
+                    .map_err(|_| "EINVAL:bad offset")?;
+            }
+            let mut buf = Vec::new();
+            file.take(max_read as u64)
+                .read_to_end(&mut buf)
+                .map_err(|_| "EIO:file read failed")?;
+            if k.medium == b't' && unlink_temp && is_safe_temp_image_path(path) {
+                let _ = std::fs::remove_file(path);
+            }
+            buf
+        }
+        _ => return Err("ENOTSUPPORTED:transmission medium"),
+    };
+
     if k.compressed {
-        return Err("ENOTSUPPORTED:compression");
+        data = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data, MAX_KITTY_DATA)
+            .map_err(|_| "EINVAL:bad zlib")?;
     }
-    let data = decode_base64(base64).ok_or("EINVAL:bad base64")?;
+
     match k.format {
         100 => {
             let (w, h) = encoded_size(&data).ok_or("EBADPNG:not an image")?;
             Ok((Format::Encoded, w, h, data))
         }
         24 | 32 => {
-            let bpp = if k.format == 24 { 3 } else { 4 };
-            if k.width == 0 || k.height == 0 || data.len() < (k.width * k.height * bpp) as usize {
+            let bpp = if k.format == 24 { 3usize } else { 4usize };
+            let need = (k.width as usize)
+                .checked_mul(k.height as usize)
+                .and_then(|px| px.checked_mul(bpp));
+            if k.width == 0 || k.height == 0 || need.is_none_or(|n| data.len() < n) {
                 return Err("ENODATA:short pixel data");
             }
             Ok((if bpp == 3 { Format::Rgb } else { Format::Rgba }, k.width, k.height, data))
         }
         _ => Err("EINVAL:format"),
     }
+}
+
+/// Extract per-frame delays in milliseconds from an animated GIF (`GIF87a`/`GIF89a`).
+/// Returns `Some(delays)` when more than one image frame is present, else `None`.
+pub fn gif_frame_delays_ms(data: &[u8]) -> Option<Vec<u32>> {
+    if data.len() < 13 || (!data.starts_with(b"GIF87a") && !data.starts_with(b"GIF89a")) {
+        return None;
+    }
+    let packed = data[10];
+    let mut i = 13usize;
+    if packed & 0x80 != 0 {
+        i += 3 * (1usize << ((packed & 0x07) + 1));
+    }
+    if i > data.len() {
+        return None;
+    }
+
+    fn skip_sub_blocks(data: &[u8], mut pos: usize) -> Option<usize> {
+        while pos < data.len() {
+            let sz = data[pos] as usize;
+            pos += 1;
+            if sz == 0 {
+                return Some(pos);
+            }
+            pos = pos.checked_add(sz)?;
+            if pos > data.len() {
+                return None;
+            }
+        }
+        None
+    }
+
+    let mut pending_delay_ms: Option<u32> = None;
+    let mut delays = Vec::new();
+    while i < data.len() {
+        match data[i] {
+            0x3B => break,
+            0x21 => {
+                if i + 2 > data.len() {
+                    break;
+                }
+                let label = data[i + 1];
+                i += 2;
+                if label == 0xF9 && i + 5 <= data.len() && data[i] == 4 {
+                    let delay_cs = u16::from_le_bytes([data[i + 2], data[i + 3]]) as u32;
+                    let ms = delay_cs * 10;
+                    pending_delay_ms = Some(if ms < 20 { 100 } else { ms });
+                }
+                let Some(next) = skip_sub_blocks(data, i) else {
+                    break;
+                };
+                i = next;
+            }
+            0x2C => {
+                if i + 10 > data.len() {
+                    break;
+                }
+                delays.push(pending_delay_ms.take().unwrap_or(100));
+                let lct = data[i + 9];
+                i += 10;
+                if lct & 0x80 != 0 {
+                    i += 3 * (1usize << ((lct & 0x07) + 1));
+                }
+                if i >= data.len() {
+                    break;
+                }
+                i += 1; // LZW minimum code size
+                let Some(next) = skip_sub_blocks(data, i) else {
+                    break;
+                };
+                i = next;
+            }
+            _ => break,
+        }
+    }
+    (delays.len() > 1).then_some(delays)
 }
 
 // ---------------------------------------------------------------------------
@@ -444,9 +629,79 @@ mod tests {
         assert_eq!((k.action, k.delete, k.id), (b'd', b'I', Some(3)));
         let raw = base64::engine::general_purpose::STANDARD.encode([255u8; 2 * 2 * 4]);
         let (k, p) = parse_kitty(format!("Gf=32,s=2,v=2;{raw}").as_bytes()).map(|(k, p)| (k, p.to_vec())).unwrap();
-        assert_eq!(kitty_image(&k, &p).map(|(f, w, h, _)| (f, w, h)), Ok((Format::Rgba, 2, 2)));
+        assert_eq!(kitty_image(&k, &p, true).map(|(f, w, h, _)| (f, w, h)), Ok((Format::Rgba, 2, 2)));
         let (k, p) = parse_kitty(b"Gf=32,s=4,v=4;AAAA").map(|(k, p)| (k, p.to_vec())).unwrap();
-        assert!(kitty_image(&k, &p).is_err(), "too few pixels");
+        assert!(kitty_image(&k, &p, true).is_err(), "too few pixels");
+    }
+
+    #[test]
+    fn kitty_compressed_zlib_and_file_transfers_decode_safely() {
+        let raw = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        let z = compress_zlib(&raw);
+        let b64_z = base64::engine::general_purpose::STANDARD.encode(&z);
+        let (k, p) = parse_kitty(format!("Ga=T,f=32,s=2,v=1,o=z;{b64_z}").as_bytes())
+            .map(|(k, p)| (k, p.to_vec()))
+            .unwrap();
+        let (fmt, w, h, decoded) = kitty_image(&k, &p, true).unwrap();
+        assert_eq!((fmt, w, h, decoded), (Format::Rgba, 2, 1, raw.clone()));
+
+        // Regular temp-file transfer (`t=t`) unlinks only matching tty-graphics-protocol paths
+        // and only when `unlink_temp == true`.
+        let dir = std::env::temp_dir().join(format!("tachyon-img-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let safe_tmp = dir.join("tty-graphics-protocol-frame.rgba");
+        std::fs::write(&safe_tmp, &raw).unwrap();
+        let b64_path = base64::engine::general_purpose::STANDARD.encode(safe_tmp.to_string_lossy().as_bytes());
+
+        // Attached pass (`unlink_temp = false`) keeps the file intact for the peer parser.
+        let (kt, pt) = parse_kitty(format!("Ga=T,t=t,f=32,s=2,v=1;{b64_path}").as_bytes())
+            .map(|(k, p)| (k, p.to_vec()))
+            .unwrap();
+        assert_eq!(kitty_image(&kt, &pt, false).unwrap().3, raw);
+        assert!(safe_tmp.exists(), "attached reader must not unlink before peer sees t=t");
+        assert_eq!(kitty_image(&kt, &pt, true).unwrap().3, raw);
+        assert!(!safe_tmp.exists(), "temp tty-graphics-protocol file should be unlinked");
+
+        // Regular file without `tty-graphics-protocol` (`t=t` safety guard + `t=f` preservation).
+        let keep_file = dir.join("keep-plot.rgba");
+        std::fs::write(&keep_file, &raw).unwrap();
+        let b64_keep = base64::engine::general_purpose::STANDARD.encode(keep_file.to_string_lossy().as_bytes());
+        let (kf, pf) = parse_kitty(format!("Ga=T,t=f,f=32,s=2,v=1;{b64_keep}").as_bytes())
+            .map(|(k, p)| (k, p.to_vec()))
+            .unwrap();
+        assert_eq!(kitty_image(&kf, &pf, true).unwrap().3, raw);
+        assert!(keep_file.exists(), "t=f must never delete user files");
+
+        let (kt_unsafe, pt_unsafe) = parse_kitty(format!("Ga=T,t=t,f=32,s=2,v=1;{b64_keep}").as_bytes())
+            .map(|(k, p)| (k, p.to_vec()))
+            .unwrap();
+        assert_eq!(kitty_image(&kt_unsafe, &pt_unsafe, true).unwrap().3, raw);
+        assert!(keep_file.exists(), "t=t without tty-graphics-protocol must not unlink");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gif_frame_delays_parser_reads_and_clamps_gce_delays() {
+        // Minimal 1x1 2-frame GIF89a with GCE delays: 6cs (60ms) and 1cs (clamped -> 100ms).
+        let mut gif = Vec::new();
+        gif.extend_from_slice(b"GIF89a");
+        gif.extend_from_slice(&[1, 0, 1, 0, 0x80, 0, 0]); // 1x1, 2-color GCT
+        gif.extend_from_slice(&[255, 0, 0, 0, 0, 255]); // red, blue
+        // Frame 1: delay 6cs = 60ms
+        gif.extend_from_slice(&[0x21, 0xF9, 0x04, 0x04, 6, 0, 0, 0]);
+        gif.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0]);
+        // Frame 2: delay 1cs -> clamped to 100ms
+        gif.extend_from_slice(&[0x21, 0xF9, 0x04, 0x04, 1, 0, 0, 0]);
+        gif.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x4C, 0x01, 0]);
+        gif.push(0x3B);
+
+        assert_eq!(encoded_size(&gif), Some((1, 1)));
+        assert_eq!(gif_frame_delays_ms(&gif), Some(vec![60, 100]));
+
+        // Single-frame GIF returns None (static image).
+        let single = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\x00\x00\x00\x00\xff\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+        assert_eq!(gif_frame_delays_ms(single), None);
     }
 
     #[test]

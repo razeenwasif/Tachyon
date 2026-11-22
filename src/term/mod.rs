@@ -452,6 +452,9 @@ pub struct Term {
     /// Output being parsed is a restored session's past, not happening now:
     /// commands in it get no start or finish times and raise no events.
     pub restoring: bool,
+    /// Whether kitty `t=t` temp files should be unlinked after reading (disabled
+    /// on the server parser while a live GUI client is attached so both read it).
+    pub unlink_temp_images: bool,
 
     /// Keep-awake: the command that keeps the Mac from sleeping while it
     /// runs, or the next one to start, if asked.
@@ -556,6 +559,7 @@ impl Term {
             current_cmd: None,
             next_cmd: 1,
             restoring: false,
+            unlink_temp_images: true,
             awake_cmd: None,
             awake_next: false,
             bulk_scratch: Vec::new(),
@@ -886,6 +890,7 @@ impl Term {
             current_cmd: None,
             next_cmd: 1,
             restoring: false,
+            unlink_temp_images: true,
             awake_cmd: None,
             awake_next: false,
             bulk_scratch: Vec::new(),
@@ -1958,7 +1963,7 @@ impl Term {
         self.dirty = true;
     }
 
-    fn full_reset(&mut self) {
+    pub fn full_reset(&mut self) {
         let rows = self.rows();
         let cols = self.cols();
         self.set_alt_screen(false, false);
@@ -1981,6 +1986,20 @@ impl Term {
         self.kitty_partial = None;
         self.iterm_partial = None;
         self.dirty = true;
+    }
+
+    /// Clear transient screen, command, status, and image state prior to
+    /// replaying a `Term::to_vt()` restore snapshot while preserving `cell_px`.
+    pub fn reset_for_restore(&mut self) {
+        self.full_reset();
+        self.commands.clear();
+        self.command_events.clear();
+        self.current_cmd = None;
+        self.next_cmd = 1;
+        self.program_status = None;
+        self.sixel = None;
+        self.jobs.clear();
+        self.folds.clear();
     }
 
     // ---------------------------------------------------------------------
@@ -2812,6 +2831,42 @@ impl Term {
         self.images.iter().any(|p| p.alt == alt)
     }
 
+    /// All placed inline images across primary and alternate screens, oldest first.
+    pub fn placements(&self) -> &[image::Placement] {
+        &self.images
+    }
+
+    /// Whether kitty image `id` is cached in `kitty_images`.
+    pub fn has_kitty_image(&self, id: u32) -> bool {
+        self.kitty_images.contains_key(&id)
+    }
+
+    fn place_restored_image(
+        &mut self,
+        image: Arc<image::Image>,
+        line: i64,
+        col: usize,
+        cols: usize,
+        rows: usize,
+        kitty_id: Option<u32>,
+        in_cells: bool,
+    ) {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        self.images.push(image::Placement {
+            image,
+            line,
+            col,
+            cols: cols.max(1),
+            rows: rows.max(1),
+            alt,
+            kitty_id,
+            in_cells,
+        });
+        self.prune_images();
+        self.grid.damage_all();
+        self.dirty = true;
+    }
+
     fn new_image(&mut self, format: image::Format, width: u32, height: u32, data: Vec<u8>) -> Arc<image::Image> {
         let id = self.next_image;
         self.next_image += 1;
@@ -2914,13 +2969,39 @@ impl Term {
             b'd' => self.kitty_delete(&k),
             b'p' => match k.id.and_then(|id| self.kitty_images.get(&id).cloned()) {
                 Some(img) => {
-                    let (cols, rows) = self.image_cells(img.width, img.height, (k.cols, k.rows));
-                    self.place_image(img, cols, rows, !k.stay, k.id, false);
-                    self.kitty_reply(&k, Ok(()));
+                    if self.restoring {
+                        if let Some(rel_y) = k.restore_line {
+                            let (cols, rows) = match (k.cols, k.rows) {
+                                (Some(c), Some(r)) => (c, r),
+                                _ => self.image_cells(img.width, img.height, (k.cols, k.rows)),
+                            };
+                            let line = self.grid.scrolled() as i64 + rel_y;
+                            self.place_restored_image(
+                                img,
+                                line,
+                                k.restore_col.unwrap_or(self.cursor.x),
+                                cols,
+                                rows,
+                                k.id,
+                                k.restore_in_cells.unwrap_or(false),
+                            );
+                        } else {
+                            let (cols, rows) = self.image_cells(img.width, img.height, (k.cols, k.rows));
+                            self.place_image(img, cols, rows, !k.stay, k.id, false);
+                        }
+                    } else {
+                        let (cols, rows) = self.image_cells(img.width, img.height, (k.cols, k.rows));
+                        self.place_image(img, cols, rows, !k.stay, k.id, false);
+                        self.kitty_reply(&k, Ok(()));
+                    }
                 }
-                None => self.kitty_reply(&k, Err("ENOENT:no such image")),
+                None => {
+                    if !self.restoring {
+                        self.kitty_reply(&k, Err("ENOENT:no such image"));
+                    }
+                }
             },
-            b't' | b'T' | b'q' => match image::kitty_image(&k, &payload) {
+            b't' | b'T' | b'q' => match image::kitty_image(&k, &payload, self.unlink_temp_images) {
                 Ok((format, w, h, data)) => {
                     if k.action != b'q' {
                         let img = self.new_image(format, w, h, data);
@@ -2928,15 +3009,45 @@ impl Term {
                             self.kitty_images.insert(id, img.clone());
                         }
                         if k.action == b'T' {
-                            let (cols, rows) = self.image_cells(w, h, (k.cols, k.rows));
-                            self.place_image(img, cols, rows, !k.stay, k.id, false);
+                            let (cols, rows) = if self.restoring {
+                                match (k.cols, k.rows) {
+                                    (Some(c), Some(r)) => (c, r),
+                                    _ => self.image_cells(w, h, (k.cols, k.rows)),
+                                }
+                            } else {
+                                self.image_cells(w, h, (k.cols, k.rows))
+                            };
+                            if self.restoring {
+                                if let Some(rel_y) = k.restore_line {
+                                    let line = self.grid.scrolled() as i64 + rel_y;
+                                    self.place_restored_image(
+                                        img,
+                                        line,
+                                        k.restore_col.unwrap_or(self.cursor.x),
+                                        cols,
+                                        rows,
+                                        k.id,
+                                        k.restore_in_cells.unwrap_or(false),
+                                    );
+                                } else {
+                                    self.place_image(img, cols, rows, !k.stay, k.id, false);
+                                }
+                            } else {
+                                self.place_image(img, cols, rows, !k.stay, k.id, false);
+                            }
                         } else {
                             self.prune_images();
                         }
                     }
-                    self.kitty_reply(&k, Ok(()));
+                    if !self.restoring {
+                        self.kitty_reply(&k, Ok(()));
+                    }
                 }
-                Err(e) => self.kitty_reply(&k, Err(e)),
+                Err(e) => {
+                    if !self.restoring {
+                        self.kitty_reply(&k, Err(e));
+                    }
+                }
             },
             _ => {}
         }

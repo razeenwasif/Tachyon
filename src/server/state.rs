@@ -430,6 +430,7 @@ impl Block {
         };
         self.space.notify_all();
         for chunk in pending {
+            parsed.term.unlink_temp_images = self.attached_count.load(Ordering::Acquire) == 0;
             let (_, _, _, evs) = parsed.feed(&self.pty, &chunk);
             if !evs.is_empty() {
                 parsed.pending_cmd_events.extend(evs);
@@ -1052,6 +1053,9 @@ impl ServerState {
         }
         let block = self.inner.lock().blocks.get(&block_id).cloned();
         if let Some(b) = block {
+            if cell_w > 0 && cell_h > 0 {
+                b.parsed.lock().term.set_cell_pixels(cell_w as u32, cell_h as u32);
+            }
             b.pty.resize(cols, rows, cell_w, cell_h);
         }
     }
@@ -2990,6 +2994,7 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
 
         let (replies, meta_changed, status_changed, inferred_changed, processed_chunk) =
             if let Some(chunk) = chunk {
+                parsed.term.unlink_temp_images = block.attached_count.load(Ordering::Acquire) == 0;
                 let (replies, meta_changed, status_changed, evs) = parsed.feed(&block.pty, &chunk);
                 cmd_events.extend(evs);
 

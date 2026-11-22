@@ -1681,3 +1681,129 @@ fn cli_server_receipts_capture_cpu_memory_and_emit_block_receipt_events() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_mux_inline_images_survive_detach_reattach_and_cell_px_resize() {
+    use base64::Engine as _;
+    use tachyon::mux::{
+        client::{MuxClient, StreamChunk},
+        Target,
+    };
+    use tachyon::term::{image, Processor, Term};
+
+    let dir = temp_dir("img-mux-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    std::fs::write(&hosts, "{}").unwrap();
+
+    let srv_out = Command::new(bin())
+        .args(["server", "start"])
+        .env("TACHYON_SOCKET", &sock)
+        .env("TACHYON_HOSTS_FILE", &hosts)
+        .env("SHELL", "/bin/sh")
+        .env_remove("TACHYON_SERVER")
+        .output()
+        .expect("start server");
+    assert!(
+        srv_out.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&srv_out.stderr)
+    );
+
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "new",
+            "img-e2e",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "stty raw -echo; printf 'SH_READY\\n'; exec cat",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let created: Value = serde_json::from_str(&out).unwrap();
+    let bid = created["block"]["id"].as_str().unwrap().to_string();
+
+    for _ in 0..40 {
+        let (c, cap, _) = run_cli(&sock, &hosts, &["capture", "-b", &bid, "--lines", "10"]);
+        if c == 0 && cap.contains("SH_READY") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let target = Target::Local { socket: sock.clone() };
+    let c1 = MuxClient::connect(&target, false, "gui", "img-c1").expect("connect c1");
+    let s1 = c1.attach(&bid, true, true).expect("attach s1");
+    let _ = s1.recv_timeout(Duration::from_secs(2)).expect("initial snapshot");
+
+    // Sync Retina cell pixel dimensions (16x32) to server Term before sending images.
+    s1.resize(80, 24, 16, 32).expect("resize with cell_px");
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    png.extend_from_slice(&32u32.to_be_bytes());
+    png.extend_from_slice(&64u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0, 0x01, 0x02, 0x03]);
+    let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+
+    let rgba = vec![255u8, 0, 0, 255, 0, 255, 0, 255];
+    let kitty_b64 = base64::engine::general_purpose::STANDARD.encode(image::compress_zlib(&rgba));
+
+    let stream_payload = format!(
+        "\x1b]1337;File=inline=1:{png_b64}\x07\r\n\x1b_Ga=T,q=2,i=7,f=32,s=2,v=1,o=z,c=2,r=1,C=1;{kitty_b64}\x1b\\\r\nIMG_E2E_READY\r\n"
+    );
+    s1.write(stream_payload.as_bytes()).expect("write images");
+
+    let mut ready = false;
+    for _ in 0..80 {
+        let cap = c1.capture(&bid, Some(20), false).unwrap_or_default();
+        if cap.contains("IMG_E2E_READY") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready, "timed out waiting for IMG_E2E_READY");
+
+    // Complete client 1 detach.
+    drop(s1);
+    drop(c1);
+
+    // Reattach fresh client 2 and replay initial Snapshot(vt).
+    let c2 = MuxClient::connect(&target, false, "gui", "img-c2").expect("connect c2");
+    let s2 = c2.attach(&bid, true, true).expect("attach s2");
+    let first = s2.recv_timeout(Duration::from_secs(2)).expect("restore snapshot");
+    let StreamChunk::Snapshot(vt) = first else {
+        panic!("expected Snapshot as first chunk on reattach");
+    };
+
+    let mut restored = Term::new(80, 24, 10_000);
+    restored.set_cell_pixels(16, 32);
+    restored.restoring = true;
+    Processor::new().advance(&mut restored, &vt);
+    restored.restoring = false;
+    assert!(restored.take_replies().is_empty(), "snapshot replay must not emit kitty replies");
+
+    assert_eq!(restored.placements().len(), 2, "expected both images to survive reattach");
+    let iterm_p = &restored.placements()[0];
+    assert!(iterm_p.in_cells);
+    assert_eq!((iterm_p.cols, iterm_p.rows), (2, 2), "32x64px at 16x32px cell_px should fit 2x2 cells");
+    assert_eq!(iterm_p.image.data, png);
+
+    let kitty_p = &restored.placements()[1];
+    assert!(!kitty_p.in_cells);
+    assert_eq!(kitty_p.kitty_id, Some(7));
+    assert_eq!((kitty_p.cols, kitty_p.rows), (2, 1));
+    assert_eq!(kitty_p.image.data, rgba);
+    assert!(restored.has_kitty_image(7));
+
+    drop(s2);
+    drop(c2);
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

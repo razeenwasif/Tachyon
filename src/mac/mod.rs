@@ -2381,6 +2381,8 @@ struct TermWindow {
     notch_status: Option<Retained<objc2_app_kit::NSTextField>>,
     /// Keeps the status's clock current while nothing else redraws.
     notch_timer: Option<Retained<objc2_foundation::NSTimer>>,
+    /// One-shot timer advancing the next animated GIF frame when visible.
+    gif_timer: Option<Retained<objc2_foundation::NSTimer>>,
     /// The Liquid Glass behind the text, tinted with the theme's background.
     host_glass: Option<Retained<NSGlassEffectView>>,
     /// Jobs a tab was opened for, so their commands stop offering one.
@@ -2475,6 +2477,9 @@ impl Drop for TermWindow {
         // A display link retains its target; invalidate it or the view leaks.
         // Dropping the tabs hangs up their shells.
         self.link.invalidate();
+        if let Some(t) = self.gif_timer.take() {
+            t.invalidate();
+        }
         if let Some(card) = &mut self.monitor_card {
             card.stop();
         }
@@ -2763,6 +2768,26 @@ impl TermWindow {
             mode_badge,
             presented,
         );
+        if let Some(t) = self.gif_timer.take() {
+            t.invalidate();
+        }
+        if let Some(ms) = self.renderer.take_next_animation_ms() {
+            let win_id = self.id;
+            let delay = (ms.max(16) as f64) / 1000.0;
+            let block = block2::RcBlock::new(move |_t: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+                with_window(win_id, |w| {
+                    w.gif_timer = None;
+                    w.request_redraw();
+                });
+            });
+            self.gif_timer = Some(unsafe {
+                objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+                    delay,
+                    false,
+                    &block,
+                )
+            });
+        }
         let overlay = match focus_at {
             Some(k) if blink => {
                 let rect = tab.panes[tab.focus].rect;
@@ -6884,6 +6909,7 @@ impl App {
             notch: None,
             notch_status: None,
             notch_timer: None,
+            gif_timer: None,
             host_glass,
             glass_tint: cfg.window.glass_tint,
             host_tint: cfg.window.host_tint,
@@ -7954,6 +7980,7 @@ fn start_session(
                     Ok(pty::ReadChunk::Snapshot(vt)) => {
                         if !vt.is_empty() {
                             let mut t = reader_term.lock();
+                            t.reset_for_restore();
                             t.restoring = true;
                             processor.advance(&mut t, &vt);
                             t.restoring = false;
@@ -8416,7 +8443,9 @@ fn rewind_root() -> Option<std::path::PathBuf> {
 /// Reconstruct a rewound `Term` screen from a server-replayed `Term::to_vt()` snapshot.
 fn decode_rewind_vt(cols: usize, rows: usize, vt: &[u8]) -> Term {
     let mut term = Term::new(cols.max(2), rows.max(1), 0);
+    term.restoring = true;
     Processor::new().advance(&mut term, vt);
+    term.restoring = false;
     let _ = term.take_replies();
     term
 }

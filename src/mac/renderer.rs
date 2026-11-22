@@ -61,13 +61,38 @@ struct ImageInstance {
     uv: [f32; 4],
 }
 
-/// An inline image's texture, made at the size it last showed at.
+/// An inline image's texture(s), made at the size it last showed at.
 struct ImageTexture {
-    /// `None` when it couldn't be decoded: not tried again.
-    texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    /// Empty when it couldn't be decoded: not tried again at this size.
+    textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+    delays_ms: Vec<u32>,
+    total_ms: u64,
+    started: std::time::Instant,
     size: (u32, u32),
     /// The frame it was last drawn in.
     used: usize,
+}
+
+impl ImageTexture {
+    fn current_frame(&self, now: std::time::Instant) -> Option<(&ProtocolObject<dyn MTLTexture>, Option<u64>)> {
+        if self.textures.is_empty() {
+            return None;
+        }
+        if self.textures.len() == 1 || self.total_ms == 0 || self.delays_ms.len() != self.textures.len() {
+            return Some((&self.textures[0], None));
+        }
+        let elapsed_ms = (now.saturating_duration_since(self.started).as_millis() as u64) % self.total_ms;
+        let mut acc = 0u64;
+        for (idx, &d) in self.delays_ms.iter().enumerate() {
+            let next = acc + d.max(1) as u64;
+            if elapsed_ms < next || idx + 1 == self.textures.len() {
+                let remaining = next.saturating_sub(elapsed_ms).max(1);
+                return Some((&self.textures[idx], Some(remaining)));
+            }
+            acc = next;
+        }
+        Some((&self.textures[0], Some(100)))
+    }
 }
 
 /// Texture memory kept for inline images not on screen.
@@ -390,6 +415,7 @@ pub struct Renderer {
     /// Inline images this frame, by image id, drawn in order.
     images: Vec<(u64, ImageInstance)>,
     textures: FxHashMap<u64, ImageTexture>,
+    next_animation_ms: Option<u64>,
     /// A panel drawn over everything (the training chart): its picture,
     /// where, and its text.
     panel_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
@@ -450,6 +476,7 @@ impl Renderer {
             cards_fg: Vec::new(),
             images: Vec::new(),
             textures: FxHashMap::default(),
+            next_animation_ms: None,
             panel_texture: None,
             panel_quad: None,
             panel_glyphs: Vec::new(),
@@ -868,6 +895,7 @@ impl Renderer {
             self.atlas.reset();
             self.atlas.overflowed = false;
         }
+        self.next_animation_ms = None;
         self.cards_bg.clear();
         self.bg.clear();
         self.glyphs.clear();
@@ -1076,9 +1104,15 @@ impl Renderer {
         draw(&self.gpu.rect_pso, bg, self.bg.len());
         // Images sit on the cell backgrounds, under any text.
         if !self.images.is_empty() {
+            let now = std::time::Instant::now();
             enc.setRenderPipelineState(&self.gpu.image_pso);
             for (id, inst) in &self.images {
-                let Some(tex) = self.textures.get(id).and_then(|t| t.texture.as_ref()) else { continue };
+                let Some((tex, wait_ms)) = self.textures.get(id).and_then(|t| t.current_frame(now)) else {
+                    continue;
+                };
+                if let Some(ms) = wait_ms {
+                    self.next_animation_ms = Some(self.next_animation_ms.map_or(ms, |cur| cur.min(ms)));
+                }
                 unsafe {
                     enc.setVertexBytes_length_atIndex(NonNull::from(inst).cast(), size_of::<ImageInstance>(), 0);
                     enc.setFragmentTexture_atIndex(Some(tex), 0);
@@ -1159,26 +1193,59 @@ impl Renderer {
         Some(tex)
     }
 
-    /// Make sure there's a texture for `image` at about `want` pixels:
-    /// decoded again when it shows at a quite different size (the font size
-    /// changed, or the window moved to another display).
+    /// Minimum milliseconds until an animated inline image drawn in the last frame
+    /// advances to its next frame (`None` when no animated image is visible).
+    pub fn take_next_animation_ms(&mut self) -> Option<u64> {
+        self.next_animation_ms.take()
+    }
+
+    /// Make sure there's a texture (or animated frame textures) for `image` at
+    /// about `want` pixels: decoded again when it shows at a quite different size.
     fn image_texture(&mut self, image: &crate::term::image::Image, want: (u32, u32)) {
         let want = (want.0.min(images::MAX_SIDE), want.1.min(images::MAX_SIDE));
         let frame = self.frame;
         if let Some(t) = self.textures.get_mut(&image.id) {
             t.used = frame;
             let near = |a: u32, b: u32| a.abs_diff(b) <= (b / 8).max(2);
-            if t.texture.is_none() || (near(t.size.0, want.0) && near(t.size.1, want.1)) {
+            if t.textures.is_empty() || (near(t.size.0, want.0) && near(t.size.1, want.1)) {
                 return;
             }
         }
-        let texture = images::decode(image, want.0, want.1).and_then(|px| self.make_texture(&px));
-        if texture.is_none() {
+        let mut textures = Vec::new();
+        let mut delays_ms = Vec::new();
+        let mut tex_size = want;
+        if let Some(decoded) = images::decode_frames(image, want.0, want.1) {
+            if let Some(first) = decoded.frames.first() {
+                tex_size = (first.width, first.height);
+            }
+            for px in &decoded.frames {
+                if let Some(t) = self.make_texture(px) {
+                    textures.push(t);
+                }
+            }
+            if textures.len() > 1 && textures.len() == decoded.delays_ms.len() {
+                delays_ms = decoded.delays_ms;
+            }
+        }
+        if textures.is_empty() {
             crate::log!("images: could not decode image {} ({}x{})", image.id, image.width, image.height);
         }
-        self.textures.insert(image.id, ImageTexture { texture, size: want, used: frame });
+        let total_ms: u64 = delays_ms.iter().map(|&d| d.max(1) as u64).sum();
+        self.textures.insert(
+            image.id,
+            ImageTexture {
+                textures,
+                delays_ms,
+                total_ms,
+                started: std::time::Instant::now(),
+                size: tex_size,
+                used: frame,
+            },
+        );
         // Over budget: the least recently drawn go, never one in this frame.
-        let bytes = |t: &ImageTexture| t.size.0 as usize * t.size.1 as usize * 4;
+        let bytes = |t: &ImageTexture| {
+            t.size.0 as usize * t.size.1 as usize * 4 * t.textures.len().max(1)
+        };
         let mut total: usize = self.textures.values().map(bytes).sum();
         while total > IMAGE_CACHE_BYTES {
             let Some((&id, t)) = self.textures.iter().filter(|(_, t)| t.used != frame).min_by_key(|(_, t)| t.used) else { break };
