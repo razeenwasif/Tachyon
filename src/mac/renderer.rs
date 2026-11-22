@@ -600,9 +600,10 @@ impl Renderer {
         right: f32,
         accent: Option<&HostAccent>,
         broadcast: Option<usize>,
+        mode_badge: Option<(&str, [u8; 3])>,
     ) {
         let minimal = self.chrome.is_minimal();
-        if !self.hints_band || (!minimal && hints.is_empty() && accent.is_none() && broadcast.is_none()) {
+        if !self.hints_band || (!minimal && hints.is_empty() && accent.is_none() && broadcast.is_none() && mode_badge.is_none()) {
             return;
         }
         const BROADCAST_RGB: [u8; 3] = [245, 158, 11];
@@ -650,6 +651,23 @@ impl Renderer {
         let text_y = y0 + ((h - m.height) / 2.0).round();
         let width = |s: &str| s.chars().map(|c| c.width().unwrap_or(1)).sum::<usize>() as f32 * m.width;
         let mut x = pad_x;
+
+        if let Some((mtxt, mrgb)) = mode_badge {
+            let mw = width(mtxt);
+            let pad_badge = (m.width * 0.6).round();
+            if x + mw + 2.0 * pad_badge <= right {
+                let mut pill = srgb(mrgb);
+                pill[3] = 0.24;
+                let ph = (m.height + 2.0 * self.scale).min(h - hair);
+                let py = y0 + ((h - ph) / 2.0).round();
+                self.bg.push(RectInstance {
+                    rect: [x, py, mw + 2.0 * pad_badge, ph],
+                    color: pill,
+                });
+                self.push_text(mtxt, x + pad_badge, text_y, mrgb);
+                x += mw + 2.0 * pad_badge + 2.0 * m.width;
+            }
+        }
 
         if let Some(n) = broadcast {
             let btxt = format!("◉ BROADCAST · {n} panes");
@@ -843,6 +861,7 @@ impl Renderer {
         hints_right: f32,
         host_accent: Option<&HostAccent>,
         broadcast_panes: Option<usize>,
+        mode_badge: Option<(&str, [u8; 3])>,
         presented: Option<Box<dyn Fn(f64)>>,
     ) {
         if self.atlas.overflowed {
@@ -912,7 +931,7 @@ impl Renderer {
 
         for p in panes {
             let origin = self.pane_origin(p.col, p.row);
-            self.build(p.term, origin, p.focused, p.selection, p.cursor_on_layer);
+            self.build(p.term, origin, p.focused, p.selection, p.cursor_on_layer, p.copy_cursor);
             if p.term.has_images() {
                 self.build_images(p.term, origin);
             }
@@ -959,7 +978,7 @@ impl Renderer {
             let cols = self.grid_size_for(self.size.0, self.size.1).0;
             self.build_strip(strip, cols);
         }
-        self.build_hints(hints, hints_right, host_accent, broadcast_panes);
+        self.build_hints(hints, hints_right, host_accent, broadcast_panes, mode_badge);
         self.build_host_top_hairline(host_accent, broadcast_panes);
         self.build_panel(panel);
 
@@ -1168,7 +1187,15 @@ impl Renderer {
         }
     }
 
-    fn build(&mut self, term: &Term, origin: (f32, f32), focused: bool, selection: Option<Range>, cursor_on_layer: bool) {
+    fn build(
+        &mut self,
+        term: &Term,
+        origin: (f32, f32),
+        focused: bool,
+        selection: Option<Range>,
+        cursor_on_layer: bool,
+        copy_cursor: Option<(usize, usize)>,
+    ) {
         let m = self.fonts.metrics;
         let theme = self.cfg.theme.clone();
         let (pad_x, pad_y) = origin;
@@ -1179,8 +1206,9 @@ impl Renderer {
         let at_bottom = term.grid().display_offset() == 0;
         let first_visible = term.grid().history_len().saturating_sub(term.grid().display_offset());
         let selected = |line: usize, x: usize| selection.is_some_and(|r| r.contains(line, x));
-        // The focused cursor lives on its own layer when it blinks.
-        let draw_cursor = cursor.visible && at_bottom && !(focused && cursor_on_layer);
+        // The focused cursor lives on its own layer when it blinks; Copy Mode
+        // replaces it with an ice-blue Vi block cursor.
+        let draw_cursor = copy_cursor.is_none() && cursor.visible && at_bottom && !(focused && cursor_on_layer);
 
         for y in 0..rows {
             let row_y = pad_y + y as f32 * m.height;
@@ -1215,6 +1243,15 @@ impl Renderer {
             }
 
             // Cursor, under the glyph so a block cursor can invert it.
+            if let Some((cx_cell, cy_cell)) = copy_cursor {
+                if cy_cell == y && cx_cell < cols {
+                    let cx = pad_x + cx_cell as f32 * m.width;
+                    self.bg.push(RectInstance {
+                        rect: [cx, row_y, m.width, m.height],
+                        color: srgb([0x96, 0xB2, 0xD7]),
+                    });
+                }
+            }
             if draw_cursor && cursor.y == y {
                 let cx = pad_x + cursor.x as f32 * m.width;
                 let rect = match cursor.shape {
@@ -1251,13 +1288,16 @@ impl Renderer {
                     x += 1;
                     continue;
                 }
+                let invert_block = |col_idx: usize| -> bool {
+                    copy_cursor == Some((col_idx, y))
+                        || (focused
+                            && draw_cursor
+                            && cursor.y == y
+                            && cursor.x == col_idx
+                            && cursor.shape == CursorShape::Block)
+                };
                 let (mut fg, _) = self.resolve_colors(&cell, term, selected(line, x));
-                if focused
-                    && draw_cursor
-                    && cursor.y == y
-                    && cursor.x == x
-                    && cursor.shape == CursorShape::Block
-                {
+                if invert_block(x) {
                     fg = theme.cursor_text;
                 }
 
@@ -1272,7 +1312,7 @@ impl Renderer {
                             for g in glyphs.iter() {
                                 let cx = cell_of.get(g.index as usize).copied().unwrap_or(x);
                                 let (mut gfg, _) = self.resolve_colors(&cells[cx], term, selected(line, cx));
-                                if focused && draw_cursor && cursor.y == y && cursor.x == cx && cursor.shape == CursorShape::Block {
+                                if invert_block(cx) {
                                     gfg = theme.cursor_text;
                                 }
                                 self.push_shaped(g, cell_x, row_y, gfg);
@@ -1900,6 +1940,7 @@ pub struct PaneFrame<'a> {
     pub focused: bool,
     pub selection: Option<Range>,
     pub cursor_on_layer: bool,
+    pub copy_cursor: Option<(usize, usize)>,
     pub decor: &'a Decor,
     /// Veil it: a pane without focus beside one with it.
     pub dim: bool,

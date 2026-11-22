@@ -4,6 +4,7 @@ pub mod jobs;
 pub mod lens;
 pub mod rerun;
 pub mod rewind;
+pub mod copy_mode;
 pub mod find;
 pub mod image;
 mod restore;

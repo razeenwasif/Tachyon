@@ -51,6 +51,8 @@ pub enum PaletteAction {
     ZoomPane,
     ToggleBroadcast,
     Find,
+    ToggleCopyMode,
+    ToggleSoundCues,
     RewindBack,
     Neutrino,
     Monitor,
@@ -174,6 +176,12 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Search screen and scrollback with optional regex".into(),
             shortcut: "⌘F",
             action: PaletteAction::Find,
+        },
+        PaletteItem {
+            title: "Editing: Vi Copy Mode".into(),
+            subtitle: "Navigate scrollback, search & yank without a mouse (hjkl, /, v/V, y)".into(),
+            shortcut: "⌘⇧X",
+            action: PaletteAction::ToggleCopyMode,
         },
         PaletteItem {
             title: "Rewind Screen".into(),
@@ -314,6 +322,12 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Install Tachyon skill & OSC 7501 hooks for detected agents".into(),
             shortcut: "",
             action: PaletteAction::SetupAgentIntegrations,
+        },
+        PaletteItem {
+            title: "Notifications: Toggle Subtle Agent Sound Cues".into(),
+            subtitle: "Play gentle chimes when background agents transition to blocked or done".into(),
+            shortcut: "",
+            action: PaletteAction::ToggleSoundCues,
         },
         PaletteItem {
             title: "Reconnect & Refresh All Hosts".into(),
@@ -930,6 +944,8 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
             with_window(win_id, |w| w.open_find());
             return;
         }
+        PaletteAction::ToggleCopyMode => with_window(win_id, |w| w.toggle_copy_mode()),
+        PaletteAction::ToggleSoundCues => super::toggle_sound_cues(),
         PaletteAction::RewindBack => with_window(win_id, |w| w.rewind_step(true)),
         PaletteAction::Neutrino => with_window(win_id, |w| w.toggle_neutrino()),
         PaletteAction::Monitor => with_window(win_id, |w| w.toggle_monitor()),

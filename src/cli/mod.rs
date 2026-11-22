@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+mod tui;
+
 use crate::mux::client::{HandoffSpec, MuxClient};
 use crate::mux::model::{HostColor, HostEntry, SplitDir};
 use crate::mux::{
@@ -40,7 +42,7 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 continue;
             }
             "server" | "bridge" | "hosts" | "workspace" | "ws" | "worktree" | "wt" | "agents"
-            | "agent" | "ls" | "new" | "session" | "window" | "split" | "run" | "wait"
+            | "agent" | "tui" | "ls" | "new" | "session" | "window" | "split" | "run" | "wait"
             | "send" | "capture" | "rewind" | "events" | "skill" | "status" | "hook"
             | "help" | "--help" | "-h" => {
                 return true;
@@ -113,6 +115,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "workspace" | "ws" => cmd_workspace(&opts, tail),
         "worktree" | "wt" => cmd_worktree(&opts, tail),
         "agents" | "agent" => cmd_agents(&opts, tail),
+        "tui" => tui::cmd_tui(&opts, tail),
         "ls" => cmd_ls(&opts),
         "new" => cmd_session_new(&opts, tail),
         "session" => cmd_session(&opts, tail),
@@ -2868,6 +2871,8 @@ Sessions, Windows & Automation:
   tachyon capture [-b B] [--lines N] [--ansi]
   tachyon rewind [-b B] [--list | --frame N | --seq S] [--provenance C,R] [--ansi]
   tachyon events [-s SESSION] [--json]
+  tachyon tui [-b B] [--agents-only] [--filter Q] [--readonly] [--once]
+                                            narrow-screen-responsive SSH/mobile attach UI
 
 Coding Agents & Live Status (OSC 7501):
   tachyon agents [--all-hosts] [--state S]  list live & blocked coding agents across hosts

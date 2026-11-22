@@ -155,6 +155,21 @@ impl Notifier {
     /// Post a notification for a local or remote Mux v2 agent/block transition.
     /// Clicking it brings Tachyon forward and focuses `(host, window_id, block_id)`.
     pub fn post_mux(&self, host: &str, window_id: &str, block_id: &str, title: &str, subtitle: &str, body: &str) {
+        self.post_mux_with_sound(host, window_id, block_id, title, subtitle, body, true);
+    }
+
+    /// Variant allowing callers to suppress macOS's default banner sound when
+    /// a subtle custom audio cue already played.
+    pub fn post_mux_with_sound(
+        &self,
+        host: &str,
+        window_id: &str,
+        block_id: &str,
+        title: &str,
+        subtitle: &str,
+        body: &str,
+        play_default_sound: bool,
+    ) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let content = UNMutableNotificationContent::new();
@@ -163,7 +178,11 @@ impl Notifier {
             content.setSubtitle(&NSString::from_str(subtitle));
         }
         content.setBody(&NSString::from_str(body));
-        content.setSound(Some(&UNNotificationSound::defaultSound()));
+        if play_default_sound {
+            content.setSound(Some(&UNNotificationSound::defaultSound()));
+        } else {
+            content.setSound(None);
+        }
         content.setThreadIdentifier(&NSString::from_str(&format!("tachyon.mux.{host}.{window_id}")));
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &NSString::from_str(&mux_identifier(host, window_id, block_id, seq)),

@@ -564,6 +564,17 @@ pub struct MacConfig {
     /// Post macOS notifications when an unfocused local or remote coding agent
     /// transitions to `blocked`, `done`, or `error` (OSC 7501).
     pub notify_agent_status: bool,
+    /// Play subtle macOS sound cues when background agents transition to
+    /// `blocked`, `done`, or `error` (opt-in; off by default).
+    pub sound_cues: bool,
+    /// Playback volume (`0.0..=1.0`) for subtle agent sound cues.
+    pub sound_volume: f32,
+    /// macOS system sound name (or `"None"`) for `blocked` transitions.
+    pub sound_blocked: String,
+    /// macOS system sound name (or `"None"`) for `done` transitions.
+    pub sound_done: String,
+    /// macOS system sound name (or `"None"`) for `error` transitions.
+    pub sound_error: String,
     /// Fairy, the assistant: her button at the bottom right, and where her
     /// socket is (empty for where she keeps it).
     pub fairy: bool,
@@ -583,6 +594,11 @@ impl Default for MacConfig {
             option_as_meta: OptionAsMeta::default(),
             notify_after_secs: 10,
             notify_agent_status: true,
+            sound_cues: false,
+            sound_volume: 0.35,
+            sound_blocked: "Tink".into(),
+            sound_done: "Glass".into(),
+            sound_error: "Basso".into(),
             fairy: true,
             fairy_socket: String::new(),
             editor: "auto".into(),
@@ -900,6 +916,11 @@ impl Config {
             "server.persist_sessions" => self.server.persist_sessions = parse_bool(value)?,
             "server.auto_resume_agents" => self.server.auto_resume_agents = parse_bool(value)?,
             "notify.agent_status" => self.macos.notify_agent_status = parse_bool(value)?,
+            "notify.sound_cues" => self.macos.sound_cues = parse_bool(value)?,
+            "notify.sound_volume" => self.macos.sound_volume = parse_f32(value, 0.0, 1.0)?,
+            "notify.sound_blocked" => self.macos.sound_blocked = value.trim().to_string(),
+            "notify.sound_done" => self.macos.sound_done = value.trim().to_string(),
+            "notify.sound_error" => self.macos.sound_error = value.trim().to_string(),
             "window.hints" => self.window.hints = parse_bool(value)?,
             "window.sidebar" => self.window.sidebar = parse_bool(value)?,
             "window.sidebar_width" => self.window.sidebar_width = parse_f32(value, 180.0, 360.0)?,
@@ -1381,5 +1402,28 @@ mod contrast_tests {
 
         let bad = Config::parse("server.persist_sessions = maybe\n");
         assert_eq!(bad.warnings.len(), 1);
+    }
+
+    #[test]
+    fn sound_cue_keys_default_off_and_validate() {
+        let def = Config::default();
+        assert!(!def.macos.sound_cues);
+        assert!((def.macos.sound_volume - 0.35).abs() < 1e-6);
+        assert_eq!(def.macos.sound_blocked, "Tink");
+        assert_eq!(def.macos.sound_done, "Glass");
+        assert_eq!(def.macos.sound_error, "Basso");
+
+        let custom = Config::parse(
+            "notify.sound_cues = true\nnotify.sound_volume = 0.25\nnotify.sound_blocked = Pop\nnotify.sound_done = Ping\nnotify.sound_error = None\n",
+        );
+        assert!(custom.warnings.is_empty(), "{:?}", custom.warnings);
+        assert!(custom.macos.sound_cues);
+        assert!((custom.macos.sound_volume - 0.25).abs() < 1e-6);
+        assert_eq!(custom.macos.sound_blocked, "Pop");
+        assert_eq!(custom.macos.sound_done, "Ping");
+        assert_eq!(custom.macos.sound_error, "None");
+
+        let bad = Config::parse("notify.sound_cues = loud\nnotify.sound_volume = 1.5\n");
+        assert_eq!(bad.warnings.len(), 2);
     }
 }
