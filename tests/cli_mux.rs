@@ -1261,3 +1261,179 @@ fn cli_worktree_lifecycle_and_multi_host_starter_templates() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_agent_handoffs_report_to_parent_and_wait_until_blocked_done_idle() {
+    let dir = temp_dir("handoff-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    let log_file = dir.join("parent_inbox.log");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // 1. Spawn a parent pane that records lines delivered into its PTY input stream.
+    let reader_cmd = format!(
+        "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; printf 'GOT:%s\\n' \"$line\"; done",
+        log_file.display()
+    );
+    let (code, out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["new", "parent-agent", "--json", "--", "/bin/sh", "-c", &reader_cmd],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let parent_v: Value = serde_json::from_str(&out).unwrap();
+    let parent_bid = parent_v["block"]["id"].as_str().unwrap().to_string();
+    std::thread::sleep(Duration::from_millis(80));
+
+    // 2. Spawn a background helper reporting back on exit (`--bg --report-to <parent>`).
+    let (code, run_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "run",
+            "--bg",
+            "--report-to",
+            &parent_bid,
+            "--label",
+            "build-check",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo ALL_GREEN_42; exit 0",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let run_v: Value = serde_json::from_str(&run_out).unwrap();
+    assert_eq!(run_v["handoff"]["report_to"], parent_bid);
+
+    let mut inbox = String::new();
+    for _ in 0..35 {
+        inbox = std::fs::read_to_string(&log_file).unwrap_or_default();
+        if inbox.contains("ALL_GREEN_42") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        inbox.contains("<tachyon from=\"build-check\"")
+            && inbox.contains("state=\"exit\"")
+            && inbox.contains("exit_code=\"0\"")
+            && inbox.contains("ALL_GREEN_42</tachyon>"),
+        "expected structured exit handoff in parent inbox, got: {inbox:?}"
+    );
+
+    // 3. Wait genuinely (`tachyon wait --until blocked`) on a helper emitting blocked after 150ms.
+    let blk_cmd = format!(
+        "sleep 0.15; '{}' status --state blocked --app claude --msg 'Approve deploy'; sleep 15",
+        bin()
+    );
+    let (code, h1_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["run", "--bg", "--label", "wait-target", "--json", "--", "/bin/sh", "-c", &blk_cmd],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let h1_v: Value = serde_json::from_str(&h1_out).unwrap();
+    let h1_bid = h1_v["block"]["id"].as_str().unwrap().to_string();
+
+    let (code, wait_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "wait",
+            "-b",
+            &h1_bid,
+            "--until",
+            "blocked",
+            "--timeout",
+            "5000",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}, out: {wait_out}");
+    let wait_v: Value = serde_json::from_str(&wait_out).unwrap();
+    assert_eq!(wait_v["matched"], "blocked");
+    assert_eq!(wait_v["exited"], false);
+    assert_eq!(wait_v["status"]["msg"], "Approve deploy");
+
+    // 4. Handoff on live `--report-on blocked` while the helper stays running.
+    let rev_cmd = format!(
+        "sleep 0.12; '{}' status --state blocked --app claude --msg 'Need signoff'; sleep 15",
+        bin()
+    );
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "run",
+            "--bg",
+            "--report-to",
+            &parent_bid,
+            "--label",
+            "reviewer",
+            "--report-on",
+            "blocked",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            &rev_cmd,
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let mut inbox2 = String::new();
+    for _ in 0..35 {
+        inbox2 = std::fs::read_to_string(&log_file).unwrap_or_default();
+        if inbox2.contains("from=\"reviewer\"") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        inbox2.contains("<tachyon from=\"reviewer\"")
+            && inbox2.contains("state=\"blocked\"")
+            && inbox2.contains("msg=\"Need signoff\""),
+        "expected live blocked handoff in parent inbox, got: {inbox2:?}"
+    );
+
+    // 5. Wait genuinely on `--until done` transition while helper stays alive.
+    let done_cmd = format!(
+        "sleep 0.12; '{}' status --state done --app claude --msg 'Finished pass'; sleep 15",
+        bin()
+    );
+    let (code, h2_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["run", "--bg", "--label", "done-target", "--json", "--", "/bin/sh", "-c", &done_cmd],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let h2_v: Value = serde_json::from_str(&h2_out).unwrap();
+    let h2_bid = h2_v["block"]["id"].as_str().unwrap().to_string();
+
+    let (code, wait_done_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "wait",
+            "-b",
+            &h2_bid,
+            "--until",
+            "done",
+            "--timeout",
+            "5000",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}, out: {wait_done_out}");
+    let wait_done_v: Value = serde_json::from_str(&wait_done_out).unwrap();
+    assert_eq!(wait_done_v["matched"], "done");
+    assert_eq!(wait_done_v["exited"], false);
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

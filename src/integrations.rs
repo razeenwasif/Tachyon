@@ -321,6 +321,12 @@ tachyon split --down -- <command>
 # Run a command in a managed pane, wait for completion, and capture output
 tachyon run --wait --capture -- <command>
 
+# Spawn a background helper pane that reports `<tachyon ...>` completion back to this pane
+tachyon run --bg --report-to self --label helper -- <command>
+
+# Wait for a helper agent/pane without polling (exit|blocked|done|error|idle)
+tachyon wait -b <block_id> --until blocked,done,error --capture
+
 # Run on a remote host (e.g. Mac mini `kagutsuchi`)
 tachyon -S kagutsuchi run --wait --capture -- <command>
 

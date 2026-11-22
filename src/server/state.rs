@@ -19,7 +19,7 @@ use crate::mux::model::{
 };
 use crate::mux::proto::{Frame, PROTOCOL_VERSION};
 use crate::mux::{local_hostname, unix_now};
-use crate::term::{Processor, Term};
+use crate::term::{Processor, ProgramState, ProgramStatus, Term, TermMode};
 
 use super::persist::{
     self, PersistedPane, PersistedSession, PersistedState, PersistedWindow, RestoreReport,
@@ -266,6 +266,97 @@ pub struct Block {
     exit_code: Mutex<Option<i32>>,
     /// Keep block record around after exit (e.g. for `run` blocks inspected shortly after).
     keep_after_exit: bool,
+    handoff: Mutex<Option<HandoffState>>,
+}
+
+/// Wait target for `tachyon wait --until ...` / `block.wait` RPC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitCondition {
+    Exit,
+    State(ProgramState),
+}
+
+impl WaitCondition {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let low = raw.trim().to_ascii_lowercase();
+        if matches!(low.as_str(), "exit" | "exited") {
+            Some(Self::Exit)
+        } else {
+            ProgramState::parse(&low).map(Self::State)
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exit => "exit",
+            Self::State(st) => st.as_str(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WaitResult {
+    matched: String,
+    exit_code: Option<i32>,
+    exited: bool,
+    status: Option<ProgramStatus>,
+    status_inferred: bool,
+}
+
+impl WaitResult {
+    fn to_json(&self, block_id: &str) -> Value {
+        json!({
+            "block_id": block_id,
+            "matched": self.matched,
+            "exited": self.exited,
+            "exit_code": self.exit_code,
+            "status": self.status.as_ref().map(crate::mux::model::status_to_json),
+            "status_inferred": self.status_inferred,
+        })
+    }
+}
+
+struct StateWaiter {
+    id: u64,
+    targets: Vec<WaitCondition>,
+    tx: Sender<WaitResult>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HandoffConfig {
+    pub report_to: String,
+    pub from_label: Option<String>,
+    pub notify_on: Vec<WaitCondition>,
+    pub capture_lines: usize,
+    pub send_enter: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HandoffState {
+    config: HandoffConfig,
+    last_reported: Option<String>,
+    reported_exit: bool,
+}
+
+impl HandoffState {
+    fn from_config(config: HandoffConfig) -> Self {
+        Self {
+            config,
+            last_reported: None,
+            reported_exit: false,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let on: Vec<&'static str> = self.config.notify_on.iter().map(|c| c.as_str()).collect();
+        json!({
+            "report_to": self.config.report_to,
+            "from": self.config.from_label,
+            "notify_on": on,
+            "capture_lines": self.config.capture_lines,
+            "send_enter": self.config.send_enter,
+        })
+    }
 }
 
 impl Block {
@@ -387,7 +478,7 @@ struct StateInner {
     blocks: BTreeMap<String, Arc<Block>>,
     clients: HashMap<String, Arc<ClientOutbox>>,
     recent_exits: VecDeque<(String, i32)>,
-    exit_waiters: HashMap<String, Vec<Sender<i32>>>,
+    state_waiters: HashMap<String, Vec<StateWaiter>>,
 }
 
 /// Control action returned by `ServerState::handle_rpc`.
@@ -496,7 +587,7 @@ impl ServerState {
                 blocks: BTreeMap::new(),
                 clients: HashMap::new(),
                 recent_exits: VecDeque::new(),
-                exit_waiters: HashMap::new(),
+                state_waiters: HashMap::new(),
             }),
             persist: PersistCoordinator::new(persist),
         });
@@ -739,6 +830,7 @@ impl ServerState {
                         false,
                         initial_run,
                         pane.awake,
+                        None,
                     ) {
                         Ok(block) => {
                             if initial_run.is_some() {
@@ -1031,6 +1123,7 @@ impl ServerState {
             "block.kill" => self.rpc_block_kill(req),
             "block.inspect" => self.rpc_block_inspect(req),
             "block.set_awake" => self.rpc_block_set_awake(req),
+            "block.set_handoff" => self.rpc_block_set_handoff(req),
             "block.detach" => self.rpc_block_detach(outbox, req),
             "block.send" => self.rpc_block_send(req),
             "block.capture" => self.rpc_block_capture(req),
@@ -1134,31 +1227,6 @@ impl ServerState {
         Ok(report.to_json())
     }
 
-    fn spawn_block(
-        self: &Arc<Self>,
-        session_id: &str,
-        window_id: &str,
-        cols: u16,
-        rows: u16,
-        cwd: Option<&str>,
-        cmd: Option<&[String]>,
-        label: Option<String>,
-        keep_after_exit: bool,
-    ) -> Result<Arc<Block>, String> {
-        self.spawn_block_with_options(
-            session_id,
-            window_id,
-            cols,
-            rows,
-            cwd,
-            cmd,
-            label,
-            keep_after_exit,
-            None,
-            false,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn spawn_block_with_options(
         self: &Arc<Self>,
@@ -1172,6 +1240,7 @@ impl ServerState {
         keep_after_exit: bool,
         initial_run: Option<&str>,
         initial_awake: bool,
+        handoff: Option<HandoffConfig>,
     ) -> Result<Arc<Block>, String> {
         let block_id = self.alloc_id("b");
         let is_login_shell = cmd.is_none_or(|parts| parts.is_empty());
@@ -1286,6 +1355,7 @@ impl ServerState {
             alive: AtomicBool::new(true),
             exit_code: Mutex::new(None),
             keep_after_exit,
+            handoff: Mutex::new(handoff.map(HandoffState::from_config)),
         });
 
         let state_reader = Arc::clone(self);
@@ -1361,8 +1431,9 @@ impl ServerState {
             }
         };
 
-        let keep = cmd.is_some();
-        let block = self.spawn_block(
+        let handoff = parse_handoff_config(req.get("handoff"))?;
+        let keep = cmd.is_some() || handoff.is_some();
+        let block = self.spawn_block_with_options(
             &session_id,
             &window_id,
             cols,
@@ -1371,6 +1442,9 @@ impl ServerState {
             cmd.as_deref(),
             label,
             keep,
+            None,
+            false,
+            handoff,
         )?;
         let block_id = block.id.clone();
 
@@ -1511,8 +1585,21 @@ impl ServerState {
         let label = req.get("label").and_then(Value::as_str).map(str::to_string);
 
         let window_id = self.alloc_id("w");
-        let keep = cmd.is_some();
-        let block = self.spawn_block(&sid, &window_id, cols, rows, cwd, cmd.as_deref(), label, keep)?;
+        let handoff = parse_handoff_config(req.get("handoff"))?;
+        let keep = cmd.is_some() || handoff.is_some();
+        let block = self.spawn_block_with_options(
+            &sid,
+            &window_id,
+            cols,
+            rows,
+            cwd,
+            cmd.as_deref(),
+            label,
+            keep,
+            None,
+            false,
+            handoff,
+        )?;
         let block_id = block.id.clone();
 
         let window_info = {
@@ -1678,8 +1765,21 @@ impl ServerState {
         let explicit_cwd = req.get("cwd").and_then(Value::as_str);
         let cwd = explicit_cwd.or(inherited_cwd.as_deref());
 
-        let keep = cmd.is_some();
-        let block = self.spawn_block(&sid, &wid, cols, rows, cwd, cmd.as_deref(), label, keep)?;
+        let handoff = parse_handoff_config(req.get("handoff"))?;
+        let keep = cmd.is_some() || handoff.is_some();
+        let block = self.spawn_block_with_options(
+            &sid,
+            &wid,
+            cols,
+            rows,
+            cwd,
+            cmd.as_deref(),
+            label,
+            keep,
+            None,
+            false,
+            handoff,
+        )?;
         let new_id = block.id.clone();
 
         let window_info = {
@@ -2039,52 +2139,272 @@ impl ServerState {
         }
     }
 
+    fn rpc_block_set_handoff(&self, req: &Value) -> Result<Value, String> {
+        let bid = req.get("block_id").and_then(Value::as_str).ok_or("missing block_id")?;
+        let cfg = parse_handoff_config(Some(req))?
+            .ok_or("missing report_to")?;
+        if cfg.report_to == bid {
+            return Err("block cannot target itself for handoff".into());
+        }
+        let block = self
+            .inner
+            .lock()
+            .blocks
+            .get(bid)
+            .cloned()
+            .ok_or_else(|| format!("no block `{bid}`"))?;
+        let st = HandoffState::from_config(cfg);
+        let resp = st.to_json();
+        *block.handoff.lock() = Some(st);
+
+        if let Some(code) = *block.exit_code.lock() {
+            self.deliver_handoff(&block, "exit", Some(code), None, true);
+        }
+        Ok(json!({ "block_id": bid, "handoff": resp }))
+    }
+
     fn rpc_block_wait(&self, req: &Value) -> Result<Value, String> {
         let bid = req.get("block_id").and_then(Value::as_str).ok_or("missing block_id")?;
         let timeout = req.get("timeout_ms").and_then(Value::as_u64).map(Duration::from_millis);
+        let after_change = req.get("after_change").and_then(Value::as_bool).unwrap_or(false);
+        let targets = parse_wait_until(req.get("until"))?;
 
-        let rx = {
+        let waiter_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (rx, block_opt) = {
             let mut st = self.inner.lock();
             if let Some((_, code)) = st.recent_exits.iter().find(|(id, _)| id == bid) {
-                return Ok(json!({ "block_id": bid, "exit_code": *code }));
+                let res = exited_wait_result(&targets, *code, None);
+                return Ok(res.to_json(bid));
             }
-            if let Some(b) = st.blocks.get(bid) {
-                if let Some(code) = *b.exit_code.lock() {
-                    return Ok(json!({ "block_id": bid, "exit_code": code }));
-                }
-            } else {
-                return Err(format!("no block `{bid}`"));
-            }
+            let block = st
+                .blocks
+                .get(bid)
+                .cloned()
+                .ok_or_else(|| format!("no block `{bid}`"))?;
             let (tx, rx) = mpsc::channel();
-            st.exit_waiters.entry(bid.to_string()).or_default().push(tx);
-            rx
+            st.state_waiters
+                .entry(bid.to_string())
+                .or_default()
+                .push(StateWaiter {
+                    id: waiter_id,
+                    targets: targets.clone(),
+                    tx,
+                });
+            (rx, Some(block))
         };
 
-        let code = match timeout {
-            Some(d) => rx
-                .recv_timeout(d)
-                .map_err(|_| format!("timed out waiting for block `{bid}`"))?,
+        if let Some(block) = block_opt {
+            if !after_change {
+                let info = block.info();
+                if let Some(res) = evaluate_wait_conditions(&targets, &info) {
+                    let mut st = self.inner.lock();
+                    if let Some(list) = st.state_waiters.get_mut(bid) {
+                        list.retain(|w| w.id != waiter_id);
+                        if list.is_empty() {
+                            st.state_waiters.remove(bid);
+                        }
+                    }
+                    return Ok(res.to_json(bid));
+                }
+            }
+        }
+
+        let res = match timeout {
+            Some(d) => match rx.recv_timeout(d) {
+                Ok(res) => res,
+                Err(_) => {
+                    let mut st = self.inner.lock();
+                    if let Some(list) = st.state_waiters.get_mut(bid) {
+                        list.retain(|w| w.id != waiter_id);
+                        if list.is_empty() {
+                            st.state_waiters.remove(bid);
+                        }
+                    }
+                    return Err(format!("timed out waiting for block `{bid}`"));
+                }
+            },
             None => rx
                 .recv()
                 .map_err(|_| format!("waiter dropped for block `{bid}`"))?,
         };
-        Ok(json!({ "block_id": bid, "exit_code": code }))
+        Ok(res.to_json(bid))
+    }
+
+    fn notify_block_waiters(&self, bid: &str, info: &BlockInfo) {
+        let mut ready: Vec<(Sender<WaitResult>, WaitResult)> = Vec::new();
+        {
+            let mut st = self.inner.lock();
+            if let Some(list) = st.state_waiters.get_mut(bid) {
+                let mut i = 0;
+                while i < list.len() {
+                    if let Some(res) = evaluate_wait_conditions(&list[i].targets, info) {
+                        let w = list.swap_remove(i);
+                        ready.push((w.tx, res));
+                    } else {
+                        i += 1;
+                    }
+                }
+                if list.is_empty() {
+                    st.state_waiters.remove(bid);
+                }
+            }
+        }
+        for (tx, res) in ready {
+            let _ = tx.send(res);
+        }
+    }
+
+    fn deliver_handoff(
+        &self,
+        block: &Arc<Block>,
+        state_str: &str,
+        exit_code: Option<i32>,
+        msg: Option<&str>,
+        is_exit: bool,
+    ) {
+        let cfg = {
+            let mut guard = block.handoff.lock();
+            let Some(ref mut hs) = *guard else {
+                return;
+            };
+            let wanted = if is_exit {
+                hs.config.notify_on.contains(&WaitCondition::Exit)
+                    || (exit_code == Some(0)
+                        && hs.config.notify_on.contains(&WaitCondition::State(ProgramState::Done)))
+                    || (exit_code.is_some_and(|c| c != 0)
+                        && hs.config.notify_on.contains(&WaitCondition::State(ProgramState::Error)))
+            } else if let Some(ps) = ProgramState::parse(state_str) {
+                hs.config.notify_on.contains(&WaitCondition::State(ps))
+            } else {
+                false
+            };
+            if !wanted {
+                return;
+            }
+            if is_exit {
+                if hs.reported_exit {
+                    return;
+                }
+                hs.reported_exit = true;
+            } else {
+                if hs.last_reported.as_deref() == Some(state_str) {
+                    return;
+                }
+                hs.last_reported = Some(state_str.to_string());
+            }
+            hs.config.clone()
+        };
+
+        let label = block.label.lock().clone();
+        let from_name = cfg
+            .from_label
+            .clone()
+            .or(label)
+            .unwrap_or_else(|| block.id.clone());
+        let captured = block.capture(Some(cfg.capture_lines), false);
+
+        let parent = self.inner.lock().blocks.get(&cfg.report_to).cloned();
+        let mut delivered = false;
+        let mut formatted_report = None;
+        if let Some(p) = parent {
+            if p.alive.load(Ordering::Acquire) {
+                let bracketed = p.parsed.lock().term.mode.contains(TermMode::BRACKETED_PASTE);
+                let report = format_handoff_report(
+                    &from_name,
+                    &block.id,
+                    state_str,
+                    exit_code,
+                    msg,
+                    &captured,
+                    bracketed,
+                );
+                let write_ok = if bracketed {
+                    let wrapped = format!("\x1b[200~{report}\x1b[201~");
+                    let ok = p.pty.write(wrapped.as_bytes()).is_ok();
+                    if ok && cfg.send_enter {
+                        let _ = p.pty.write(b"\r");
+                    }
+                    ok
+                } else {
+                    let mut payload = report.clone();
+                    if cfg.send_enter {
+                        payload.push('\r');
+                    }
+                    p.pty.write(payload.as_bytes()).is_ok()
+                };
+                if write_ok {
+                    p.input_seq.fetch_add(1, Ordering::Release);
+                    delivered = true;
+                }
+                formatted_report = Some(report);
+            }
+        }
+
+        self.broadcast_event(json!({
+            "event": "block.handoff",
+            "from_block": block.id,
+            "to_block": cfg.report_to,
+            "from": from_name,
+            "state": state_str,
+            "exit_code": exit_code,
+            "delivered": delivered,
+            "report": formatted_report,
+        }));
+    }
+
+    fn on_block_state_update(&self, block: &Arc<Block>, info: &BlockInfo, status_updated: bool) {
+        self.notify_block_waiters(&block.id, info);
+        if status_updated {
+            if let Some(ref st) = info.status {
+                if st.state == ProgramState::Working {
+                    if let Some(ref mut hs) = *block.handoff.lock() {
+                        hs.last_reported = None;
+                    }
+                } else {
+                    self.deliver_handoff(
+                        block,
+                        st.state.as_str(),
+                        None,
+                        st.msg.as_deref(),
+                        false,
+                    );
+                }
+            }
+        }
     }
 
     fn record_block_exit(&self, block: &Arc<Block>, code: i32) {
         *block.exit_code.lock() = Some(code);
         block.alive.store(false, Ordering::Release);
 
-        let waiters = {
+        let info = block.info();
+        self.notify_block_waiters(&block.id, &info);
+        self.deliver_handoff(block, "exit", Some(code), None, true);
+
+        let leftovers: Vec<Sender<WaitResult>> = {
             let mut st = self.inner.lock();
             st.recent_exits.push_back((block.id.clone(), code));
             while st.recent_exits.len() > RECENT_EXITS_CAP {
                 st.recent_exits.pop_front();
             }
-            st.exit_waiters.remove(&block.id).unwrap_or_default()
+            st.state_waiters
+                .remove(&block.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|w| w.tx)
+                .collect()
         };
-        for tx in waiters {
-            let _ = tx.send(code);
+        if !leftovers.is_empty() {
+            let fallback = WaitResult {
+                matched: "exited".into(),
+                exit_code: Some(code),
+                exited: true,
+                status: info.status.clone(),
+                status_inferred: info.status_inferred,
+            };
+            for tx in leftovers {
+                let _ = tx.send(fallback.clone());
+            }
         }
 
         self.broadcast_event(json!({
@@ -2100,6 +2420,249 @@ impl ServerState {
                 self.mark_persist_dirty();
             }
         }
+    }
+}
+
+fn parse_wait_until(v: Option<&Value>) -> Result<Vec<WaitCondition>, String> {
+    let Some(val) = v else {
+        return Ok(vec![WaitCondition::Exit]);
+    };
+    let mut out = Vec::new();
+    match val {
+        Value::String(s) => {
+            for part in s.split(',') {
+                let t = part.trim();
+                if !t.is_empty() {
+                    let c = WaitCondition::parse(t)
+                        .ok_or_else(|| format!("invalid wait condition `{t}`"))?;
+                    if !out.contains(&c) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or("wait condition array items must be strings")?;
+                for part in s.split(',') {
+                    let t = part.trim();
+                    if !t.is_empty() {
+                        let c = WaitCondition::parse(t)
+                            .ok_or_else(|| format!("invalid wait condition `{t}`"))?;
+                        if !out.contains(&c) {
+                            out.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        _ => return Err("`until` must be a string or string array".into()),
+    }
+    if out.is_empty() {
+        out.push(WaitCondition::Exit);
+    }
+    Ok(out)
+}
+
+fn exited_wait_result(
+    targets: &[WaitCondition],
+    code: i32,
+    status: Option<&BlockInfo>,
+) -> WaitResult {
+    let matched = if targets.contains(&WaitCondition::Exit) {
+        "exit"
+    } else if code == 0 && targets.contains(&WaitCondition::State(ProgramState::Done)) {
+        "done"
+    } else if code != 0 && targets.contains(&WaitCondition::State(ProgramState::Error)) {
+        "error"
+    } else {
+        "exited"
+    };
+    WaitResult {
+        matched: matched.into(),
+        exit_code: Some(code),
+        exited: true,
+        status: status.and_then(|i| i.status.clone()),
+        status_inferred: status.is_some_and(|i| i.status_inferred),
+    }
+}
+
+fn evaluate_wait_conditions(targets: &[WaitCondition], info: &BlockInfo) -> Option<WaitResult> {
+    if !info.alive {
+        let code = info.exit_code.unwrap_or(0);
+        return Some(exited_wait_result(targets, code, Some(info)));
+    }
+    let st = info.status.as_ref().map(|s| s.state);
+    for &cond in targets {
+        let matched = match cond {
+            WaitCondition::Exit => false,
+            WaitCondition::State(want) => {
+                st == Some(want)
+                    || (want == ProgramState::Working && info.command_running)
+                    || (want == ProgramState::Idle
+                        && !info.command_running
+                        && matches!(st, None | Some(ProgramState::Idle) | Some(ProgramState::Done)))
+            }
+        };
+        if matched {
+            return Some(WaitResult {
+                matched: cond.as_str().into(),
+                exit_code: info.exit_code,
+                exited: false,
+                status: info.status.clone(),
+                status_inferred: info.status_inferred,
+            });
+        }
+    }
+    None
+}
+
+fn parse_handoff_config(v: Option<&Value>) -> Result<Option<HandoffConfig>, String> {
+    let Some(val) = v else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(None);
+    }
+    let report_to = val
+        .get("report_to")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("handoff missing non-empty `report_to`")?
+        .to_string();
+    let from_label = val
+        .get("from")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let notify_on = if val.get("notify_on").is_some() {
+        parse_wait_until(val.get("notify_on"))?
+    } else {
+        vec![
+            WaitCondition::Exit,
+            WaitCondition::State(ProgramState::Blocked),
+            WaitCondition::State(ProgramState::Done),
+            WaitCondition::State(ProgramState::Error),
+        ]
+    };
+    let capture_lines = val
+        .get("capture_lines")
+        .and_then(Value::as_u64)
+        .map(|n| (n as usize).clamp(1, 200))
+        .unwrap_or(40);
+    let send_enter = val
+        .get("send_enter")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    Ok(Some(HandoffConfig {
+        report_to,
+        from_label,
+        notify_on,
+        capture_lines,
+        send_enter,
+    }))
+}
+
+fn escape_xml_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn sanitize_handoff_body(raw: &str, multiline: bool) -> String {
+    let mut cleaned = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            continue;
+        }
+        cleaned.push(ch);
+    }
+    let trimmed_lines: Vec<&str> = cleaned
+        .lines()
+        .map(|l| l.trim_end())
+        .skip_while(|l| l.is_empty())
+        .collect();
+    let end = trimmed_lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let slice = &trimmed_lines[..end];
+    let escaped_close = |line: &str| {
+        line.replace("</tachyon>", "&lt;/tachyon&gt;")
+            .replace("</Tachyon>", "&lt;/Tachyon&gt;")
+    };
+    let mut body = if multiline {
+        slice
+            .iter()
+            .map(|l| escaped_close(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        slice
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| escaped_close(l.trim()))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    const MAX_BODY: usize = 4096;
+    if body.len() > MAX_BODY {
+        let mut cut = MAX_BODY;
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body.truncate(cut);
+        body.push_str("…");
+    }
+    body
+}
+
+/// Format a sanitized `<tachyon ...>...</tachyon>` agent handoff payload.
+pub fn format_handoff_report(
+    from: &str,
+    block_id: &str,
+    state: &str,
+    exit_code: Option<i32>,
+    msg: Option<&str>,
+    captured: &str,
+    multiline: bool,
+) -> String {
+    let mut attrs = format!(
+        "from=\"{}\" block=\"{}\" state=\"{}\"",
+        escape_xml_attr(from),
+        escape_xml_attr(block_id),
+        escape_xml_attr(state)
+    );
+    if let Some(code) = exit_code {
+        attrs.push_str(&format!(" exit_code=\"{code}\""));
+    }
+    if let Some(m) = msg.filter(|s| !s.trim().is_empty()) {
+        attrs.push_str(&format!(" msg=\"{}\"", escape_xml_attr(m)));
+    }
+    let body = sanitize_handoff_body(captured, multiline);
+    if body.is_empty() {
+        format!("<tachyon {attrs}></tachyon>")
+    } else if multiline {
+        format!("<tachyon {attrs}>\n{body}\n</tachyon>")
+    } else {
+        format!("<tachyon {attrs}>{body}</tachyon>")
     }
 }
 
@@ -2302,6 +2865,7 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
                     "block": info.to_json(),
                     "status": info.status.as_ref().map(crate::mux::model::status_to_json),
                 }));
+                state.on_block_state_update(&block, &info, true);
             }
             continue;
         }
@@ -2349,6 +2913,10 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
                 "block": info.to_json(),
                 "status": info.status.as_ref().map(crate::mux::model::status_to_json),
             }));
+            state.on_block_state_update(&block, &info, true);
+        } else if meta_changed {
+            let info = block.info();
+            state.on_block_state_update(&block, &info, false);
         }
         if meta_changed || status_changed || inferred_changed {
             state.mark_persist_dirty();
@@ -2404,4 +2972,97 @@ fn server_rewind_root() -> Option<std::path::PathBuf> {
 fn server_rewind_dir(block_id: &str) -> Option<std::path::PathBuf> {
     let root = server_rewind_root()?;
     Some(root.join(format!("{}-{block_id}", std::process::id())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_block_info(alive: bool, exit_code: Option<i32>, command_running: bool, state: Option<ProgramState>) -> BlockInfo {
+        BlockInfo {
+            id: "b_1".into(),
+            session_id: "s_1".into(),
+            window_id: "w_1".into(),
+            label: Some("worker".into()),
+            title: None,
+            cwd: None,
+            command_running,
+            command: None,
+            pid: 1,
+            cols: 80,
+            rows: 24,
+            alive,
+            exit_code,
+            awake: false,
+            attached_clients: 0,
+            created_at: 0,
+            status: state.map(|st| ProgramStatus {
+                state: st,
+                app: Some("claude".into()),
+                kind: None,
+                msg: Some("Needs approval".into()),
+                label: None,
+            }),
+            status_inferred: false,
+        }
+    }
+
+    #[test]
+    fn handoff_report_formats_sanitizes_and_escapes_xml_safely() {
+        let single = format_handoff_report(
+            "build\"&<1>",
+            "b_9",
+            "exit",
+            Some(0),
+            Some("All \"tests\" <pass>"),
+            "\n  line one\x07\nline </tachyon> two\n\n",
+            false,
+        );
+        assert!(!single.contains('\n'));
+        assert!(!single.contains('\x07'));
+        assert!(single.contains("from=\"build&quot;&amp;&lt;1&gt;\""));
+        assert!(single.contains("msg=\"All &quot;tests&quot; &lt;pass&gt;\""));
+        assert!(single.contains("line one | line &lt;/tachyon&gt; two</tachyon>"));
+
+        let multi = format_handoff_report(
+            "reviewer",
+            "b_2",
+            "blocked",
+            None,
+            Some("Approve tool"),
+            "line A\nline B",
+            true,
+        );
+        assert!(multi.starts_with("<tachyon from=\"reviewer\" block=\"b_2\" state=\"blocked\" msg=\"Approve tool\">\n"));
+        assert!(multi.ends_with("line A\nline B\n</tachyon>"));
+    }
+
+    #[test]
+    fn wait_condition_evaluation_handles_states_and_exit_safely() {
+        let working = test_block_info(true, None, true, Some(ProgramState::Working));
+        assert!(evaluate_wait_conditions(&[WaitCondition::State(ProgramState::Blocked)], &working).is_none());
+        let w = evaluate_wait_conditions(&[WaitCondition::State(ProgramState::Working)], &working).unwrap();
+        assert_eq!(w.matched, "working");
+        assert!(!w.exited);
+
+        let blocked = test_block_info(true, None, true, Some(ProgramState::Blocked));
+        let b = evaluate_wait_conditions(
+            &[WaitCondition::State(ProgramState::Blocked), WaitCondition::State(ProgramState::Done)],
+            &blocked,
+        )
+        .unwrap();
+        assert_eq!(b.matched, "blocked");
+        assert!(!b.exited);
+
+        let idle_shell = test_block_info(true, None, false, None);
+        let id = evaluate_wait_conditions(&[WaitCondition::State(ProgramState::Idle)], &idle_shell).unwrap();
+        assert_eq!(id.matched, "idle");
+
+        // Waiting for `blocked` on an already-exited block must wake cleanly instead of hanging.
+        let dead = test_block_info(false, Some(3), false, None);
+        let res = evaluate_wait_conditions(&[WaitCondition::State(ProgramState::Blocked)], &dead).unwrap();
+        assert_eq!(res.matched, "exited");
+        assert!(res.exited);
+        assert_eq!(res.exit_code, Some(3));
+    }
 }
