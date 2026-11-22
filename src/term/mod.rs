@@ -5,6 +5,7 @@ pub mod lens;
 pub mod rerun;
 pub mod rewind;
 pub mod copy_mode;
+pub mod export;
 pub mod find;
 pub mod image;
 mod restore;
@@ -636,35 +637,57 @@ impl Term {
         self.folds.contains_key(&id)
     }
 
+    fn append_row_text(&self, row: &Row, out: &mut String) {
+        let cells = row.cells();
+        for c in &cells[..row.trimmed_len()] {
+            if c.flags.contains(CellFlags::WIDE_SPACER) {
+                continue;
+            }
+            if c.ch & CLUSTER_TAG != 0 {
+                out.extend(self.cluster(c.ch).unwrap_or(&[]));
+            } else {
+                out.push(char::from_u32(c.ch).filter(|&ch| ch != '\0').unwrap_or(' '));
+            }
+        }
+        if !row.wrapped {
+            out.push('\n');
+        }
+    }
+
+    /// Fallback text of command `id`'s prompt/input line (`RowMark::INPUT`),
+    /// used when `OSC 133;C` did not supply `cmdline=`.
+    pub fn command_input_line(&self, id: u32) -> Option<String> {
+        let total = self.grid.total_lines();
+        let start = (0..total).rev().find(|&l| {
+            let m = self.grid.mark(l);
+            m.cmd == id && m.has(RowMark::INPUT)
+        })?;
+        let mut out = String::new();
+        for l in start..total {
+            let row = self.grid.line(l);
+            let wrapped = row.wrapped;
+            self.append_row_text(&row, &mut out);
+            if !wrapped {
+                break;
+            }
+        }
+        let trimmed = out.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+
     /// Command `id`'s output as text, folded lines included.
     pub fn output_text(&self, id: u32) -> Option<String> {
         let (start, end) = self.output_range(id)?;
         let mut out = String::new();
-        let line_text = |row: &Row, out: &mut String| {
-            let cells = row.cells();
-            for c in &cells[..row.trimmed_len()] {
-                if c.flags.contains(CellFlags::WIDE_SPACER) {
-                    continue;
-                }
-                if c.ch & CLUSTER_TAG != 0 {
-                    out.extend(self.cluster(c.ch).unwrap_or(&[]));
-                } else {
-                    out.push(char::from_u32(c.ch).filter(|&ch| ch != '\0').unwrap_or(' '));
-                }
-            }
-            if !row.wrapped {
-                out.push('\n');
-            }
-        };
         for l in start..end {
             let row = self.grid.line(l);
             match self.folds.get(&id).filter(|_| row.mark.has(RowMark::FOLDED)) {
                 Some(folded) => {
                     for p in folded {
-                        line_text(&p.unpack(self.cols()), &mut out);
+                        self.append_row_text(&p.unpack(self.cols()), &mut out);
                     }
                 }
-                None => line_text(&row, &mut out),
+                None => self.append_row_text(&row, &mut out),
             }
         }
         // A command's output ends at the next prompt: no trailing blank lines.

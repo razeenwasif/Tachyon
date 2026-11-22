@@ -125,6 +125,12 @@ thread_local! {
     static MACHINE_ITEMS: RefCell<Vec<Retained<NSMenuItem>>> = const { RefCell::new(Vec::new()) };
     /// A layout save is queued.
     static LAYOUT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Command block targeted by the currently open right-click context menu.
+    static CONTEXT_MENU_CMD: RefCell<Option<u32>> = const { RefCell::new(None) };
+}
+
+fn take_context_cmd() -> Option<u32> {
+    CONTEXT_MENU_CMD.with(|c| c.borrow_mut().take())
 }
 
 /// Tachyon is quitting: the host's shells stay, for next time.
@@ -377,6 +383,44 @@ define_class!(
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
+            let menu_target = query_window(self.id(), |w| w.context_menu_target(event)).flatten();
+            if let Some((pane_id, cmd, header, folded, has_sel)) = menu_target {
+                with_window(self.id(), |w| w.focus_pane_by_id(pane_id));
+                CONTEXT_MENU_CMD.with(|c| *c.borrow_mut() = Some(cmd));
+                if let Some(mtm) = MainThreadMarker::new() {
+                    let menu = NSMenu::new(mtm);
+                    menu.setAutoenablesItems(false);
+                    let ns = NSString::from_str;
+                    let target: &AnyObject = self.as_ref();
+                    if has_sel {
+                        let copy_item = unsafe {
+                            menu.addItemWithTitle_action_keyEquivalent(&ns("Copy"), Some(sel!(copy:)), &ns(""))
+                        };
+                        unsafe { copy_item.setTarget(Some(target)) };
+                        menu.addItem(&NSMenuItem::separatorItem(mtm));
+                    }
+                    let hdr_item = unsafe {
+                        menu.addItemWithTitle_action_keyEquivalent(&ns(&header), None, &ns(""))
+                    };
+                    hdr_item.setEnabled(false);
+
+                    let add_item = |title: &str, action: Sel| {
+                        let item = unsafe {
+                            menu.addItemWithTitle_action_keyEquivalent(&ns(title), Some(action), &ns(""))
+                        };
+                        unsafe { item.setTarget(Some(target)) };
+                    };
+                    add_item("Find in Command…", sel!(tachyonContextFindCommand:));
+                    add_item("Copy Output", sel!(tachyonContextCopyOutput:));
+                    add_item("Copy as Markdown", sel!(tachyonContextCopyMarkdown:));
+                    add_item("Export as Markdown…", sel!(tachyonContextExportMarkdown:));
+                    menu.addItem(&NSMenuItem::separatorItem(mtm));
+                    add_item(if folded { "Unfold Output" } else { "Fold Output" }, sel!(tachyonContextFoldOutput:));
+                    add_item("Select Output", sel!(tachyonContextSelectOutput:));
+                    NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+                    return;
+                }
+            }
             with_window(self.id(), |w| w.mouse_down(event, MouseButton::Right));
         }
 
@@ -654,6 +698,62 @@ define_class!(
         #[unsafe(method(tachyonFindRegex:))]
         fn find_regex(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), TermWindow::find_changed);
+        }
+
+        #[unsafe(method(tachyonFindCommand:))]
+        fn find_command(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::find_changed);
+        }
+
+        #[unsafe(method(tachyonFindInCommand:))]
+        fn find_in_command(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.open_find_in_command(None));
+        }
+
+        #[unsafe(method(tachyonCopyMarkdown:))]
+        fn copy_markdown(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), |w| w.copy_command_markdown(None));
+        }
+
+        #[unsafe(method(tachyonExportMarkdown:))]
+        fn export_markdown(&self, _sender: Option<&AnyObject>) {
+            export_command_markdown(self.id(), None);
+        }
+
+        #[unsafe(method(tachyonContextFindCommand:))]
+        fn context_find_command(&self, _sender: Option<&AnyObject>) {
+            let cmd = take_context_cmd();
+            with_window(self.id(), |w| w.open_find_in_command(cmd));
+        }
+
+        #[unsafe(method(tachyonContextCopyOutput:))]
+        fn context_copy_output(&self, _sender: Option<&AnyObject>) {
+            let Some(cmd) = take_context_cmd() else { return };
+            with_window(self.id(), |w| w.copy_output_for(cmd));
+        }
+
+        #[unsafe(method(tachyonContextCopyMarkdown:))]
+        fn context_copy_markdown(&self, _sender: Option<&AnyObject>) {
+            let cmd = take_context_cmd();
+            with_window(self.id(), |w| w.copy_command_markdown(cmd));
+        }
+
+        #[unsafe(method(tachyonContextExportMarkdown:))]
+        fn context_export_markdown(&self, _sender: Option<&AnyObject>) {
+            let cmd = take_context_cmd();
+            export_command_markdown(self.id(), cmd);
+        }
+
+        #[unsafe(method(tachyonContextFoldOutput:))]
+        fn context_fold_output(&self, _sender: Option<&AnyObject>) {
+            let Some(cmd) = take_context_cmd() else { return };
+            with_window(self.id(), |w| w.toggle_fold(cmd));
+        }
+
+        #[unsafe(method(tachyonContextSelectOutput:))]
+        fn context_select_output(&self, _sender: Option<&AnyObject>) {
+            let Some(cmd) = take_context_cmd() else { return };
+            with_window(self.id(), |w| w.select_output(cmd));
         }
 
         #[unsafe(method(tachyonCopyMode:))]
@@ -1387,6 +1487,8 @@ struct FindState {
     /// keystroke (⌘G after editing, say).
     query: String,
     regex: bool,
+    command_scope: bool,
+    scoped_cmd: Option<u32>,
     matches: Vec<crate::term::find::Match>,
     current: Option<usize>,
     /// The scrollback's length when searched: a different one means the
@@ -1423,16 +1525,17 @@ impl FindState {
 }
 
 /// The glass find bar at the top right: a search field, the match count,
-/// and a regex switch.
+/// a command-scope switch, and a regex switch.
 struct FindBar {
     host: Retained<NSView>,
     field: Retained<NSSearchField>,
     count: Retained<objc2_app_kit::NSTextField>,
+    command: Retained<objc2_app_kit::NSButton>,
     regex: Retained<objc2_app_kit::NSButton>,
 }
 
 impl FindBar {
-    const WIDTH: f64 = 400.0;
+    const WIDTH: f64 = 488.0;
     const HEIGHT: f64 = 36.0;
 
     fn new(mtm: MainThreadMarker, parent: &TachyonView) -> FindBar {
@@ -1461,6 +1564,11 @@ impl FindBar {
         count.setTextColor(Some(&NSColor::secondaryLabelColor()));
         count.setAlignment(objc2_app_kit::NSTextAlignment::Right);
         let target: &AnyObject = parent.as_ref();
+        let command = unsafe {
+            objc2_app_kit::NSButton::checkboxWithTitle_target_action(&NSString::from_str("Command"), Some(target), Some(sel!(tachyonFindCommand:)), mtm)
+        };
+        command.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(12.0)));
+        command.setToolTip(Some(&NSString::from_str("Search only the selected or last command's output (OSC 133)")));
         // A checkbox, so whether the query is a regular expression shows at
         // a glance.
         let regex = unsafe {
@@ -1470,10 +1578,11 @@ impl FindBar {
         regex.setToolTip(Some(&NSString::from_str("Search with a regular expression, like loss=0\\.[0-4] or error|warn")));
         content.addSubview(&field);
         content.addSubview(&count);
+        content.addSubview(&command);
         content.addSubview(&regex);
         host.setHidden(true);
         parent.addSubview(&host);
-        FindBar { host, field, count, regex }
+        FindBar { host, field, count, command, regex }
     }
 
     /// Place it at the top right of a view of `size`, below `top` points.
@@ -1485,9 +1594,11 @@ impl FindBar {
         if let Some(content) = unsafe { self.field.superview() } {
             content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
         }
-        let (count_w, regex_w) = (80.0, 64.0);
-        self.field.setFrame(NSRect::new(NSPoint::new(10.0, 6.0), NSSize::new(w - 10.0 - count_w - regex_w - 18.0, 24.0)));
-        self.count.setFrame(NSRect::new(NSPoint::new(w - count_w - regex_w - 12.0, 10.0), NSSize::new(count_w, 16.0)));
+        let (count_w, cmd_w, regex_w) = (84.0, 82.0, 60.0);
+        let field_w = (w - 10.0 - count_w - cmd_w - regex_w - 22.0).max(110.0);
+        self.field.setFrame(NSRect::new(NSPoint::new(10.0, 6.0), NSSize::new(field_w, 24.0)));
+        self.count.setFrame(NSRect::new(NSPoint::new(10.0 + field_w + 4.0, 10.0), NSSize::new(count_w, 16.0)));
+        self.command.setFrame(NSRect::new(NSPoint::new(w - regex_w - cmd_w - 10.0, 8.0), NSSize::new(cmd_w, 20.0)));
         self.regex.setFrame(NSRect::new(NSPoint::new(w - regex_w - 8.0, 8.0), NSSize::new(regex_w, 20.0)));
     }
 }
@@ -2414,6 +2525,7 @@ struct TermWindow {
     /// Find in scrollback: the bar, and what it found.
     find_bar: Option<FindBar>,
     find: Option<FindState>,
+    find_cmd_override: Option<u32>,
     /// Vi-style keyboard navigation & visual selection mode over scrollback.
     copy_mode: Option<crate::term::copy_mode::CopyMode>,
     /// The suggestion showing after the cursor (all of it), for → to take.
@@ -4515,17 +4627,54 @@ impl TermWindow {
         }
     }
 
-    /// Copy a command's output (the selected one's, or the last's), folded
-    /// lines and all.
-    fn copy_output(&mut self) {
-        let Some(cmd) = self.block_target() else { return };
+    fn pane_host_name(&self) -> Option<String> {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| t.mux_target.as_ref())
+            .map(|(h, _, _)| h.clone())
+    }
+
+    fn copy_output_for(&mut self, cmd: u32) {
         let Some(text) = self.term.lock().output_text(cmd) else { return };
         if text.is_empty() {
             return;
         }
-        let board = NSPasteboard::generalPasteboard();
-        board.clearContents();
-        board.setString_forType(&NSString::from_str(&text), unsafe { NSPasteboardTypeString });
+        copy_to_pasteboard(&text);
+    }
+
+    /// Copy a command's output (the selected one's, or the last's), folded
+    /// lines and all.
+    fn copy_output(&mut self) {
+        if let Some(cmd) = self.block_target() {
+            self.copy_output_for(cmd);
+        }
+    }
+
+    fn command_markdown(&self, cmd: Option<u32>) -> Option<(String, String)> {
+        let target = cmd
+            .filter(|&id| self.term.lock().command(id).is_some())
+            .or_else(|| self.resolve_find_command())
+            .or_else(|| self.block_target())?;
+        let host = self.pane_host_name();
+        let term = self.term.lock();
+        let ctx = crate::term::export::MarkdownContext {
+            host: host.as_deref(),
+            cwd: None,
+        };
+        let md = crate::term::export::command_to_markdown(&term, target, &ctx)?;
+        let info = term.command(target)?;
+        let fallback = if info.cmdline.is_none() { term.command_input_line(target) } else { None };
+        let filename = crate::term::export::suggested_filename(
+            info.cmdline.as_deref().or(fallback.as_deref()),
+            info.exit,
+        );
+        Some((md, filename))
+    }
+
+    fn copy_command_markdown(&mut self, cmd: Option<u32>) {
+        if let Some((md, _)) = self.command_markdown(cmd) {
+            copy_to_pasteboard(&md);
+        }
     }
 
     /// Fold or unfold command `cmd`'s output in the focused pane.
@@ -4549,8 +4698,97 @@ impl TermWindow {
         let mut sel = Selection::new(selection::Pos { line: start, cell: 0, edge: 0 }, Unit::Char);
         sel.extend(selection::Pos { line: end - 1, cell: cols - 1, edge: cols });
         self.selection = Some(sel);
+        if self.find_bar.as_ref().is_some_and(|b| !b.host.isHidden() && b.command.state() == objc2_app_kit::NSControlStateValueOn) {
+            self.find_cmd_override = Some(cmd);
+            self.find_changed();
+        }
         self.schedule_a11y_notify(false, true, false);
         self.request_redraw();
+    }
+
+    fn started_command_at_row(&self, pane: usize, row: usize) -> Option<(u32, bool)> {
+        let tab = &self.tabs[self.active];
+        let term = tab.panes.get(pane)?.term.lock();
+        let g = term.grid();
+        let line = g.history_len().saturating_sub(g.display_offset()) + row;
+        if line >= g.total_lines() || term.mode.contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let cmd = term.command_at_line(line)?;
+        let folded = g.mark(line).has(RowMark::FOLDED);
+        term.output_range(cmd).map(|_| (cmd, folded))
+    }
+
+    fn gutter_command_at(&self, event: &NSEvent) -> Option<(usize, u32)> {
+        let (fx, fy) = self.grid_point(event);
+        let tab = &self.tabs[self.active];
+        let pane = tab.visible().into_iter().find(|&p| {
+            let r = tab.panes[p].rect;
+            if fy < r.row as f32 || fy >= (r.row + r.rows) as f32 {
+                return false;
+            }
+            if r.col == 0 {
+                fx < 0.0
+            } else {
+                fx >= r.col as f32 - 0.65 && fx < r.col as f32
+            }
+        })?;
+        let rect = tab.panes[pane].rect;
+        let row = (fy - rect.row as f32).max(0.0) as usize;
+        let (cmd, _) = self.started_command_at_row(pane, row)?;
+        Some((pane, cmd))
+    }
+
+    fn context_menu_target(&self, event: &NSEvent) -> Option<(u64, u32, String, bool, bool)> {
+        if self.rewound.is_some()
+            || self.strip_hit(event).is_some()
+            || self.chart_at(event)
+            || self.palette_card.as_ref().is_some_and(|c| !c.host.isHidden())
+        {
+            return None;
+        }
+        let (_, fy) = self.grid_point(event);
+        let (p, cmd) = if let Some(hit) = self.gutter_command_at(event) {
+            hit
+        } else if !self.mouse_for_app(event) {
+            let p = self.pane_at(event)?;
+            let rect = self.tabs[self.active].panes[p].rect;
+            let row = (fy - rect.row as f32).max(0.0) as usize;
+            let (cmd, _) = self.started_command_at_row(p, row)?;
+            (p, cmd)
+        } else {
+            return None;
+        };
+        let tab = &self.tabs[self.active];
+        let pane = &tab.panes[p];
+        let has_sel = if p == tab.focus {
+            self.selection.is_some()
+        } else {
+            pane.saved.selection.is_some()
+        };
+        let term = pane.term.lock();
+        let folded = term.is_folded(cmd);
+        let info = term.command(cmd);
+        let fallback = if info.and_then(|c| c.cmdline.as_deref()).is_none() {
+            term.command_input_line(cmd)
+        } else {
+            None
+        };
+        let raw_cmd = info
+            .and_then(|c| c.cmdline.as_deref())
+            .or(fallback.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Command block");
+        let single: String = raw_cmd.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+        let short = truncate_chars(&single, 42);
+        let header = match info.map(|c| (c.state, c.exit)) {
+            Some((CommandState::Running, _)) => format!("running · {short}"),
+            Some((CommandState::Done, Some(0))) => format!("✓ · {short}"),
+            Some((CommandState::Done, Some(code))) => format!("✗ {code} · {short}"),
+            _ => short,
+        };
+        Some((pane.id, cmd, header, folded, has_sel))
     }
 
     /// A click on a command block: on its bar in the left margin (of a pane
@@ -5066,6 +5304,19 @@ impl TermWindow {
         self.request_redraw();
     }
 
+    fn resolve_find_command(&self) -> Option<u32> {
+        let term = self.term.lock();
+        if let Some(cmd) = self.find_cmd_override {
+            if term.output_range(cmd).is_some() {
+                return Some(cmd);
+            }
+        }
+        match self.selection.and_then(|s| s.range(&term)) {
+            Some(r) => term.command_at_line(r.start.0).filter(|&id| term.output_range(id).is_some()),
+            None => term.last_started_command().filter(|&id| term.output_range(id).is_some()),
+        }
+    }
+
     /// ⌘F: show the find bar, its text selected, ready to type.
     fn open_find(&mut self) {
         self.copy_mode = None;
@@ -5083,15 +5334,68 @@ impl TermWindow {
         }
     }
 
-    /// The query or the regex switch changed: search again, and show the
-    /// match nearest the bottom of the screen.
+    /// ⌘⇧F / context menu: open the find bar scoped to `cmd` (or selected/last command).
+    fn open_find_in_command(&mut self, cmd: Option<u32>) {
+        self.find_cmd_override = cmd;
+        self.copy_mode = None;
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let top = self.title_bar_height();
+        let size = self.view.bounds().size;
+        let bar = self.find_bar.get_or_insert_with(|| FindBar::new(mtm, &self.view));
+        bar.command.setState(objc2_app_kit::NSControlStateValueOn);
+        bar.place(size, top);
+        bar.host.setHidden(false);
+        self.window.makeFirstResponder(Some(&bar.field));
+        // SAFETY: selecting a field's own text on the main thread.
+        unsafe { bar.field.selectText(None) };
+        self.find_changed();
+    }
+
+    /// The query, command-scope, or regex switch changed: search again, and
+    /// show the match nearest the bottom of the screen.
     fn find_changed(&mut self) {
-        let Some(bar) = &self.find_bar else { return };
-        let query = bar.field.stringValue().to_string();
-        let regex = bar.regex.state() == objc2_app_kit::NSControlStateValueOn;
+        let (query, regex, command_scope) = {
+            let Some(bar) = &self.find_bar else { return };
+            (
+                bar.field.stringValue().to_string(),
+                bar.regex.state() == objc2_app_kit::NSControlStateValueOn,
+                bar.command.state() == objc2_app_kit::NSControlStateValueOn,
+            )
+        };
+        if !command_scope {
+            self.find_cmd_override = None;
+        }
+        let scoped_cmd = if command_scope { self.resolve_find_command() } else { None };
+        let placeholder = if command_scope {
+            let label = scoped_cmd.and_then(|id| {
+                let t = self.term.lock();
+                let line = t
+                    .command(id)
+                    .and_then(|c| c.cmdline.clone())
+                    .or_else(|| t.command_input_line(id))?;
+                let single: String = line
+                    .trim()
+                    .chars()
+                    .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                    .collect();
+                (!single.is_empty()).then(|| truncate_chars(&single, 26))
+            });
+            match label {
+                Some(l) => format!("Find in: {l}"),
+                None => "Find in command".to_string(),
+            }
+        } else {
+            "Find in scrollback".to_string()
+        };
+        if let Some(bar) = &self.find_bar {
+            bar.field.setPlaceholderString(Some(&NSString::from_str(&placeholder)));
+        }
+
         if query.is_empty() {
             self.find = None;
-            bar.count.setStringValue(&NSString::from_str(""));
+            if let Some(bar) = &self.find_bar {
+                bar.count.setStringValue(&NSString::from_str(""));
+            }
             self.request_redraw();
             return;
         }
@@ -5099,20 +5403,50 @@ impl TermWindow {
             Ok(re) => re,
             Err(e) => {
                 self.find = None;
-                bar.count.setStringValue(&NSString::from_str(&e));
+                if let Some(bar) = &self.find_bar {
+                    bar.count.setStringValue(&NSString::from_str(&e));
+                }
                 self.request_redraw();
                 return;
             }
         };
+        if command_scope && scoped_cmd.is_none() {
+            self.find = Some(FindState {
+                query,
+                regex,
+                command_scope,
+                scoped_cmd: None,
+                matches: Vec::new(),
+                current: None,
+                lines: 0,
+            });
+            if let Some(bar) = &self.find_bar {
+                bar.count.setStringValue(&NSString::from_str("No command"));
+            }
+            self.request_redraw();
+            return;
+        }
         let (matches, lines, bottom) = {
             let t = self.term.lock();
             let g = t.grid();
             let bottom = g.history_len() - g.display_offset() + t.rows();
-            (crate::term::find::find(&t, &re, FIND_LIMIT), g.total_lines(), bottom)
+            let matches = match scoped_cmd {
+                Some(cmd) => crate::term::find::find_in_command(&t, &re, cmd, FIND_LIMIT).unwrap_or_default(),
+                None => crate::term::find::find(&t, &re, FIND_LIMIT),
+            };
+            (matches, g.total_lines(), bottom)
         };
         // The newest match that starts on or above the screen's last row.
         let current = matches.iter().rposition(|m| m.start.0 < bottom).or((!matches.is_empty()).then_some(0));
-        self.find = Some(FindState { query, regex, matches, current, lines });
+        self.find = Some(FindState {
+            query,
+            regex,
+            command_scope,
+            scoped_cmd,
+            matches,
+            current,
+            lines,
+        });
         self.reveal_match();
     }
 
@@ -5127,10 +5461,14 @@ impl TermWindow {
             }
             return;
         };
-        // The text changed without a keystroke: search it, and stop there.
+        // The text or options changed without triggering a re-search: search first.
         if let Some(bar) = &self.find_bar {
             let regex = bar.regex.state() == objc2_app_kit::NSControlStateValueOn;
-            if bar.field.stringValue().to_string() != f.query || regex != f.regex {
+            let command_scope = bar.command.state() == objc2_app_kit::NSControlStateValueOn;
+            if bar.field.stringValue().to_string() != f.query
+                || regex != f.regex
+                || command_scope != f.command_scope
+            {
                 self.find_changed();
                 return;
             }
@@ -5159,6 +5497,7 @@ impl TermWindow {
             let total = if f.matches.len() >= FIND_LIMIT { format!("{}+", group_digits(FIND_LIMIT as u64)) } else { group_digits(f.matches.len() as u64) };
             let text = match f.current {
                 Some(i) => format!("{} of {total}", group_digits(i as u64 + 1)),
+                None if f.command_scope && f.scoped_cmd.is_none() => "No command".to_string(),
                 None => "No matches".to_string(),
             };
             bar.count.setStringValue(&NSString::from_str(&text));
@@ -5179,6 +5518,7 @@ impl TermWindow {
     /// Escape: close the bar and clear the highlights; keys go back to the
     /// terminal.
     fn close_find(&mut self) {
+        self.find_cmd_override = None;
         let Some(bar) = &self.find_bar else { return };
         if bar.host.isHidden() {
             return;
@@ -6959,6 +7299,7 @@ impl App {
             pane_headers: Vec::new(),
             find_bar: None,
             find: None,
+            find_cmd_override: None,
             copy_mode: None,
             cursor_layer,
             cursor_shown: None,
@@ -7500,9 +7841,14 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // The selected command's output, or the last command's.
     item(&edit, "Copy Output", sel!(tachyonCopyOutput:), "o")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    item(&edit, "Copy Command as Markdown", sel!(tachyonCopyMarkdown:), "m")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    item(&edit, "Export Command as Markdown…", sel!(tachyonExportMarkdown:), "e")
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     item(&edit, "Vi Copy Mode", sel!(tachyonCopyMode:), "X");
     edit.addItem(&NSMenuItem::separatorItem(mtm));
     item(&edit, "Find…", sel!(tachyonFind:), "f");
+    item(&edit, "Find in Command…", sel!(tachyonFindInCommand:), "F");
     item(&edit, "Find Next", sel!(tachyonFindNext:), "g");
     item(&edit, "Find Previous", sel!(tachyonFindPrevious:), "G");
     submenu(&main, &edit);
@@ -9040,6 +9386,41 @@ fn mux_set_host_color(alias: &str, color: Option<String>) {
             w.request_redraw();
         }
     });
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(max.saturating_sub(1)).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        s.to_string()
+    }
+}
+
+pub(super) fn export_command_markdown(win_id: u64, cmd: Option<u32>) {
+    let Some(win_id) = default_target_win_id(win_id) else {
+        return;
+    };
+    let Some((md, suggested)) = query_window(win_id, |w| w.command_markdown(cmd)).flatten() else {
+        return;
+    };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let panel = objc2_app_kit::NSSavePanel::savePanel(mtm);
+    panel.setTitle(Some(&NSString::from_str("Export Command as Markdown")));
+    panel.setNameFieldStringValue(&NSString::from_str(&suggested));
+    if panel.runModal() == objc2_app_kit::NSModalResponseOK {
+        if let Some(path) = panel.URL().and_then(|u| u.path()) {
+            if let Err(e) = std::fs::write(path.to_string(), md) {
+                crate::log::force(&format!("markdown export write failed: {e}"));
+            }
+        }
+    }
 }
 
 fn default_target_win_id(win_id: u64) -> Option<u64> {

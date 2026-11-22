@@ -1889,3 +1889,105 @@ fn cli_doctor_and_hosts_upgrade_diagnose_capabilities_and_restart_server() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_receipts_markdown_export_renders_command_receipt_and_output() {
+    let dir = temp_dir("receipts-md-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    std::fs::write(&hosts, "{}").unwrap();
+
+    let srv_out = Command::new(bin())
+        .args(["server", "start"])
+        .env("TACHYON_SOCKET", &sock)
+        .env("TACHYON_HOSTS_FILE", &hosts)
+        .env("SHELL", "/bin/sh")
+        .env_remove("TACHYON_SERVER")
+        .output()
+        .expect("start server");
+    assert!(
+        srv_out.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&srv_out.stderr)
+    );
+
+    let dir_str = dir.to_string_lossy().to_string();
+    let (code, out, err) = run_cli(&sock, &hosts, &["new", "md-exp-1", "--cwd", &dir_str, "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let created: Value = serde_json::from_str(&out).unwrap();
+    let bid1 = created["block"]["id"].as_str().unwrap().to_string();
+
+    let cmd1 = concat!(
+        "printf '\\033]133;A\\007\\033]133;B\\007\\033]133;C;cmdline=md_probe_one\\007'; ",
+        "printf 'MD_EXPORT_MARKER_42\\n'; ",
+        "awk 'BEGIN { s=0; for (i=0; i<600000; i++) s+=i }'; ",
+        "printf '\\033]133;D;%s\\007\\n' \"$?\""
+    );
+    let (code, _, err) = run_cli(&sock, &hosts, &["send", "-b", &bid1, "--enter", cmd1]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let mut ready1 = false;
+    for _ in 0..80 {
+        let (c, r_out, _) = run_cli(&sock, &hosts, &["receipts", "-b", &bid1, "--json"]);
+        if c == 0 {
+            if let Ok(v) = serde_json::from_str::<Value>(&r_out) {
+                if v["receipts"].as_array().is_some_and(|a| !a.is_empty()) {
+                    ready1 = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready1, "expected captured receipt for {bid1}");
+
+    let (code, md_single, err) = run_cli(
+        &sock,
+        &hosts,
+        &["receipts", "-b", &bid1, "--markdown", "--with-output"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(md_single.contains("### `md_probe_one`"), "md:\n{md_single}");
+    assert!(md_single.contains("- **Status:** ✓ exit 0"), "md:\n{md_single}");
+    assert!(md_single.contains("- **Host:** `local`"), "md:\n{md_single}");
+    assert!(md_single.contains("- **Directory:**"), "md:\n{md_single}");
+    assert!(md_single.contains("- **Receipt:** wall "), "md:\n{md_single}");
+    assert!(md_single.contains("text\n"), "expected fenced output:\n{md_single}");
+    assert!(md_single.contains("MD_EXPORT_MARKER_42"), "expected captured output:\n{md_single}");
+
+    let (code, out2, err) = run_cli(&sock, &hosts, &["new", "md-exp-2", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let created2: Value = serde_json::from_str(&out2).unwrap();
+    let bid2 = created2["block"]["id"].as_str().unwrap().to_string();
+    let cmd2 = concat!(
+        "printf '\\033]133;A\\007\\033]133;B\\007\\033]133;C;cmdline=md_probe_two\\007'; ",
+        "awk 'BEGIN { s=0; for (i=0; i<300000; i++) s+=i }'; ",
+        "printf '\\033]133;D;0\\007\\n'"
+    );
+    let (code, _, err) = run_cli(&sock, &hosts, &["send", "-b", &bid2, "--enter", cmd2]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let mut ready2 = false;
+    for _ in 0..80 {
+        let (c, r_out, _) = run_cli(&sock, &hosts, &["receipts", "-b", &bid2, "--json"]);
+        if c == 0 {
+            if let Ok(v) = serde_json::from_str::<Value>(&r_out) {
+                if v["receipts"].as_array().is_some_and(|a| !a.is_empty()) {
+                    ready2 = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready2, "expected captured receipt for {bid2}");
+
+    let (code, md_all, err) = run_cli(&sock, &hosts, &["receipts", "--all", "--markdown"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(md_all.contains("### `md_probe_one`"), "md_all:\n{md_all}");
+    assert!(md_all.contains("### `md_probe_two`"), "md_all:\n{md_all}");
+    assert!(md_all.contains("\n---\n"), "expected Markdown divider:\n{md_all}");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -26,19 +26,24 @@ pub fn pattern(query: &str, regex: bool) -> Result<Regex, String> {
     })
 }
 
-/// Every match of `re`, oldest first, up to `limit` of them.
-pub fn find(term: &Term, re: &Regex, limit: usize) -> Vec<Match> {
+/// Every match of `re` within `range` of absolute grid lines, oldest first, up to `limit`.
+pub fn find_in_range(term: &Term, re: &Regex, range: std::ops::Range<usize>, limit: usize) -> Vec<Match> {
     let grid = term.grid();
     let total = grid.total_lines();
+    let start = range.start.min(total);
+    let end = range.end.min(total);
+    if start >= end || limit == 0 {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut text = String::new();
     // The cell each character of `text` starts at, by byte offset.
     let mut at: Vec<(usize, usize, usize)> = Vec::new();
-    let mut l = 0;
-    while l < total && out.len() < limit {
+    let mut l = start;
+    while l < end && out.len() < limit {
         text.clear();
         at.clear();
-        // One logical line: this row and the rows it wraps onto.
+        // One logical line: this row and the rows it wraps onto within `end`.
         loop {
             // Most scrollback is plain ASCII: read its bytes as they're kept.
             if let Some((bytes, wrapped)) = grid.line_ascii(l) {
@@ -47,7 +52,7 @@ pub fn find(term: &Term, re: &Regex, limit: usize) -> Vec<Match> {
                     text.push(if b == 0 { ' ' } else { b as char });
                 }
                 l += 1;
-                if !wrapped || l >= total {
+                if !wrapped || l >= end {
                     break;
                 }
                 // A wrapped line is full width: the rest of its cells are blank.
@@ -71,7 +76,7 @@ pub fn find(term: &Term, re: &Regex, limit: usize) -> Vec<Match> {
             }
             let wrapped = row.wrapped;
             l += 1;
-            if !wrapped || l >= total {
+            if !wrapped || l >= end {
                 break;
             }
         }
@@ -96,6 +101,18 @@ pub fn find(term: &Term, re: &Regex, limit: usize) -> Vec<Match> {
         }
     }
     out
+}
+
+/// Every match of `re`, oldest first, up to `limit` of them.
+pub fn find(term: &Term, re: &Regex, limit: usize) -> Vec<Match> {
+    find_in_range(term, re, 0..term.grid().total_lines(), limit)
+}
+
+/// Every match of `re` inside command `cmd`'s output block (`None` when the
+/// command's output is no longer in scrollback or on the alternate screen).
+pub fn find_in_command(term: &Term, re: &Regex, cmd: u32, limit: usize) -> Option<Vec<Match>> {
+    let (start, end) = term.output_range(cmd)?;
+    Some(find_in_range(term, re, start..end, limit))
 }
 
 #[cfg(test)]
@@ -151,6 +168,41 @@ mod tests {
     fn wide_characters_take_two_cells() {
         let t = term(20, 3, "a 日本語 b\r\n");
         assert_eq!(found(&t, "本", false), vec![Match { start: (0, 4), end: (0, 6) }]);
+    }
+
+    #[test]
+    fn command_scoped_find_limits_matches_to_target_command_block() {
+        let mut t = Term::new(12, 4, 500);
+        let mut p = Processor::new();
+        // Command 1 has a wrapped line containing "needle" plus a second line.
+        p.advance(&mut t, b"\x1b]133;A\x07$ \x1b]133;B\x07c1\r\n\x1b]133;C;cmdline=c1\x07");
+        let cmd1 = t.current_command().unwrap();
+        p.advance(&mut t, b"0123456789needle_a\r\nextra needle\r\n\x1b]133;D;0\x07");
+
+        // Command 2 has its own "needle" match.
+        p.advance(&mut t, b"\x1b]133;A\x07$ \x1b]133;B\x07c2\r\n\x1b]133;C;cmdline=c2\x07");
+        let cmd2 = t.current_command().unwrap();
+        p.advance(&mut t, b"second needle\r\n\x1b]133;D;1\x07");
+
+        let re = pattern("needle", false).unwrap();
+        let all = find(&t, &re, 1000);
+        assert_eq!(all.len(), 3);
+
+        let r1 = t.output_range(cmd1).unwrap();
+        let m1 = find_in_command(&t, &re, cmd1, 1000).expect("cmd1 range");
+        assert_eq!(m1.len(), 2);
+        assert!(m1.iter().all(|m| m.start.0 >= r1.0 && m.end.0 < r1.1), "m1={m1:?}, r1={r1:?}");
+
+        let r2 = t.output_range(cmd2).unwrap();
+        let m2 = find_in_command(&t, &re, cmd2, 1000).expect("cmd2 range");
+        assert_eq!(m2.len(), 1);
+        assert!(m2[0].start.0 >= r2.0 && m2[0].end.0 < r2.1);
+
+        assert_eq!(find_in_command(&t, &re, 999_999, 1000), None);
+
+        // Alternate screen suspends command-block scoping.
+        p.advance(&mut t, b"\x1b[?1049h");
+        assert_eq!(find_in_command(&t, &re, cmd1, 1000), None);
     }
 
     /// How long a search over a full 100,000-line scrollback takes. Run with
