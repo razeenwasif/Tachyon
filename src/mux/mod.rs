@@ -1,6 +1,7 @@
 //! Tachyon Mux v2: portable multi-host protocol, state model, transports,
 //! host registry, bearer-token auth helpers, and multiplexed client.
 
+pub mod agents;
 pub mod client;
 pub mod model;
 pub mod proto;

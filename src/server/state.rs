@@ -172,6 +172,10 @@ struct ParsedBlock {
     last_title_rev: u64,
     last_status_rev: u64,
     awake: bool,
+    agent_tracker: crate::mux::agents::AgentTracker,
+    inferred_status: Option<crate::term::ProgramStatus>,
+    last_agent_eval: Option<std::time::Instant>,
+    last_input_seq: u64,
 }
 
 impl ParsedBlock {
@@ -198,6 +202,44 @@ impl ParsedBlock {
         self.last_status_rev = srev;
         (self.term.take_replies(), meta_changed, status_changed)
     }
+
+    fn evaluate_agent(&mut self, block: &Block, now: std::time::Instant) -> (bool, Option<Duration>) {
+        self.last_agent_eval = Some(now);
+        if self.term.program_status.is_some() {
+            self.agent_tracker.reset();
+            let changed = self.inferred_status.take().is_some();
+            return (changed, None);
+        }
+        let fg = block.pty.foreground_process(block.is_login_shell);
+        let cmd_running = self.term.command_running()
+            || (!block.is_login_shell && block.alive.load(Ordering::Acquire));
+        let cmdline = self
+            .term
+            .running_cmdline()
+            .or(block.spawn_cmdline.as_deref());
+        let label_guard = block.label.lock();
+        let lines = crate::mux::agents::extract_visible_lines(
+            &self.term,
+            crate::mux::agents::MAX_SCREEN_LINES,
+        );
+        let next = self
+            .agent_tracker
+            .evaluate(&crate::mux::agents::AgentObservation {
+                fg: fg.as_ref(),
+                cmdline,
+                title: self.term.title.as_deref(),
+                label: label_guard.as_deref(),
+                command_running: cmd_running,
+                alt_screen: self.term.in_alt_screen(),
+                screen_lines: &lines,
+                now,
+            });
+        drop(label_guard);
+        let changed = self.inferred_status != next;
+        self.inferred_status = next;
+        let settle = self.agent_tracker.next_settle_deadline(now);
+        (changed, settle)
+    }
 }
 
 pub struct Block {
@@ -206,6 +248,9 @@ pub struct Block {
     pub window_id: String,
     pub label: Mutex<Option<String>>,
     pub created_at: u64,
+    pub is_login_shell: bool,
+    pub spawn_cmdline: Option<String>,
+    pub input_seq: AtomicU64,
     pub pty: Arc<HostPty>,
     subscribers: Mutex<Vec<StreamSub>>,
     attached_count: AtomicUsize,
@@ -224,6 +269,9 @@ impl Block {
         let p = self.parsed.lock();
         let (cols, rows) = (p.term.cols() as u16, p.term.rows() as u16);
         let cmd = p.term.running_cmdline().map(str::to_string);
+        let explicit = p.term.program_status.clone();
+        let status_inferred = explicit.is_none() && p.inferred_status.is_some();
+        let status = explicit.or_else(|| p.inferred_status.clone());
         BlockInfo {
             id: self.id.clone(),
             session_id: self.session_id.clone(),
@@ -241,7 +289,8 @@ impl Block {
             awake: p.awake,
             attached_clients: self.attached_count.load(Ordering::Acquire),
             created_at: self.created_at,
-            status: p.term.program_status.clone(),
+            status,
+            status_inferred,
         }
     }
 
@@ -472,7 +521,9 @@ impl ServerState {
         }
         let block = self.inner.lock().blocks.get(&block_id).cloned();
         if let Some(b) = block {
-            let _ = b.pty.write(bytes);
+            if b.pty.write(bytes).is_ok() {
+                b.input_seq.fetch_add(1, Ordering::Release);
+            }
         }
     }
 
@@ -661,6 +712,10 @@ impl ServerState {
         keep_after_exit: bool,
     ) -> Result<Arc<Block>, String> {
         let block_id = self.alloc_id("b");
+        let is_login_shell = cmd.is_none_or(|parts| parts.is_empty());
+        let spawn_cmdline = cmd
+            .filter(|parts| !parts.is_empty())
+            .map(|parts| parts.join(" "));
         let (program, args, login, mut extra_env) = match cmd {
             Some(parts) if !parts.is_empty() => (
                 parts[0].clone(),
@@ -718,6 +773,9 @@ impl ServerState {
             window_id: window_id.to_string(),
             label: Mutex::new(label),
             created_at: unix_now(),
+            is_login_shell,
+            spawn_cmdline,
+            input_seq: AtomicU64::new(0),
             pty: Arc::new(pty),
             subscribers: Mutex::new(Vec::new()),
             attached_count: AtomicUsize::new(0),
@@ -735,6 +793,10 @@ impl ServerState {
                 last_title_rev: 0,
                 last_status_rev: 0,
                 awake: false,
+                agent_tracker: crate::mux::agents::AgentTracker::new(),
+                inferred_status: None,
+                last_agent_eval: None,
+                last_input_seq: 0,
             }),
             alive: AtomicBool::new(true),
             exit_code: Mutex::new(None),
@@ -1356,6 +1418,7 @@ impl ServerState {
             .cloned()
             .ok_or_else(|| format!("no block `{bid}`"))?;
         block.pty.write(&bytes).map_err(|e| format!("pty write failed: {e}"))?;
+        block.input_seq.fetch_add(1, Ordering::Release);
         Ok(json!({ "written": bytes.len() }))
     }
 
@@ -1599,34 +1662,90 @@ fn read_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
 }
 
 /// Parse queued PTY output on a background thread so forwarding never blocks
-/// on terminal parsing. Answers terminal queries while no client is attached.
+/// on terminal parsing. Answers terminal queries while no client is attached
+/// and runs zero-hook agent state classification with zero idle wake-ups.
 fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
+    let mut settle_wait: Option<Duration> = None;
     loop {
-        {
+        let timed_out = {
             let mut q = block.queue.lock();
+            let mut hit_timeout = false;
             while q.0.is_empty() && !q.2 {
-                block.work.wait(&mut q);
+                if let Some(dur) = settle_wait {
+                    let res = block.work.wait_for(&mut q, dur);
+                    if q.0.is_empty() && !q.2 && res.timed_out() {
+                        hit_timeout = true;
+                        break;
+                    }
+                } else {
+                    block.work.wait(&mut q);
+                }
             }
-            if q.0.is_empty() {
+            if q.0.is_empty() && !hit_timeout {
                 return;
             }
+            hit_timeout
+        };
+
+        let now = std::time::Instant::now();
+        if timed_out {
+            let mut parsed = block.parsed.lock();
+            let cur_in = block.input_seq.load(Ordering::Acquire);
+            if cur_in != parsed.last_input_seq {
+                parsed.last_input_seq = cur_in;
+                parsed.agent_tracker.note_input(now);
+            }
+            let (inferred_changed, next_settle) = parsed.evaluate_agent(&block, now);
+            drop(parsed);
+            settle_wait = next_settle;
+            if inferred_changed {
+                let info = block.info();
+                state.broadcast_event(json!({
+                    "event": "block.status",
+                    "block": info.to_json(),
+                    "status": info.status.as_ref().map(crate::mux::model::status_to_json),
+                }));
+            }
+            continue;
         }
+
         let mut parsed = block.parsed.lock();
-        let chunk = {
+        let (chunk, queue_empty) = {
             let mut q = block.queue.lock();
             let c = q.0.pop_front();
             q.1 -= c.as_ref().map_or(0, Vec::len);
-            c
+            (c, q.0.is_empty())
         };
         block.space.notify_one();
         let Some(chunk) = chunk else { continue };
         let (replies, meta_changed, status_changed) = parsed.feed(&block.pty, &chunk);
+
+        let cur_in = block.input_seq.load(Ordering::Acquire);
+        if cur_in != parsed.last_input_seq {
+            parsed.last_input_seq = cur_in;
+            parsed.agent_tracker.note_input(now);
+        }
+        parsed.agent_tracker.note_output(chunk.len(), now);
+
+        let should_eval = meta_changed
+            || status_changed
+            || queue_empty
+            || parsed
+                .last_agent_eval
+                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(250));
+        let inferred_changed = if should_eval {
+            let (chg, next_settle) = parsed.evaluate_agent(&block, now);
+            settle_wait = next_settle;
+            chg
+        } else {
+            false
+        };
         drop(parsed);
 
         if !replies.is_empty() && block.attached_count.load(Ordering::Acquire) == 0 {
             let _ = block.pty.write(&replies);
         }
-        if status_changed {
+        if status_changed || inferred_changed {
             let info = block.info();
             state.broadcast_event(json!({
                 "event": "block.status",

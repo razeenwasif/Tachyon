@@ -1259,6 +1259,7 @@ mod tests {
                 msg: Some("Approve".into()),
                 label: None,
             }),
+            status_inferred: false,
         };
 
         let local = HostView {

@@ -52,8 +52,8 @@ mod workspaces;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dispatch2::DispatchQueue;
@@ -91,7 +91,7 @@ use parking_lot::Mutex;
 use crate::config::{Appearance, Backdrop, ChromeStyle, Config, Contrast, OptionAsMeta, PaneHeaders, PaneStyle, ThemeConfig, ThemePreset};
 use crate::term::jobs::JobRef;
 use crate::term::rewind::RewindLog;
-use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, RowMark, Term, TermMode};
+use crate::term::{jobs, lens, CommandEvent, CommandState, Processor, ProgramStatus, RowMark, Term, TermMode};
 use rustc_hash::FxHashMap;
 use pty::Pty;
 use input::{MouseButton, MouseEventKind};
@@ -1982,6 +1982,8 @@ struct Pane {
     kill_on_drop: Cell<bool>,
     /// The keystroke in flight, for the latency ledger.
     ledger: Arc<ledger::Slot>,
+    /// Zero-hook fallback agent state for standalone panes or pre-upgrade daemons.
+    inferred: Arc<PaneInferred>,
 }
 
 /// A tab: one pane, or several split from it.
@@ -2072,7 +2074,18 @@ impl Pane {
         let kill_on_drop = !pty.is_mux();
         let wake_pending = Arc::new(AtomicBool::new(false));
         let slot = Arc::new(ledger::Slot::default());
-        let (term, pty, log) = start_session(id, pty, cfg, cols, rows, Arc::clone(&wake_pending), awake, Arc::clone(&slot))?;
+        let inferred = Arc::new(PaneInferred::new());
+        let (term, pty, log) = start_session(
+            id,
+            pty,
+            cfg,
+            cols,
+            rows,
+            Arc::clone(&wake_pending),
+            awake,
+            Arc::clone(&slot),
+            Arc::clone(&inferred),
+        )?;
         Ok(Pane {
             id,
             term,
@@ -2085,6 +2098,7 @@ impl Pane {
             header_rect: None,
             kill_on_drop: Cell::new(kill_on_drop),
             ledger: slot,
+            inferred,
         })
     }
 }
@@ -4779,7 +4793,13 @@ impl TermWindow {
             }
             let (title, running, status) = {
                 let t = pane.term.lock();
-                (tab_label(&t), t.command_running(), t.program_status.clone())
+                (
+                    tab_label(&t),
+                    t.command_running(),
+                    t.program_status
+                        .clone()
+                        .or_else(|| pane.inferred.status.lock().clone()),
+                )
             };
             let remote_host = pane
                 .pty
@@ -5383,6 +5403,13 @@ impl TermWindow {
     fn stamp_keystroke(&mut self) {
         let key = self.key_time.take().unwrap_or_else(ledger::now);
         self.tabs[self.active].pane().ledger.keystroke(key);
+        if self.is_broadcasting() {
+            for pane in &self.tabs[self.active].panes {
+                pane.inferred.input_seq.fetch_add(1, Ordering::Release);
+            }
+        } else {
+            self.tabs[self.active].pane().inferred.input_seq.fetch_add(1, Ordering::Release);
+        }
     }
 
     fn set_preedit(&mut self, text: String) {
@@ -5497,6 +5524,7 @@ impl TermWindow {
                     bytes.extend_from_slice(b"\x1b[201~");
                 }
                 let _ = pane.pty.write(&bytes);
+                pane.inferred.input_seq.fetch_add(1, Ordering::Release);
             }
         } else {
             let bracketed = {
@@ -5513,6 +5541,7 @@ impl TermWindow {
                 bytes.extend_from_slice(b"\x1b[201~");
             }
             let _ = self.pty.write(&bytes);
+            self.tabs[self.active].pane().inferred.input_seq.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -7455,6 +7484,192 @@ fn open_session(cfg: &Config, cols: usize, rows: usize, run: Option<&str>, cwd: 
     Ok((id, pty))
 }
 
+struct PaneInferred {
+    status: Mutex<Option<ProgramStatus>>,
+    tracker: Mutex<crate::mux::agents::AgentTracker>,
+    input_seq: AtomicU64,
+    seen_input_seq: AtomicU64,
+    last_eval: Mutex<Option<Instant>>,
+    out_gen: AtomicU64,
+}
+
+impl PaneInferred {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(None),
+            tracker: Mutex::new(crate::mux::agents::AgentTracker::new()),
+            input_seq: AtomicU64::new(0),
+            seen_input_seq: AtomicU64::new(0),
+            last_eval: Mutex::new(None),
+            out_gen: AtomicU64::new(0),
+        }
+    }
+
+    fn note_io(&self, bytes: usize, now: Instant) -> (u64, bool) {
+        let gen = self.out_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        let in_seq = self.input_seq.load(Ordering::Acquire);
+        let prev_in = self.seen_input_seq.swap(in_seq, Ordering::AcqRel);
+        let mut tr = self.tracker.lock();
+        if in_seq != prev_in {
+            tr.note_input(now);
+        }
+        tr.note_output(bytes, now);
+        drop(tr);
+        let due = self
+            .last_eval
+            .lock()
+            .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(250));
+        (gen, due)
+    }
+
+    fn clear_if_active(&self, mux_key: Option<&(String, String)>) -> bool {
+        let had_status = self.status.lock().take().is_some();
+        self.tracker.lock().reset();
+        let removed = mux_key.is_some_and(|k| set_attached_inferred(k, None));
+        had_status || removed
+    }
+}
+
+struct AgentScreenSnap {
+    command_running: bool,
+    alt_screen: bool,
+    cmdline: Option<String>,
+    title: Option<String>,
+    lines: Vec<String>,
+}
+
+fn attached_inferred_map() -> &'static Mutex<FxHashMap<(String, String), ProgramStatus>> {
+    static MAP: OnceLock<Mutex<FxHashMap<(String, String), ProgramStatus>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn set_attached_inferred(key: &(String, String), st: Option<&ProgramStatus>) -> bool {
+    let mut map = attached_inferred_map().lock();
+    match st {
+        Some(next) => {
+            if map.get(key) == Some(next) {
+                false
+            } else {
+                map.insert(key.clone(), next.clone());
+                true
+            }
+        }
+        None => map.remove(key).is_some(),
+    }
+}
+
+fn evaluate_pane_inferred(
+    inferred: &PaneInferred,
+    mux_key: Option<&(String, String)>,
+    snap: &AgentScreenSnap,
+    fg: Option<&crate::mux::agents::ForegroundProc>,
+    now: Instant,
+) -> (bool, Option<Duration>) {
+    *inferred.last_eval.lock() = Some(now);
+    let mut tr = inferred.tracker.lock();
+    let in_seq = inferred.input_seq.load(Ordering::Acquire);
+    if in_seq != inferred.seen_input_seq.swap(in_seq, Ordering::AcqRel) {
+        tr.note_input(now);
+    }
+    let next = tr.evaluate(&crate::mux::agents::AgentObservation {
+        fg,
+        cmdline: snap.cmdline.as_deref(),
+        title: snap.title.as_deref(),
+        label: None,
+        command_running: snap.command_running,
+        alt_screen: snap.alt_screen,
+        screen_lines: &snap.lines,
+        now,
+    });
+    let settle = tr.next_settle_deadline(now);
+    drop(tr);
+
+    let mut st_guard = inferred.status.lock();
+    let local_changed = *st_guard != next;
+    *st_guard = next.clone();
+    drop(st_guard);
+
+    let map_changed = mux_key.is_some_and(|k| set_attached_inferred(k, next.as_ref()));
+    (local_changed || map_changed, settle)
+}
+
+fn schedule_pane_settle(
+    expected_gen: u64,
+    after: Duration,
+    term: Arc<Mutex<Term>>,
+    pty: Arc<Pty>,
+    inferred: Arc<PaneInferred>,
+    mux_key: Option<(String, String)>,
+    shell: libc::pid_t,
+) {
+    let secs = after.as_secs_f64().max(0.1);
+    DispatchQueue::main().exec_async(move || {
+        if inferred.out_gen.load(Ordering::Acquire) != expected_gen {
+            return;
+        }
+        let block = block2::RcBlock::new(move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+            if inferred.out_gen.load(Ordering::Acquire) != expected_gen {
+                return;
+            }
+            let (has_explicit, snap) = {
+                let t = term.lock();
+                if t.program_status.is_some() {
+                    (true, None)
+                } else {
+                    (
+                        false,
+                        Some(AgentScreenSnap {
+                            command_running: t.command_running(),
+                            alt_screen: t.in_alt_screen(),
+                            cmdline: t.running_cmdline().map(str::to_string),
+                            title: t.title.clone(),
+                            lines: crate::mux::agents::extract_visible_lines(
+                                &t,
+                                crate::mux::agents::MAX_SCREEN_LINES,
+                            ),
+                        }),
+                    )
+                }
+            };
+            if has_explicit {
+                if inferred.clear_if_active(mux_key.as_ref()) {
+                    sync_all_sidebars();
+                }
+                return;
+            }
+            let Some(snap) = snap else { return };
+            let fg = if pty.master_fd() >= 0 {
+                crate::server::pty::foreground_process_fd(pty.master_fd(), shell, true)
+            } else {
+                None
+            };
+            let (changed, next_settle) =
+                evaluate_pane_inferred(&inferred, mux_key.as_ref(), &snap, fg.as_ref(), Instant::now());
+            if changed {
+                sync_all_sidebars();
+            }
+            if let Some(dur) = next_settle {
+                if inferred.out_gen.load(Ordering::Acquire) == expected_gen {
+                    schedule_pane_settle(
+                        expected_gen,
+                        dur,
+                        Arc::clone(&term),
+                        Arc::clone(&pty),
+                        Arc::clone(&inferred),
+                        mux_key.clone(),
+                        shell,
+                    );
+                }
+            }
+        });
+        unsafe {
+            let _ = objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+                secs, false, &block,
+            );
+        }
+    });
+}
+
 /// Feed a shell's output to a new terminal, on a reader thread of its own.
 /// A host's shell sends the screen to restore first, which is parsed as the
 /// past: no replies to old queries, no notifications.
@@ -7468,6 +7683,7 @@ fn start_session(
     // Keep-awake was on at the host: on again once the screen is restored.
     awake_after_restore: bool,
     stamps: Arc<ledger::Slot>,
+    inferred: Arc<PaneInferred>,
 ) -> Result<(Arc<Mutex<Term>>, Arc<Pty>, Arc<Mutex<RewindLog>>), String> {
     let pty = Arc::new(pty);
     let term = Arc::new(Mutex::new(Term::new(cols, rows, cfg.scrollback)));
@@ -7495,6 +7711,8 @@ fn start_session(
                 });
             });
             let shell = reader_pty.pid();
+            let mux_key = reader_pty.mux_meta().map(|m| (m.host.clone(), m.block_id.clone()));
+            let mut last_title_rev = 0u64;
             let mut cpu_at_start: FxHashMap<u32, Option<Duration>> = FxHashMap::default();
             let mut dump = std::env::var_os("TACHYON_DUMP").and_then(|p| std::fs::File::create(p).ok());
             // The metric lens reads a running command's output as lines.
@@ -7563,7 +7781,13 @@ fn start_session(
                 }
                 let restoring = replay > 0;
                 stamps.output_read();
-                let (replies, events, running, cmdline) = {
+                let now = Instant::now();
+                let (out_gen, eval_due_time) = if !restoring {
+                    inferred.note_io(n, now)
+                } else {
+                    (0, false)
+                };
+                let (replies, events, running, cmdline, has_explicit_status, agent_snap) = {
                     let mut t = reader_term.lock();
                     processor.advance(&mut t, &buf[..n]);
                     if restoring {
@@ -7588,16 +7812,77 @@ fn start_session(
                             log.snapshot(t.rewind_snapshot());
                         }
                     }
+                    let trev = t.title_revision;
+                    let title_changed = trev != last_title_rev;
+                    last_title_rev = trev;
+                    let has_explicit = t.program_status.is_some();
+                    let agent_snap = if !restoring && !has_explicit && (eval_due_time || title_changed) {
+                        Some(AgentScreenSnap {
+                            command_running: t.command_running(),
+                            alt_screen: t.in_alt_screen(),
+                            cmdline: t.running_cmdline().map(str::to_string),
+                            title: t.title.clone(),
+                            lines: crate::mux::agents::extract_visible_lines(
+                                &t,
+                                crate::mux::agents::MAX_SCREEN_LINES,
+                            ),
+                        })
+                    } else {
+                        None
+                    };
                     let cmdline = t.running_cmdline().map(str::to_string);
                     stamps.output_parsed();
                     let (replies, events) = (t.take_replies(), t.take_command_events());
                     if restoring {
                         // The past: its queries were answered long ago.
-                        (Vec::new(), Vec::new(), false, None)
+                        (Vec::new(), Vec::new(), false, None, has_explicit, None)
                     } else {
-                        (replies, events, t.command_running(), cmdline)
+                        (replies, events, t.command_running(), cmdline, has_explicit, agent_snap)
                     }
                 };
+                if !restoring {
+                    if has_explicit_status {
+                        if inferred.clear_if_active(mux_key.as_ref()) {
+                            DispatchQueue::main().exec_async(sync_all_sidebars);
+                        }
+                    } else if let Some(snap) = agent_snap {
+                        let fg = if reader_pty.master_fd() >= 0 {
+                            crate::server::pty::foreground_process_fd(
+                                reader_pty.master_fd(),
+                                shell,
+                                true,
+                            )
+                        } else {
+                            None
+                        };
+                        let (changed, settle) =
+                            evaluate_pane_inferred(&inferred, mux_key.as_ref(), &snap, fg.as_ref(), now);
+                        if changed {
+                            DispatchQueue::main().exec_async(sync_all_sidebars);
+                        }
+                        if let Some(dur) = settle {
+                            schedule_pane_settle(
+                                out_gen,
+                                dur,
+                                Arc::clone(&reader_term),
+                                Arc::clone(&reader_pty),
+                                Arc::clone(&inferred),
+                                mux_key.clone(),
+                                shell,
+                            );
+                        }
+                    } else {
+                        schedule_pane_settle(
+                            out_gen,
+                            Duration::from_millis(260),
+                            Arc::clone(&reader_term),
+                            Arc::clone(&reader_pty),
+                            Arc::clone(&inferred),
+                            mux_key.clone(),
+                            shell,
+                        );
+                    }
+                }
                 if running {
                     // A training run prints a few lines a second, and every
                     // one is read. A flood (cat of a big log) isn't where
@@ -7698,6 +7983,9 @@ fn start_session(
                         })
                     });
                 }
+            }
+            if inferred.clear_if_active(mux_key.as_ref()) {
+                DispatchQueue::main().exec_async(sync_all_sidebars);
             }
             DispatchQueue::main().exec_async(move || shell_exited(id));
         })
@@ -8034,7 +8322,23 @@ fn mux_client(host: &str) -> Option<Arc<crate::mux::client::MuxClient>> {
 }
 
 fn mux_host_views() -> Vec<host_mgr::HostView> {
-    host_mgr().map(|m| m.views()).unwrap_or_default()
+    let mut views = host_mgr().map(|m| m.views()).unwrap_or_default();
+    let overlay = attached_inferred_map().lock();
+    if !overlay.is_empty() {
+        for hv in &mut views {
+            if let Some(ref mut snap) = hv.snapshot {
+                for blk in &mut snap.blocks {
+                    if blk.status.is_none() {
+                        if let Some(st) = overlay.get(&(hv.alias.clone(), blk.id.clone())) {
+                            blk.status = Some(st.clone());
+                            blk.status_inferred = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    views
 }
 
 fn sync_all_sidebars() {
@@ -9052,15 +9356,8 @@ fn handle_mux_event(host: String, ev: serde_json::Value) {
                             .app
                             .as_deref()
                             .filter(|s| !s.is_empty())
-                            .map(|a| match a.to_ascii_lowercase().as_str() {
-                                "claude" | "claude-code" => "Claude Code",
-                                "antigravity" | "agy" => "Antigravity",
-                                "codex" => "Codex",
-                                "opencode" => "OpenCode",
-                                "pi" => "Pi",
-                                _ => a,
-                            })
-                            .unwrap_or("Agent");
+                            .map(|a| crate::mux::model::agent_identity(a).1)
+                            .unwrap_or_else(|| "Agent".to_string());
                         let state_word = match status.state {
                             ProgramState::Blocked => "needs input",
                             ProgramState::Done => "finished",

@@ -219,8 +219,10 @@ pub struct BlockInfo {
     pub awake: bool,
     pub attached_clients: usize,
     pub created_at: u64,
-    /// Live OSC 7501 program/agent status, if reported.
+    /// Live OSC 7501 or zero-hook inferred program/agent status.
     pub status: Option<ProgramStatus>,
+    /// True when `status` was derived automatically without explicit OSC 7501 hooks.
+    pub status_inferred: bool,
 }
 
 impl BlockInfo {
@@ -233,14 +235,10 @@ impl BlockInfo {
             return t.to_string();
         }
         if let Some(app) = self.status.as_ref().and_then(|s| s.app.as_deref()).filter(|s| !s.is_empty()) {
-            return match app.to_ascii_lowercase().as_str() {
-                "claude" | "claude-code" => "Claude Code".into(),
-                "antigravity" | "agy" => "Antigravity".into(),
-                "codex" => "Codex".into(),
-                "opencode" => "OpenCode".into(),
-                "pi" => "Pi".into(),
-                _ => app.to_string(),
-            };
+            if let Some(m) = crate::mux::agents::find_manifest(app) {
+                return m.display_name.to_string();
+            }
+            return app.to_string();
         }
         if let Some(cmd) = self.command.as_deref().filter(|s| !s.is_empty()) {
             return cmd.to_string();
@@ -270,6 +268,7 @@ impl BlockInfo {
             "attached_clients": self.attached_clients,
             "created_at": self.created_at,
             "status": self.status.as_ref().map(status_to_json),
+            "status_inferred": self.status_inferred,
         })
     }
 
@@ -292,6 +291,7 @@ impl BlockInfo {
             attached_clients: v.get("attached_clients").and_then(Value::as_u64).unwrap_or(0) as usize,
             created_at: v.get("created_at").and_then(Value::as_u64).unwrap_or(0),
             status: v.get("status").and_then(status_from_json),
+            status_inferred: v.get("status_inferred").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }
@@ -776,27 +776,7 @@ pub fn agent_state_priority(state: ProgramState) -> u8 {
 
 /// Human-friendly agent name & glyph from an OSC 7501 `app` or inferred process name.
 pub fn agent_identity(raw: &str) -> (String, String, &'static str) {
-    let low = raw.trim().to_ascii_lowercase();
-    if low.contains("claude") {
-        ("claude".into(), "Claude Code".into(), "✳")
-    } else if low.contains("antigravity") || low == "agy" {
-        ("antigravity".into(), "Antigravity".into(), "✦")
-    } else if low.contains("codex") {
-        ("codex".into(), "Codex".into(), "◎")
-    } else if low.contains("opencode") {
-        ("opencode".into(), "OpenCode".into(), "◈")
-    } else if low == "pi" || low.starts_with("pi-") || low.ends_with("-pi") {
-        ("pi".into(), "Pi".into(), "π")
-    } else if low.is_empty() {
-        ("agent".into(), "Agent".into(), "●")
-    } else {
-        let mut chars = raw.trim().chars();
-        let cap = match chars.next() {
-            Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
-            None => "Agent".into(),
-        };
-        (low, cap, "●")
-    }
+    crate::mux::agents::agent_identity(raw)
 }
 
 /// Infer whether a block without explicit OSC 7501 status is running a known coding agent.
@@ -804,43 +784,15 @@ pub fn infer_agent_from_block(b: &BlockInfo) -> Option<&'static str> {
     if !b.alive {
         return None;
     }
-    let check = |text: &str| -> Option<&'static str> {
-        let low = text.trim().to_ascii_lowercase();
-        let first_word = low
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .rsplit('\\')
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(".exe");
-        match first_word {
-            "claude" | "claude-code" => Some("claude"),
-            "antigravity" | "agy" => Some("antigravity"),
-            "codex" => Some("codex"),
-            "opencode" => Some("opencode"),
-            "pi" => Some("pi"),
-            _ => {
-                if low.contains("claude code") {
-                    Some("claude")
-                } else if low.contains("antigravity") {
-                    Some("antigravity")
-                } else if low.contains("opencode") {
-                    Some("opencode")
-                } else {
-                    None
-                }
-            }
-        }
-    };
-    b.command
-        .as_deref()
-        .and_then(check)
-        .or_else(|| b.title.as_deref().and_then(check))
-        .or_else(|| b.label.as_deref().and_then(check))
+    crate::mux::agents::identify_agent(
+        None,
+        b.command.as_deref(),
+        b.title.as_deref(),
+        b.label.as_deref(),
+        &[],
+        false,
+    )
+    .map(|m| m.id)
 }
 
 /// Collect and urgency-sort coding-agent entries across one or more host snapshots.
@@ -867,7 +819,7 @@ pub fn collect_agent_entries(
                     .clone()
                     .filter(|s| !s.is_empty())
                     .or_else(|| st.label.clone().filter(|s| !s.is_empty()));
-                (st.state, raw, msg, false)
+                (st.state, raw, msg, blk.status_inferred)
             } else if let Some(inferred_app) = infer_agent_from_block(blk) {
                 (
                     ProgramState::Working,
@@ -1237,6 +1189,7 @@ mod tests {
             attached_clients: 0,
             created_at: 0,
             status,
+            status_inferred: false,
         };
         let snap = ServerSnapshot {
             host: HostInfo {
