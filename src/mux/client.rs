@@ -783,6 +783,28 @@ impl MuxClient {
         }))
     }
 
+    /// Fetch captured server-side command resource receipts for `block_id`.
+    pub fn block_receipts(
+        &self,
+        block_id: &str,
+        limit: Option<usize>,
+    ) -> io::Result<Vec<crate::mux::model::CommandReceipt>> {
+        let data = self.rpc(json!({
+            "op": "block.receipts",
+            "block_id": block_id,
+            "limit": limit.unwrap_or(20),
+        }))?;
+        Ok(data
+            .get("receipts")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(crate::mux::model::CommandReceipt::from_json)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Attach a live stream to `block_id`. The first item on `rx` (when `restore`
     /// is true) is `StreamChunk::Snapshot(vt_bytes)`, followed gap-free by live
     /// `StreamChunk::Output(bytes)`.

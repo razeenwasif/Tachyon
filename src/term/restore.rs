@@ -278,12 +278,33 @@ impl Writer<'_> {
         let info = self.term.commands.get(&id);
         let cmdline = info.and_then(|c| c.cmdline.as_deref()).unwrap_or("");
         let _ = write!(self.out, "\x1b]133;C;cmdline={}\x07", cmdline.replace(['\x07', '\x1b'], ""));
-        match info.and_then(|c| c.exit) {
-            Some(e) => {
-                let _ = write!(self.out, "\x1b]133;D;{e}\x07");
-            }
-            None => self.out.push_str("\x1b]133;D\x07"),
+        let _ = write!(self.out, "\x1b]133;D");
+        let has_tags = info.is_some_and(|c| c.wall.is_some() || c.receipt.is_some());
+        if let Some(e) = info.and_then(|c| c.exit) {
+            let _ = write!(self.out, ";{e}");
+        } else if has_tags {
+            self.out.push(';');
         }
+        if let Some(c) = info {
+            if let Some(w) = c.wall {
+                let _ = write!(self.out, ";tachyon_wall_us={}", w.as_micros() as u64);
+            }
+            if let Some(r) = c.receipt {
+                if let Some(cpu) = r.cpu {
+                    let _ = write!(self.out, ";tachyon_cpu_us={}", cpu.as_micros() as u64);
+                }
+                if let Some(p) = r.pcore_share {
+                    let _ = write!(self.out, ";tachyon_pcore={p:.4}");
+                }
+                if let Some(e) = r.energy_joules {
+                    let _ = write!(self.out, ";tachyon_energy={e:.4}");
+                }
+                if let Some(m) = r.peak_footprint {
+                    let _ = write!(self.out, ";tachyon_mem={m}");
+                }
+            }
+        }
+        self.out.push('\x07');
     }
 }
 
@@ -411,5 +432,39 @@ mod tests {
         feed(&mut t, &expected.encode_osc_7501());
         let r = restored(&t);
         assert_eq!(r.program_status, Some(expected));
+    }
+
+    #[test]
+    fn command_receipts_and_wall_time_round_trip_through_to_vt() {
+        use std::time::Duration;
+        let mut t = Term::new(40, 8, 100);
+        feed(&mut t, "\x1b]133;A\x07~ \x1b]133;B\x07cargo test\r\n\x1b]133;C;cmdline=cargo test\x07ok\r\n\x1b]133;D;0\x07");
+        let cmd_id = t.last_finished().map(|_| 1).unwrap_or(1);
+        let expected_receipt = crate::term::Receipt {
+            cpu: Some(Duration::from_micros(420_500)),
+            pcore_share: Some(0.75),
+            energy_joules: Some(3.25),
+            peak_footprint: Some(64 * 1024 * 1024),
+        };
+        assert!(t.apply_remote_receipt(
+            Some(cmd_id),
+            Some("cargo test"),
+            Some(0),
+            Duration::from_micros(1_250_000),
+            expected_receipt,
+        ));
+
+        let r = restored(&t);
+        let cmd = r.last_finished().expect("restored command");
+        assert_eq!(cmd.cmdline.as_deref(), Some("cargo test"));
+        assert_eq!(cmd.exit, Some(0));
+        assert!(cmd.started.is_none());
+        assert_eq!(cmd.wall, Some(Duration::from_micros(1_250_000)));
+        assert_eq!(cmd.elapsed(), Some(Duration::from_micros(1_250_000)));
+        let rr = cmd.receipt.expect("restored receipt");
+        assert_eq!(rr.cpu, expected_receipt.cpu);
+        assert_eq!(rr.peak_footprint, expected_receipt.peak_footprint);
+        assert!((rr.pcore_share.unwrap() - 0.75).abs() < 1e-3);
+        assert!((rr.energy_joules.unwrap() - 3.25).abs() < 1e-3);
     }
 }

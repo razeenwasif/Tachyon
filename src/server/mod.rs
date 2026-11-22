@@ -11,6 +11,7 @@
 
 pub mod persist;
 pub mod pty;
+pub mod receipts;
 pub mod state;
 
 use std::io::{self, Read, Write};

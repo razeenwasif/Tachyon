@@ -132,6 +132,10 @@ mod unix_pty {
             self.pid.max(0) as u32
         }
 
+        pub fn master_fd(&self) -> i32 {
+            self.master.as_raw_fd()
+        }
+
         pub fn size(&self) -> (u16, u16) {
             let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
             unsafe {
@@ -674,6 +678,10 @@ mod win_pty {
 
         pub fn pid(&self) -> u32 {
             self.inner.pid()
+        }
+
+        pub fn master_fd(&self) -> i32 {
+            -1
         }
 
         pub fn size(&self) -> (u16, u16) {

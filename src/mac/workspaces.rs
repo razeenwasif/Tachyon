@@ -1287,6 +1287,7 @@ mod tests {
                 label: None,
             }),
             status_inferred: false,
+            last_receipt: None,
         };
 
         let local = HostView {

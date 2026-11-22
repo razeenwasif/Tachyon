@@ -201,6 +201,163 @@ impl HostInfo {
     }
 }
 
+/// Portable per-command resource receipt captured inside `tachyon server`
+/// across macOS (`rusage`), Linux (`/proc`), and Windows (`Win32`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandReceipt {
+    pub cmd_seq: Option<u32>,
+    pub cmdline: Option<String>,
+    pub exit_code: Option<i32>,
+    pub wall_us: u64,
+    pub cpu_us: Option<u64>,
+    /// Share of CPU time spent on P-cores in basis points (0..=10000).
+    pub pcore_bp: Option<u16>,
+    /// Energy consumed in millijoules.
+    pub energy_mj: Option<u64>,
+    /// Peak memory footprint in bytes.
+    pub peak_bytes: Option<u64>,
+    pub finished_at: u64,
+}
+
+impl CommandReceipt {
+    pub fn wall_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.wall_us)
+    }
+
+    pub fn cpu_duration(&self) -> Option<std::time::Duration> {
+        self.cpu_us.map(std::time::Duration::from_micros)
+    }
+
+    pub fn pcore_share(&self) -> Option<f32> {
+        self.pcore_bp.map(|bp| (bp.min(10_000) as f32) / 10_000.0)
+    }
+
+    pub fn energy_joules(&self) -> Option<f64> {
+        self.energy_mj.map(|mj| mj as f64 / 1000.0)
+    }
+
+    pub fn from_term_receipt(
+        cmd_seq: Option<u32>,
+        cmdline: Option<String>,
+        exit_code: Option<i32>,
+        wall: std::time::Duration,
+        r: crate::term::Receipt,
+        finished_at: u64,
+    ) -> Self {
+        Self {
+            cmd_seq,
+            cmdline,
+            exit_code,
+            wall_us: wall.as_micros().min(u64::MAX as u128) as u64,
+            cpu_us: r.cpu.map(|c| c.as_micros().min(u64::MAX as u128) as u64),
+            pcore_bp: r.pcore_share.filter(|v| v.is_finite()).map(|v| (v.clamp(0.0, 1.0) * 10_000.0).round() as u16),
+            energy_mj: r.energy_joules.filter(|v| v.is_finite() && *v >= 0.0).map(|v| (v * 1000.0).round() as u64),
+            peak_bytes: r.peak_footprint,
+            finished_at,
+        }
+    }
+
+    pub fn to_term_receipt(&self) -> crate::term::Receipt {
+        crate::term::Receipt {
+            cpu: self.cpu_duration(),
+            pcore_share: self.pcore_share(),
+            energy_joules: self.energy_joules(),
+            peak_footprint: self.peak_bytes,
+        }
+    }
+
+    pub fn format_duration(d: std::time::Duration) -> String {
+        let secs = d.as_secs_f64();
+        if secs < 0.001 {
+            format!("{} µs", d.as_micros())
+        } else if secs < 1.0 {
+            format!("{} ms", d.as_millis())
+        } else if secs < 60.0 {
+            format!("{secs:.2} s")
+        } else {
+            let total = d.as_secs();
+            let h = total / 3600;
+            let m = (total % 3600) / 60;
+            let s = total % 60;
+            if h > 0 {
+                format!("{h}h {m:02}m {s:02}s")
+            } else {
+                format!("{m}m {s:02}s")
+            }
+        }
+    }
+
+    pub fn format_bytes(bytes: u64) -> String {
+        const KIB: f64 = 1024.0;
+        const MIB: f64 = KIB * 1024.0;
+        const GIB: f64 = MIB * 1024.0;
+        let b = bytes as f64;
+        if b >= GIB {
+            format!("{:.2} GiB", b / GIB)
+        } else if b >= MIB {
+            format!("{:.1} MiB", b / MIB)
+        } else if b >= KIB {
+            format!("{:.0} KiB", b / KIB)
+        } else {
+            format!("{bytes} B")
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::with_capacity(5);
+        parts.push(format!("wall {}", Self::format_duration(self.wall_duration())));
+        if let Some(cpu) = self.cpu_duration() {
+            let pct = if self.wall_us > 0 {
+                let ratio = (cpu.as_secs_f64() / self.wall_duration().as_secs_f64()) * 100.0;
+                if ratio >= 5.0 { format!(" ({ratio:.0}%)") } else { String::new() }
+            } else {
+                String::new()
+            };
+            parts.push(format!("cpu {}{pct}", Self::format_duration(cpu)));
+        }
+        if let Some(p) = self.pcore_share() {
+            parts.push(format!("{:.0}% P-core", p * 100.0));
+        }
+        if let Some(e) = self.energy_joules() {
+            if e >= 0.05 {
+                parts.push(format!("{e:.1} J"));
+            }
+        }
+        if let Some(mem) = self.peak_bytes.filter(|&b| b > 0) {
+            parts.push(format!("peak {}", Self::format_bytes(mem)));
+        }
+        parts.join(" · ")
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "cmd_seq": self.cmd_seq,
+            "cmdline": self.cmdline,
+            "exit_code": self.exit_code,
+            "wall_us": self.wall_us,
+            "cpu_us": self.cpu_us,
+            "pcore_bp": self.pcore_bp,
+            "energy_mj": self.energy_mj,
+            "peak_bytes": self.peak_bytes,
+            "finished_at": self.finished_at,
+        })
+    }
+
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            cmd_seq: v.get("cmd_seq").and_then(Value::as_u64).map(|x| x as u32),
+            cmdline: v.get("cmdline").and_then(Value::as_str).map(str::to_string),
+            exit_code: v.get("exit_code").and_then(Value::as_i64).map(|x| x as i32),
+            wall_us: v.get("wall_us")?.as_u64()?,
+            cpu_us: v.get("cpu_us").and_then(Value::as_u64),
+            pcore_bp: v.get("pcore_bp").and_then(Value::as_u64).map(|x| (x.min(10_000)) as u16),
+            energy_mj: v.get("energy_mj").and_then(Value::as_u64),
+            peak_bytes: v.get("peak_bytes").and_then(Value::as_u64),
+            finished_at: v.get("finished_at").and_then(Value::as_u64).unwrap_or(0),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockInfo {
     pub id: String,
@@ -223,6 +380,8 @@ pub struct BlockInfo {
     pub status: Option<ProgramStatus>,
     /// True when `status` was derived automatically without explicit OSC 7501 hooks.
     pub status_inferred: bool,
+    /// Latest resource receipt captured on the server for this block.
+    pub last_receipt: Option<CommandReceipt>,
 }
 
 impl BlockInfo {
@@ -269,6 +428,7 @@ impl BlockInfo {
             "created_at": self.created_at,
             "status": self.status.as_ref().map(status_to_json),
             "status_inferred": self.status_inferred,
+            "last_receipt": self.last_receipt.as_ref().map(CommandReceipt::to_json),
         })
     }
 
@@ -292,6 +452,7 @@ impl BlockInfo {
             created_at: v.get("created_at").and_then(Value::as_u64).unwrap_or(0),
             status: v.get("status").and_then(status_from_json),
             status_inferred: v.get("status_inferred").and_then(Value::as_bool).unwrap_or(false),
+            last_receipt: v.get("last_receipt").and_then(CommandReceipt::from_json),
         })
     }
 }
@@ -1266,6 +1427,7 @@ mod tests {
             created_at: 0,
             status,
             status_inferred: false,
+            last_receipt: None,
         };
         let snap = ServerSnapshot {
             host: HostInfo {
@@ -1439,5 +1601,36 @@ mod tests {
         assert_eq!(groups[1].entries.len(), 2);
         assert_eq!(groups[1].entries[0].block_id, "b3"); // Working before Done
         assert_eq!(groups[2].project, "alpha");
+    }
+
+    #[test]
+    fn command_receipt_json_roundtrip_and_summary() {
+        let term_r = crate::term::Receipt {
+            cpu: Some(std::time::Duration::from_millis(840)),
+            pcore_share: Some(0.82),
+            energy_joules: Some(4.6),
+            peak_footprint: Some(128 * 1024 * 1024),
+        };
+        let r = CommandReceipt::from_term_receipt(
+            Some(7),
+            Some("cargo build --release".into()),
+            Some(0),
+            std::time::Duration::from_millis(1200),
+            term_r,
+            1_700_000_000,
+        );
+        let round = CommandReceipt::from_json(&r.to_json()).expect("roundtrip");
+        assert_eq!(round, r);
+        let back = round.to_term_receipt();
+        assert_eq!(back.cpu, term_r.cpu);
+        assert_eq!(back.peak_footprint, term_r.peak_footprint);
+        assert!((back.pcore_share.unwrap() - 0.82).abs() < 1e-3);
+        assert!((back.energy_joules.unwrap() - 4.6).abs() < 1e-3);
+        let s = round.summary();
+        assert!(s.contains("wall 1.20 s"));
+        assert!(s.contains("cpu 840 ms"));
+        assert!(s.contains("82% P-core"));
+        assert!(s.contains("4.6 J"));
+        assert!(s.contains("peak 128.0 MiB"));
     }
 }

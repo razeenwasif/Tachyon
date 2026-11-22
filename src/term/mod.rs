@@ -152,6 +152,7 @@ pub struct CommandInfo {
     pub started: Option<Instant>,
     pub finished: Option<Instant>,
     pub exit: Option<i32>,
+    pub wall: Option<Duration>,
     pub receipt: Option<Receipt>,
     /// The command line, when the shell reports it (`OSC 133;C;cmdline=...`).
     pub cmdline: Option<String>,
@@ -178,6 +179,9 @@ pub struct PreviousRun {
 impl CommandInfo {
     /// How long it ran, or has been running.
     pub fn elapsed(&self) -> Option<Duration> {
+        if let Some(wall) = self.wall {
+            return Some(wall);
+        }
         let start = self.started?;
         Some(self.finished.unwrap_or_else(Instant::now).duration_since(start))
     }
@@ -1059,10 +1063,77 @@ impl Term {
     }
 
     pub fn set_receipt(&mut self, id: u32, receipt: Receipt) {
+        self.set_receipt_with_wall(id, receipt, None);
+    }
+
+    pub fn set_receipt_with_wall(&mut self, id: u32, receipt: Receipt, wall: Option<Duration>) {
         if let Some(c) = self.commands.get_mut(&id) {
             c.receipt = Some(receipt);
+            if let Some(w) = wall {
+                c.wall = Some(w);
+            }
             self.dirty = true;
         }
+    }
+
+    /// Apply a receipt produced remotely (e.g. by `tachyon server` over Mux v2)
+    /// to the matching command mark, returning `true` if a finished command matched.
+    pub fn apply_remote_receipt(
+        &mut self,
+        cmd_seq: Option<u32>,
+        cmdline: Option<&str>,
+        exit_code: Option<i32>,
+        wall: Duration,
+        receipt: Receipt,
+    ) -> bool {
+        let cmdline_matches = |c: &CommandInfo| -> bool {
+            match (cmdline, c.cmdline.as_deref()) {
+                (Some(a), Some(b)) => a.trim() == b.trim(),
+                _ => true,
+            }
+        };
+        if let Some(id) = cmd_seq {
+            if let Some(c) = self.commands.get_mut(&id) {
+                if c.state == CommandState::Done && cmdline_matches(c) && (exit_code.is_none() || c.exit.is_none() || c.exit == exit_code) {
+                    c.receipt = Some(receipt);
+                    c.wall = Some(wall);
+                    if c.exit.is_none() {
+                        c.exit = exit_code;
+                    }
+                    self.dirty = true;
+                    return true;
+                }
+            }
+        }
+        // Fallback when client reattached mid-session and local cmd IDs are offset.
+        let mut keys: Vec<u32> = self.commands.keys().copied().collect();
+        keys.sort_by_key(|k| self.next_cmd.wrapping_sub(*k));
+        let mut fallback_done = None;
+        for id in keys {
+            if let Some(c) = self.commands.get(&id) {
+                if c.state == CommandState::Done && cmdline_matches(c) && (exit_code.is_none() || c.exit.is_none() || c.exit == exit_code) {
+                    if c.receipt.is_none() {
+                        fallback_done = Some(id);
+                        break;
+                    }
+                    if fallback_done.is_none() {
+                        fallback_done = Some(id);
+                    }
+                }
+            }
+        }
+        if let Some(id) = fallback_done {
+            if let Some(c) = self.commands.get_mut(&id) {
+                c.receipt = Some(receipt);
+                c.wall = Some(wall);
+                if c.exit.is_none() {
+                    c.exit = exit_code;
+                }
+                self.dirty = true;
+                return true;
+            }
+        }
+        false
     }
 
     /// OSC 133: A prompt starts, B input starts, C output starts (the command
@@ -1094,6 +1165,7 @@ impl Term {
                         started: None,
                         finished: None,
                         exit: None,
+                        wall: None,
                         receipt: None,
                         cmdline: None,
                         lens: lens::Lens::default(),
@@ -1161,11 +1233,18 @@ impl Term {
                         .get(2)
                         .and_then(|p| std::str::from_utf8(p).ok())
                         .and_then(|s| s.parse().ok());
+                    let (parsed_wall, parsed_receipt) = parse_osc133_receipt(params.get(2..).unwrap_or(&[]));
                     if let Some(c) = self.commands.get_mut(&id) {
                         if c.state == CommandState::Running {
                             c.state = CommandState::Done;
                             c.finished = (!self.restoring).then(Instant::now);
                             c.exit = exit;
+                            if parsed_wall.is_some() {
+                                c.wall = parsed_wall;
+                            }
+                            if parsed_receipt.is_some() {
+                                c.receipt = parsed_receipt;
+                            }
                             if self.awake_cmd == Some(id) {
                                 self.awake_cmd = None;
                             }
@@ -2925,6 +3004,58 @@ impl Term {
         let img = self.new_image(image::Format::Encoded, i.width, i.height, i.data);
         self.place_image(img, cols, rows, true, None, true);
     }
+}
+
+/// Parse optional `tachyon_*` telemetry tags attached to `OSC 133;D`.
+fn parse_osc133_receipt(tail: &[&[u8]]) -> (Option<Duration>, Option<Receipt>) {
+    let mut wall = None;
+    let mut r = Receipt::default();
+    let mut any_receipt = false;
+    for raw in tail {
+        let Ok(s) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        let Some((k, v)) = s.split_once('=') else {
+            continue;
+        };
+        match k {
+            "tachyon_wall_us" => {
+                if let Ok(us) = v.parse::<u64>() {
+                    wall = Some(Duration::from_micros(us));
+                }
+            }
+            "tachyon_cpu_us" => {
+                if let Ok(us) = v.parse::<u64>() {
+                    r.cpu = Some(Duration::from_micros(us));
+                    any_receipt = true;
+                }
+            }
+            "tachyon_pcore" => {
+                if let Ok(p) = v.parse::<f32>() {
+                    if p.is_finite() {
+                        r.pcore_share = Some(p.clamp(0.0, 1.0));
+                        any_receipt = true;
+                    }
+                }
+            }
+            "tachyon_energy" => {
+                if let Ok(e) = v.parse::<f64>() {
+                    if e.is_finite() && e >= 0.0 {
+                        r.energy_joules = Some(e);
+                        any_receipt = true;
+                    }
+                }
+            }
+            "tachyon_mem" => {
+                if let Ok(m) = v.parse::<u64>() {
+                    r.peak_footprint = Some(m);
+                    any_receipt = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    (wall, any_receipt.then_some(r))
 }
 
 /// Whether a command line starts an ssh session.

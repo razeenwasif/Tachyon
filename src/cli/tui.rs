@@ -1851,6 +1851,7 @@ mod tests {
                         label: None,
                     }),
                     status_inferred: false,
+                    last_receipt: None,
                 },
                 BlockInfo {
                     id: "b_2".into(),
@@ -1871,6 +1872,7 @@ mod tests {
                     created_at: 2,
                     status: None,
                     status_inferred: false,
+                    last_receipt: None,
                 },
             ],
             clients: Vec::new(),

@@ -1521,3 +1521,163 @@ fn cli_tui_narrow_and_wide_render_live_sessions_and_blocked_agents() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_server_receipts_capture_cpu_memory_and_emit_block_receipt_events() {
+    let dir = temp_dir("receipts-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    std::fs::write(&hosts, "{}").unwrap();
+
+    // Start isolated server with SHELL=/bin/sh so `new` opens a clean login
+    // shell immediately without depending on user rc files.
+    let srv_out = Command::new(bin())
+        .args(["server", "start"])
+        .env("TACHYON_SOCKET", &sock)
+        .env("TACHYON_HOSTS_FILE", &hosts)
+        .env("SHELL", "/bin/sh")
+        .env_remove("TACHYON_SERVER")
+        .output()
+        .expect("start server");
+    assert!(
+        srv_out.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&srv_out.stderr)
+    );
+
+    // Subscribe to live Mux v2 JSON events in a background CLI child.
+    let mut ev_child = Command::new(bin())
+        .args(["events", "--json"])
+        .env("TACHYON_SOCKET", &sock)
+        .env("TACHYON_HOSTS_FILE", &hosts)
+        .env_remove("TACHYON_SERVER")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn events");
+    let ev_stdout = ev_child.stdout.take().expect("events stdout");
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Value>();
+    let ev_reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(ev_stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                let _ = ev_tx.send(v);
+            }
+        }
+    });
+    // Wait briefly so `events.subscribe` is registered before emitting commands.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // 1. Login-shell block (`cmd = None`): OSC 133 A/B/C/D command triggers receipt capture & RPCs.
+    let (code, out, err) = run_cli(&sock, &hosts, &["new", "rcpt-shell", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let created: Value = serde_json::from_str(&out).unwrap();
+    let shell_bid = created["block"]["id"].as_str().unwrap().to_string();
+
+    let cmd = concat!(
+        "printf '\\033]133;A\\007\\033]133;B\\007\\033]133;C;cmdline=awk_spin\\007'; ",
+        "awk 'BEGIN { s=0; for (i=0; i<900000; i++) s+=i }'; ",
+        "printf '\\033]133;D;%s\\007\\n' \"$?\""
+    );
+    let (code, _, err) = run_cli(&sock, &hosts, &["send", "-b", &shell_bid, "--enter", cmd]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let mut shell_receipt: Option<Value> = None;
+    for _ in 0..80 {
+        let (c, r_out, _) = run_cli(&sock, &hosts, &["receipts", "-b", &shell_bid, "--json"]);
+        if c == 0 {
+            if let Ok(v) = serde_json::from_str::<Value>(&r_out) {
+                if let Some(first) = v["receipts"].as_array().and_then(|a| a.first()) {
+                    shell_receipt = Some(first.clone());
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let sr = shell_receipt.expect("expected shell receipt via block.receipts RPC");
+    assert_eq!(sr["cmdline"].as_str(), Some("awk_spin"));
+    assert_eq!(sr["exit_code"].as_i64(), Some(0));
+    assert!(sr["wall_us"].as_u64().unwrap_or(0) > 0, "wall_us: {sr}");
+    assert!(
+        sr["cpu_us"].as_u64().unwrap_or(0) > 0,
+        "expected non-zero cpu_us for awk burn: {sr}"
+    );
+    assert!(
+        sr["peak_bytes"].as_u64().unwrap_or(0) > 0,
+        "expected non-zero peak_bytes for awk burn: {sr}"
+    );
+
+    // Human-readable `tachyon receipts -b` and `--all --json` + `ls --json` `last_receipt`.
+    let (code, human_out, err) = run_cli(&sock, &hosts, &["receipts", "-b", &shell_bid]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(human_out.contains("awk_spin"), "human: {human_out:?}");
+    assert!(human_out.contains("cpu "), "human: {human_out:?}");
+    assert!(human_out.contains("peak "), "human: {human_out:?}");
+
+    let (code, all_out, err) = run_cli(&sock, &hosts, &["receipts", "--all", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let all_v: Value = serde_json::from_str(&all_out).unwrap();
+    assert!(
+        all_v["receipts"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x["block_id"] == shell_bid)),
+        "expected shell block in `receipts --all`: {all_v}"
+    );
+
+    let (code, ls_out, err) = run_cli(&sock, &hosts, &["ls", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let ls_v: Value = serde_json::from_str(&ls_out).unwrap();
+    assert!(
+        ls_v["blocks"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|b| b["id"] == shell_bid && b["last_receipt"]["cmdline"] == "awk_spin")),
+        "expected last_receipt on BlockInfo in `ls --json`: {ls_v}"
+    );
+
+    // 2. Direct command block (`tachyon run --wait`): emits `block.receipt` event on exit.
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "run",
+            "--wait",
+            "--",
+            "/bin/sh",
+            "-c",
+            "awk 'BEGIN { s=0; for (i=0; i<900000; i++) s+=i }'",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut receipt_events = Vec::new();
+    while std::time::Instant::now() < deadline && receipt_events.len() < 2 {
+        if let Ok(ev) = ev_rx.recv_timeout(Duration::from_millis(100)) {
+            if ev.get("event").and_then(Value::as_str) == Some("block.receipt") {
+                receipt_events.push(ev);
+            }
+        }
+    }
+    assert!(
+        receipt_events.iter().any(|e| e["block_id"] == shell_bid),
+        "missing shell block.receipt event: {receipt_events:?}"
+    );
+    assert!(
+        receipt_events.iter().any(|e| {
+            e["block_id"] != shell_bid
+                && e["receipt"]["wall_us"].as_u64().unwrap_or(0) > 0
+                && (e["receipt"]["cpu_us"].as_u64().unwrap_or(0) > 0
+                    || e["receipt"]["peak_bytes"].as_u64().unwrap_or(0) > 0)
+        }),
+        "missing direct `run` block.receipt event with CPU/memory telemetry: {receipt_events:?}"
+    );
+
+    let _ = ev_child.kill();
+    let _ = ev_child.wait();
+    let _ = ev_reader.join();
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
