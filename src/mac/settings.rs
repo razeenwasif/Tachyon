@@ -91,6 +91,58 @@ pub fn refresh_if_open() {
     });
 }
 
+fn set_status_note_if_open(text: &str) {
+    SETTINGS.with(|slot| {
+        if let Ok(guard) = slot.try_borrow() {
+            if let Some(win) = guard.as_ref() {
+                *win.actions.ivars().status_note.borrow_mut() = Some(text.to_string());
+            }
+        }
+    });
+    refresh_if_open();
+}
+
+/// Run Fleet Doctor asynchronously across local and all configured remote hosts
+/// and update the Settings status bar.
+pub fn trigger_fleet_doctor() {
+    set_status_note_if_open("Running Fleet Doctor across all configured hosts…");
+    std::thread::spawn(|| {
+        let hosts = crate::mux::load_hosts();
+        let diags = crate::mux::doctor::diagnose_fleet(&hosts, true, std::time::Duration::from_secs(4));
+        let total = diags.len();
+        let healthy = diags
+            .iter()
+            .filter(|d| d.health == crate::mux::doctor::HostHealth::Healthy)
+            .count();
+        let stale: Vec<String> = diags
+            .iter()
+            .filter(|d| d.update_available)
+            .map(|d| d.alias.clone())
+            .collect();
+        let offline: Vec<String> = diags
+            .iter()
+            .filter(|d| d.health == crate::mux::doctor::HostHealth::Offline)
+            .map(|d| d.alias.clone())
+            .collect();
+        let summary = if healthy == total {
+            format!("Fleet Doctor: {healthy}/{total} hosts healthy (v{}, {}).", crate::APP_VERSION, crate::APP_BUILD_SHA)
+        } else {
+            let mut parts = vec![format!("Fleet Doctor: {healthy}/{total} healthy")];
+            if !stale.is_empty() {
+                parts.push(format!("update available: {}", stale.join(", ")));
+            }
+            if !offline.is_empty() {
+                parts.push(format!("offline: {}", offline.join(", ")));
+            }
+            parts.join(" · ")
+        };
+        DispatchQueue::main().exec_async(move || {
+            super::mux_refresh_all();
+            set_status_note_if_open(&summary);
+        });
+    });
+}
+
 #[derive(Default)]
 struct NavState {
     active: Cell<usize>,
@@ -342,6 +394,30 @@ define_class!(
             });
         }
 
+        #[unsafe(method(serverUpgrade:))]
+        fn server_upgrade(&self, _sender: Option<&AnyObject>) {
+            self.set_note("Snapshotting sessions & upgrading local server…");
+            std::thread::spawn(|| {
+                let hosts = crate::mux::load_hosts();
+                let res = crate::mux::doctor::execute_upgrade(
+                    "local",
+                    &hosts,
+                    &crate::mux::doctor::UpgradeOptions::default(),
+                );
+                let msg = match res {
+                    Ok(r) => {
+                        let lbl = r.after.as_ref().map_or("restarted", |a| a.health.label());
+                        format!("Local server upgraded -> {lbl}.")
+                    }
+                    Err(e) => format!("Local upgrade failed: {e}"),
+                };
+                DispatchQueue::main().exec_async(move || {
+                    super::mux_reconnect_host("local");
+                    set_status_note_if_open(&msg);
+                });
+            });
+        }
+
         #[unsafe(method(serverInstallService:))]
         fn server_install_service(&self, _sender: Option<&AnyObject>) {
             match server::install_service(&default_socket_path()) {
@@ -366,6 +442,38 @@ define_class!(
                 super::mux_reconnect_host(&alias);
                 self.set_note(&format!("Reconnecting `{alias}`…"));
                 refresh_if_open();
+            }
+        }
+
+        #[unsafe(method(hostRunDoctor:))]
+        fn host_run_doctor(&self, _sender: Option<&AnyObject>) {
+            trigger_fleet_doctor();
+        }
+
+        #[unsafe(method(hostUpgrade:))]
+        fn host_upgrade(&self, sender: Option<&AnyObject>) {
+            if let Some(alias) = tagged_string(sender, &self.ivars().host_aliases.borrow()) {
+                self.set_note(&format!("Upgrading `{alias}` (snapshot + deploy + restart)…"));
+                refresh_if_open();
+                std::thread::spawn(move || {
+                    let hosts = crate::mux::load_hosts();
+                    let uopts = crate::mux::doctor::UpgradeOptions {
+                        install_service: true,
+                        ..Default::default()
+                    };
+                    let res = crate::mux::doctor::execute_upgrade(&alias, &hosts, &uopts);
+                    let msg = match res {
+                        Ok(r) => {
+                            let status = r.after.as_ref().map_or("upgraded", |a| a.health.label());
+                            format!("Upgraded `{}` ({}) -> {status}", r.plan.alias, r.plan.strategy)
+                        }
+                        Err(e) => format!("Upgrade `{alias}` failed: {e}"),
+                    };
+                    DispatchQueue::main().exec_async(move || {
+                        super::mux_reconnect_host(&alias);
+                        set_status_note_if_open(&msg);
+                    });
+                });
             }
         }
 
@@ -929,24 +1037,61 @@ impl SettingsWindow {
         let hosts = super::mux_host_views();
         let local = hosts.iter().find(|h| h.is_local);
 
-        let (state_text, detail_text) = match local.map(|h| &h.status) {
-            Some(HostStatus::Connected { info, .. }) => {
-                let (s, b) = local
+        let (state_text, detail_text, local_update) = match local.map(|h| &h.status) {
+            Some(HostStatus::Connected { info, rtt_ms }) => {
+                let (s, b, c) = local
                     .and_then(|h| h.snapshot.as_ref())
-                    .map(|sn| (sn.sessions.len(), sn.blocks.len()))
-                    .unwrap_or((0, 0));
+                    .map(|sn| (sn.sessions.len(), sn.blocks.len(), sn.clients.len()))
+                    .unwrap_or((0, 0, 0));
+                let diag = crate::mux::doctor::diagnose_from_status(
+                    "local",
+                    &crate::mux::default_local_uri(),
+                    true,
+                    Some(info),
+                    *rtt_ms,
+                    s,
+                    b,
+                    c,
+                    None,
+                );
+                let ver = format!(
+                    "v{} ({})",
+                    info.version,
+                    info.build.as_deref().unwrap_or("legacy")
+                );
+                let head = if diag.update_available {
+                    format!(
+                        "{} Running · Update available · PID {} · {ver} · caps:{}/{}",
+                        diag.health.dot(),
+                        info.pid,
+                        diag.capabilities.len(),
+                        crate::LOCAL_CAPABILITIES.len(),
+                    )
+                } else {
+                    format!(
+                        "{} Running · PID {} · Mux v{} · {ver} · caps:{}/{}",
+                        diag.health.dot(),
+                        info.pid,
+                        info.protocol,
+                        diag.capabilities.len(),
+                        crate::LOCAL_CAPABILITIES.len(),
+                    )
+                };
                 (
-                    format!("🟢 Running · PID {} · Mux v{}", info.pid, info.protocol),
+                    head,
                     format!("{} sessions, {} blocks · {}", s, b, default_socket_path().display()),
+                    diag.update_available,
                 )
             }
             Some(HostStatus::Connecting) => (
                 "🟡 Starting local server…".into(),
                 default_socket_path().display().to_string(),
+                false,
             ),
             _ => (
                 "⚪️ Stopped".into(),
                 format!("Socket: {}", default_socket_path().display()),
+                false,
             ),
         };
 
@@ -958,7 +1103,11 @@ impl SettingsWindow {
         let l3 = label(mtm, &detail_text, 11.0, false, &NSColor::secondaryLabelColor());
         l3.setFrame(NSRect::new(NSPoint::new(14.0, 54.0), NSSize::new(w - 28.0, 16.0)));
 
-        let start_btn = push_button(mtm, "Start / Reconnect", target, sel!(serverStartOrRestart:));
+        let start_btn = if local_update {
+            push_button(mtm, "Restart & Upgrade", target, sel!(serverUpgrade:))
+        } else {
+            push_button(mtm, "Start / Reconnect", target, sel!(serverStartOrRestart:))
+        };
         start_btn.setFrame(NSRect::new(NSPoint::new(14.0, 78.0), NSSize::new(140.0, 26.0)));
         let inst_btn = push_button(mtm, "Install LaunchAgent", target, sel!(serverInstallService:));
         inst_btn.setFrame(NSRect::new(NSPoint::new(162.0, 78.0), NSSize::new(146.0, 26.0)));
@@ -996,11 +1145,14 @@ impl SettingsWindow {
         let remotes: Vec<_> = hosts.into_iter().filter(|h| !h.is_local).collect();
 
         let mut aliases = Vec::new();
-        let rows_h = (remotes.len().max(1) as f64) * 34.0 + 36.0;
+        let rows_h = (remotes.len().max(1) as f64) * 52.0 + 40.0;
         let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, rows_h)));
         let hdr = label(mtm, "Configured Remote Hosts", 13.0, true, &NSColor::labelColor());
-        hdr.setFrame(NSRect::new(NSPoint::new(14.0, 10.0), NSSize::new(w - 28.0, 18.0)));
+        hdr.setFrame(NSRect::new(NSPoint::new(14.0, 10.0), NSSize::new(w - 170.0, 18.0)));
+        let doc_btn = push_button(mtm, "Run Fleet Doctor", target, sel!(hostRunDoctor:));
+        doc_btn.setFrame(NSRect::new(NSPoint::new(w - 148.0, 6.0), NSSize::new(134.0, 24.0)));
         card.addSubview(&hdr);
+        card.addSubview(&doc_btn);
 
         if remotes.is_empty() {
             let empty = label(
@@ -1010,27 +1162,76 @@ impl SettingsWindow {
                 false,
                 &NSColor::secondaryLabelColor(),
             );
-            empty.setFrame(NSRect::new(NSPoint::new(14.0, 36.0), NSSize::new(w - 28.0, 18.0)));
+            empty.setFrame(NSRect::new(NSPoint::new(14.0, 42.0), NSSize::new(w - 28.0, 18.0)));
             card.addSubview(&empty);
         } else {
             for (idx, h) in remotes.iter().enumerate() {
                 aliases.push(h.alias.clone());
-                let ry = 34.0 + idx as f64 * 34.0;
-                let line = match &h.status {
-                    HostStatus::Connected { info, rtt_ms: Some(ms) } => {
-                        format!("🟢 {} · {}/{} ({ms:.0} ms) · {}", h.display_name, info.os, info.arch, h.uri)
+                let ry = 36.0 + idx as f64 * 52.0;
+                let (line1, line2, can_upgrade) = match &h.status {
+                    HostStatus::Connected { info, rtt_ms } => {
+                        let (s, b, cl) = h
+                            .snapshot
+                            .as_ref()
+                            .map(|sn| (sn.sessions.len(), sn.blocks.len(), sn.clients.len()))
+                            .unwrap_or((0, 0, 0));
+                        let diag = crate::mux::doctor::diagnose_from_status(
+                            &h.alias,
+                            &h.uri,
+                            false,
+                            Some(info),
+                            *rtt_ms,
+                            s,
+                            b,
+                            cl,
+                            None,
+                        );
+                        let rtt_str = rtt_ms.map_or_else(String::new, |ms| format!(" · {ms:.0} ms"));
+                        let ver = format!(
+                            "v{} ({})",
+                            info.version,
+                            info.build.as_deref().unwrap_or("legacy")
+                        );
+                        let badge = diag.health.label();
+                        let l1 = format!(
+                            "{} {} · {}/{}{rtt_str} · {ver} [{badge}]",
+                            diag.health.dot(),
+                            h.display_name,
+                            info.os,
+                            info.arch,
+                        );
+                        let cap_str = if diag.missing_capabilities.is_empty() {
+                            format!(
+                                "caps:{}/{} · {}",
+                                diag.capabilities.len(),
+                                crate::LOCAL_CAPABILITIES.len(),
+                                diag.auth_status
+                            )
+                        } else {
+                            format!("missing: {}", diag.missing_capabilities.join(", "))
+                        };
+                        let l2 = format!("{} · {cap_str}", h.uri);
+                        (l1, l2, diag.update_available)
                     }
-                    HostStatus::Connected { info, .. } => {
-                        format!("🟢 {} · {}/{} · {}", h.display_name, info.os, info.arch, h.uri)
-                    }
-                    HostStatus::Connecting => format!("🟡 {} (connecting…)", h.display_name),
-                    HostStatus::Disconnected { .. } => format!("⚪️ {} (offline) · {}", h.display_name, h.uri),
+                    HostStatus::Connecting => (
+                        format!("🟡 {} (connecting…)", h.display_name),
+                        h.uri.clone(),
+                        false,
+                    ),
+                    HostStatus::Disconnected { error } => (
+                        format!("🔴 {} (offline)", h.display_name),
+                        format!("{} · {error}", h.uri),
+                        true,
+                    ),
                 };
-                let lbl = label(mtm, &line, 12.0, false, &NSColor::labelColor());
-                lbl.setFrame(NSRect::new(NSPoint::new(14.0, ry + 5.0), NSSize::new(w - 280.0, 18.0)));
+                let lbl = label(mtm, &line1, 12.0, false, &NSColor::labelColor());
+                lbl.setFrame(NSRect::new(NSPoint::new(14.0, ry + 5.0), NSSize::new(w - 354.0, 17.0)));
+                let sub = label(mtm, &line2, 10.5, false, &NSColor::secondaryLabelColor());
+                sub.setFrame(NSRect::new(NSPoint::new(14.0, ry + 24.0), NSSize::new(w - 354.0, 15.0)));
+
                 let color_pop = NSPopUpButton::initWithFrame_pullsDown(
                     NSPopUpButton::alloc(mtm),
-                    NSRect::new(NSPoint::new(w - 258.0, ry + 1.0), NSSize::new(86.0, 24.0)),
+                    NSRect::new(NSPoint::new(w - 334.0, ry + 11.0), NSSize::new(82.0, 24.0)),
                     false,
                 );
                 let cur_spec = h.color.as_deref().unwrap_or("auto");
@@ -1048,14 +1249,20 @@ impl SettingsWindow {
                     color_pop.setTarget(Some(target));
                     color_pop.setAction(Some(sel!(hostChangeColor:)));
                 }
+                let upg_title = if can_upgrade { "Upgrade" } else { "Deploy" };
+                let upg = push_button(mtm, upg_title, target, sel!(hostUpgrade:));
+                upg.setTag(idx as isize);
+                upg.setFrame(NSRect::new(NSPoint::new(w - 246.0, ry + 11.0), NSSize::new(72.0, 24.0)));
                 let rec = push_button(mtm, "Reconnect", target, sel!(hostReconnect:));
                 rec.setTag(idx as isize);
-                rec.setFrame(NSRect::new(NSPoint::new(w - 166.0, ry + 1.0), NSSize::new(82.0, 24.0)));
+                rec.setFrame(NSRect::new(NSPoint::new(w - 168.0, ry + 11.0), NSSize::new(82.0, 24.0)));
                 let rem = push_button(mtm, "Remove", target, sel!(hostRemove:));
                 rem.setTag(idx as isize);
-                rem.setFrame(NSRect::new(NSPoint::new(w - 80.0, ry + 1.0), NSSize::new(68.0, 24.0)));
+                rem.setFrame(NSRect::new(NSPoint::new(w - 82.0, ry + 11.0), NSSize::new(68.0, 24.0)));
                 card.addSubview(&lbl);
+                card.addSubview(&sub);
                 card.addSubview(&color_pop);
+                card.addSubview(&upg);
                 card.addSubview(&rec);
                 card.addSubview(&rem);
             }

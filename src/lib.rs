@@ -35,3 +35,18 @@ pub const APP_USER_MODEL_ID: &str = "Tachyon.Terminal";
 
 pub const APP_NAME: &str = "Tachyon";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub const APP_BUILD_SHA: &str = match option_env!("TACHYON_BUILD_SHA") {
+    Some(s) => s,
+    None => "unknown",
+};
+
+pub const LOCAL_CAPABILITIES: &[&str] = &[
+    "auth.bearer",
+    "block.handoff",
+    "block.receipts",
+    "block.rewind",
+    "block.wait",
+    "images.restore",
+    "server.persist",
+];

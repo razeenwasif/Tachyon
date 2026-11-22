@@ -1788,6 +1788,9 @@ mod tests {
                 version: "0.1.0".into(),
                 protocol: 2,
                 pid: 123,
+                build: None,
+                capabilities: Vec::new(),
+                auth_enabled: None,
             },
             sessions: vec![
                 SessionInfo {

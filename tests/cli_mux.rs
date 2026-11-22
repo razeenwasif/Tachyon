@@ -1807,3 +1807,85 @@ fn cli_mux_inline_images_survive_detach_reattach_and_cell_px_resize() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_doctor_and_hosts_upgrade_diagnose_capabilities_and_restart_server() {
+    let dir = temp_dir("doctor-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+    std::fs::write(&hosts, "{}").unwrap();
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // 1. Healthy local daemon reports build SHA + all expected capabilities + RTT.
+    let (code, out, err) = run_cli(&sock, &hosts, &["doctor", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}\nout: {out}");
+    let doc: Value = serde_json::from_str(&out).expect("doctor json");
+    assert_eq!(doc["healthy"], true, "{doc}");
+    assert_eq!(doc["local_build"].as_str(), Some(tachyon::APP_BUILD_SHA));
+    let local = doc["hosts"]
+        .as_array()
+        .and_then(|a| a.iter().find(|h| h["alias"] == "local"))
+        .expect("local host entry");
+    assert_eq!(local["health"], "healthy", "{local}");
+    assert_eq!(local["host"]["build"].as_str(), Some(tachyon::APP_BUILD_SHA));
+    assert!(local["missing_capabilities"].as_array().unwrap().is_empty());
+    for cap in tachyon::LOCAL_CAPABILITIES {
+        assert!(
+            local["capabilities"].as_array().unwrap().iter().any(|c| c == *cap),
+            "missing capability {cap} in {local}"
+        );
+    }
+    assert!(local["rtt_ms"].as_f64().is_some_and(|r| r >= 0.0));
+    let pid_before = local["host"]["pid"].as_u64().unwrap();
+
+    // 2. Adding an unreachable host makes fleet doctor exit 1 with `offline`.
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &["hosts", "add", "dead-box", "tcp://127.0.0.1:1", "--token", "bad"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, out_bad, err_bad) = run_cli(&sock, &hosts, &["doctor", "--json", "--timeout", "1000"]);
+    assert_eq!(code, 1, "expected exit 1 with offline host; err: {err_bad}");
+    let doc_bad: Value = serde_json::from_str(&out_bad).unwrap();
+    assert_eq!(doc_bad["healthy"], false);
+    let dead = doc_bad["hosts"]
+        .as_array()
+        .and_then(|a| a.iter().find(|h| h["alias"] == "dead-box"))
+        .expect("dead-box");
+    assert_eq!(dead["health"], "offline");
+
+    // 3. Dry-run SSH upgrade prints strategy & steps without touching SSH.
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "add", "mock-mini", "ssh://mock-mini"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, dry_out, dry_err) = run_cli(
+        &sock,
+        &hosts,
+        &["hosts", "upgrade", "mock-mini", "--dry-run", "--json"],
+    );
+    assert_eq!(code, 0, "stderr: {dry_err}");
+    let dry_v: Value = serde_json::from_str(&dry_out).unwrap();
+    assert_eq!(dry_v["executed"], false);
+    assert_eq!(dry_v["plan"]["alias"], "mock-mini");
+    assert!(!dry_v["plan"]["steps"].as_array().unwrap().is_empty());
+
+    // 4. Live `hosts upgrade local` snapshots, stops, restarts & verifies new healthy PID.
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "rm", "dead-box"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, _, err) = run_cli(&sock, &hosts, &["hosts", "rm", "mock-mini"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let (code, upg_out, upg_err) = run_cli(&sock, &hosts, &["hosts", "upgrade", "local", "--json"]);
+    assert_eq!(code, 0, "stderr: {upg_err}\nout: {upg_out}");
+    let upg_v: Value = serde_json::from_str(&upg_out).unwrap();
+    assert_eq!(upg_v["executed"], true);
+    assert_eq!(upg_v["plan"]["strategy"], "local-restart");
+    assert_eq!(upg_v["after"]["health"], "healthy");
+    let pid_after = upg_v["after"]["host"]["pid"].as_u64().unwrap();
+    assert_ne!(pid_after, pid_before, "expected local daemon restart with new PID");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

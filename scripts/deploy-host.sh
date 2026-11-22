@@ -51,9 +51,10 @@ fi
 
 if [[ $remote_build -eq 1 ]]; then
     echo "building headless tachyon on $host (${remote_os:-remote}/${remote_arch:-unknown})..."
+    build_sha=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
     ssh "$host" 'mkdir -p ~/.local/bin ~/.local/share/tachyon/shell ~/.cache/tachyon-src'
     rsync -az --delete --exclude target --exclude dist --exclude .git ./ "$host:~/.cache/tachyon-src/"
-    ssh "$host" 'export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR="$HOME/.cache/tachyon-src/target"; cd ~/.cache/tachyon-src && cargo build --release --no-default-features && cp target/release/tachyon ~/.local/bin/tachyon.new && chmod +x ~/.local/bin/tachyon.new && mv -f ~/.local/bin/tachyon.new ~/.local/bin/tachyon && cp -R shell/* ~/.local/share/tachyon/shell/'
+    ssh "$host" "export PATH=\"\$HOME/.cargo/bin:\$PATH\" CARGO_TARGET_DIR=\"\$HOME/.cache/tachyon-src/target\" TACHYON_BUILD_SHA=\"$build_sha\"; cd ~/.cache/tachyon-src && cargo build --release --no-default-features && cp target/release/tachyon ~/.local/bin/tachyon.new && chmod +x ~/.local/bin/tachyon.new && mv -f ~/.local/bin/tachyon.new ~/.local/bin/tachyon && cp -R shell/* ~/.local/share/tachyon/shell/"
 else
     echo "building headless tachyon (${local_os}/${local_arch})..."
     cargo build --release --no-default-features
@@ -75,7 +76,7 @@ if [[ $install_service -eq 1 ]]; then
     if [[ -n "$listen_addr" ]]; then
         svc_flags="--listen $listen_addr"
     fi
-    ssh "$host" "~/.local/bin/tachyon server stop >/dev/null 2>&1 || true; ~/.local/bin/tachyon server install-service $svc_flags"
+    ssh "$host" "~/.local/bin/tachyon server snapshot >/dev/null 2>&1 || true; ~/.local/bin/tachyon server stop >/dev/null 2>&1 || true; ~/.local/bin/tachyon server install-service $svc_flags"
 fi
 
 echo "verifying remote host over SSH bridge..."

@@ -68,6 +68,7 @@ pub enum PaletteAction {
     FollowJob,
     SetupAgentIntegrations,
     RefreshHosts,
+    FleetDoctor,
     SaveServerSnapshot,
     LaunchWorkspace(String),
     StopWorkspace(String),
@@ -334,6 +335,12 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Re-sync sessions across This Mac and remote servers".into(),
             shortcut: "",
             action: PaletteAction::RefreshHosts,
+        },
+        PaletteItem {
+            title: "Hosts: Run Fleet Health Check (Doctor)".into(),
+            subtitle: "Audit versions, build SHAs, capabilities & RTT across all hosts".into(),
+            shortcut: "",
+            action: PaletteAction::FleetDoctor,
         },
         PaletteItem {
             title: "Server: Save Session Snapshot Now".into(),
@@ -967,6 +974,11 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
             return;
         }
         PaletteAction::RefreshHosts => super::mux_refresh_all(),
+        PaletteAction::FleetDoctor => {
+            super::open_settings_section(1);
+            super::settings::trigger_fleet_doctor();
+            return;
+        }
         PaletteAction::SaveServerSnapshot => super::mux_save_server_snapshot(),
         PaletteAction::LaunchWorkspace(name) => super::mux_workspace_up(win_id, &name),
         PaletteAction::StopWorkspace(name) => super::mux_workspace_down(&name),

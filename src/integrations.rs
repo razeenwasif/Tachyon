@@ -310,8 +310,9 @@ Every managed pane automatically exports:
 ## Common Commands
 
 ```sh
-# Inspect hosts, sessions, windows, and panes as structured JSON
+# Inspect hosts, health diagnostics, sessions, windows, and panes as JSON
 tachyon hosts ls --json
+tachyon doctor --json
 tachyon ls --json
 
 # Open a split pane beside or below the current pane

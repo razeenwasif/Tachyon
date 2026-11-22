@@ -41,7 +41,7 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 i += 1;
                 continue;
             }
-            "server" | "bridge" | "hosts" | "workspace" | "ws" | "worktree" | "wt" | "agents"
+            "server" | "bridge" | "hosts" | "doctor" | "workspace" | "ws" | "worktree" | "wt" | "agents"
             | "agent" | "tui" | "ls" | "new" | "session" | "window" | "split" | "run" | "wait"
             | "send" | "capture" | "rewind" | "receipts" | "events" | "skill" | "status" | "hook"
             | "help" | "--help" | "-h" => {
@@ -112,6 +112,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "bridge" => cmd_bridge(tail),
         "server" => cmd_server(&opts, tail),
         "hosts" => cmd_hosts(&opts, tail),
+        "doctor" => cmd_doctor(&opts, tail),
         "workspace" | "ws" => cmd_workspace(&opts, tail),
         "worktree" | "wt" => cmd_worktree(&opts, tail),
         "agents" | "agent" => cmd_agents(&opts, tail),
@@ -634,8 +635,243 @@ fn cmd_hosts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             }
             Ok(0)
         }
+        "upgrade" => {
+            let mut alias: Option<String> = None;
+            let mut all = false;
+            let mut uopts = crate::mux::doctor::UpgradeOptions {
+                install_service: true,
+                ..Default::default()
+            };
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--all" | "-a" => {
+                        all = true;
+                        i += 1;
+                    }
+                    "--dry-run" => {
+                        uopts.dry_run = true;
+                        i += 1;
+                    }
+                    "--remote-build" => {
+                        uopts.remote_build = true;
+                        i += 1;
+                    }
+                    "--no-service" => {
+                        uopts.install_service = false;
+                        i += 1;
+                    }
+                    "--service" => {
+                        uopts.install_service = true;
+                        i += 1;
+                    }
+                    "--listen" => {
+                        uopts.listen = Some(rest.get(i + 1).ok_or("--listen requires an address")?.clone());
+                        i += 2;
+                    }
+                    "--ssh" => {
+                        uopts.ssh_override = Some(rest.get(i + 1).ok_or("--ssh requires user@host")?.clone());
+                        i += 2;
+                    }
+                    other if !other.starts_with('-') && alias.is_none() => {
+                        alias = Some(other.to_string());
+                        i += 1;
+                    }
+                    other => return Err(format!("unknown hosts upgrade option `{other}`")),
+                }
+            }
+
+            let hosts = load_hosts();
+            let targets: Vec<String> = if all {
+                let mut list = vec!["local".to_string()];
+                for h in &hosts {
+                    if h.alias != "local" {
+                        list.push(h.alias.clone());
+                    }
+                }
+                list
+            } else if let Some(a) = alias.or_else(|| opts.server.clone()) {
+                vec![a]
+            } else {
+                return Err("usage: tachyon hosts upgrade <alias | --all> [--dry-run] [--remote-build] [--listen ADDR] [--ssh DEST] [--no-service]".into());
+            };
+
+            let mut results = Vec::new();
+            let mut failures = Vec::new();
+            for target_alias in &targets {
+                match crate::mux::doctor::execute_upgrade(target_alias, &hosts, &uopts) {
+                    Ok(res) => results.push(res),
+                    Err(err) => failures.push((target_alias.clone(), err)),
+                }
+            }
+
+            if targets.len() == 1 && failures.is_empty() {
+                let res = &results[0];
+                if opts.json {
+                    print_json(&res.to_json());
+                } else if !res.executed {
+                    println!("Dry-run upgrade plan for `{}` ({}):", res.plan.alias, res.plan.strategy);
+                    for s in &res.plan.steps {
+                        println!("  $ {s}");
+                    }
+                    if let Some(ref note) = res.plan.note {
+                        println!("  note: {note}");
+                    }
+                } else {
+                    let after = res.after.as_ref();
+                    let status = after.map_or("unknown", |a| a.health.label());
+                    println!(
+                        "upgraded `{}` ({}) -> {}",
+                        res.plan.alias, res.plan.strategy, status
+                    );
+                }
+                return Ok(0);
+            }
+
+            if opts.json {
+                print_json(&json!({
+                    "dry_run": uopts.dry_run,
+                    "results": results.iter().map(crate::mux::doctor::UpgradeResult::to_json).collect::<Vec<_>>(),
+                    "failures": failures.iter().map(|(a, e)| json!({ "alias": a, "error": e })).collect::<Vec<_>>(),
+                }));
+            } else {
+                for res in &results {
+                    let status = if res.executed {
+                        res.after.as_ref().map_or("done", |a| a.health.label())
+                    } else {
+                        "dry-run"
+                    };
+                    println!("✓ {} ({}) — {}", res.plan.alias, res.plan.strategy, status);
+                    if !res.executed {
+                        for s in &res.plan.steps {
+                            println!("    $ {s}");
+                        }
+                    }
+                }
+                for (a, e) in &failures {
+                    eprintln!("✗ {a}: {e}");
+                }
+            }
+            if failures.is_empty() { Ok(0) } else { Ok(1) }
+        }
         other => Err(format!("unknown hosts subcommand `{other}`")),
     }
+}
+
+fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    let mut host_arg: Option<String> = None;
+    let mut all = false;
+    let mut strict = false;
+    let mut timeout_ms: u64 = 4000;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--all" | "-a" => {
+                all = true;
+                i += 1;
+            }
+            "--strict" => {
+                strict = true;
+                i += 1;
+            }
+            "--timeout" => {
+                let v = args.get(i + 1).ok_or("--timeout requires ms")?;
+                timeout_ms = v.parse::<u64>().map_err(|_| format!("invalid --timeout `{v}`"))?.max(250);
+                i += 2;
+            }
+            other if !other.starts_with('-') && host_arg.is_none() => {
+                host_arg = Some(other.to_string());
+                i += 1;
+            }
+            other => return Err(format!("unknown doctor option `{other}`")),
+        }
+    }
+
+    let timeout = Duration::from_millis(timeout_ms);
+    let hosts = load_hosts();
+    let single = if all {
+        None
+    } else {
+        host_arg.or_else(|| opts.server.clone())
+    };
+
+    let diags = if let Some(ref alias) = single {
+        let uri = if alias == "local" {
+            default_local_uri()
+        } else {
+            hosts
+                .iter()
+                .find(|h| h.alias == *alias)
+                .map(|h| h.uri.clone())
+                .unwrap_or_else(|| alias.clone())
+        };
+        let d = match resolve_target(Some(alias), &hosts) {
+            Ok(target) => crate::mux::doctor::diagnose_host(alias, &uri, &target, alias == "local", timeout),
+            Err(e) => crate::mux::doctor::diagnose_from_status(
+                alias,
+                &uri,
+                alias == "local",
+                None,
+                None,
+                0,
+                0,
+                0,
+                Some(&e.to_string()),
+            ),
+        };
+        vec![d]
+    } else {
+        crate::mux::doctor::diagnose_fleet(&hosts, true, timeout)
+    };
+
+    let all_ok = diags.iter().all(|d| d.health.is_ok(strict));
+    if opts.json {
+        print_json(&json!({
+            "local_version": crate::APP_VERSION,
+            "local_build": crate::APP_BUILD_SHA,
+            "expected_capabilities": crate::LOCAL_CAPABILITIES,
+            "healthy": all_ok,
+            "hosts": diags.iter().map(crate::mux::doctor::HostDiagnostic::to_json).collect::<Vec<_>>(),
+        }));
+    } else {
+        println!(
+            "Tachyon Fleet Doctor · client v{} ({}) · Mux v{} · {} expected capabilities",
+            crate::APP_VERSION,
+            crate::APP_BUILD_SHA,
+            crate::mux::proto::PROTOCOL_VERSION,
+            crate::LOCAL_CAPABILITIES.len(),
+        );
+        for d in &diags {
+            let ver = d.info.as_ref().map_or_else(
+                || "-".into(),
+                |i| format!("v{} ({})", i.version, i.build.as_deref().unwrap_or("legacy")),
+            );
+            let rtt = d
+                .rtt_ms
+                .map_or_else(|| "-".into(), |r| format!("{r:.1} ms"));
+            let caps = format!("{}/{}", d.capabilities.len(), crate::LOCAL_CAPABILITIES.len());
+            println!(
+                "{} {:<16} {:<17} {:<20} {:<9} {:<18} caps:{} · {}",
+                d.health.dot(),
+                d.alias,
+                d.health.label(),
+                ver,
+                rtt,
+                d.auth_status,
+                caps,
+                d.uri
+            );
+            for issue in &d.issues {
+                println!("    issue: {issue}");
+            }
+            for rec in &d.recommendations {
+                println!("    fix:   {rec}");
+            }
+        }
+    }
+
+    Ok(if all_ok { 0 } else { 1 })
 }
 
 // ---------------------------------------------------------------------------
@@ -2939,6 +3175,10 @@ Server & Hosts:
                                             set accent or danger colour for a saved host
   tachyon hosts remove <alias>              remove a saved host
   tachyon hosts test <alias>                verify SSH/TCP transport, server version & RTT
+  tachyon hosts upgrade <alias|--all> [--dry-run] [--remote-build] [--listen A] [--ssh DEST]
+                                            snapshot, deploy & restart host binary cleanly
+  tachyon doctor [HOST] [--all] [--strict] [--json]
+                                            audit versions, capabilities, auth & transport RTT
 
 Workspaces & Git Worktrees:
   tachyon workspace ls                      list saved templates in ~/.config/Tachyon/workspaces/

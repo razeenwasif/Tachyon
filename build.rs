@@ -36,6 +36,38 @@ const ICON_SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/tachyon.manifest");
+    println!("cargo:rerun-if-env-changed=TACHYON_BUILD_SHA");
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let git_head = manifest_dir.join(".git/HEAD");
+    if git_head.exists() {
+        println!("cargo:rerun-if-changed=.git/HEAD");
+        if let Ok(head_text) = fs::read_to_string(&git_head) {
+            if let Some(ref_path) = head_text.trim().strip_prefix("ref: ") {
+                let rel = format!(".git/{ref_path}");
+                if manifest_dir.join(&rel).exists() {
+                    println!("cargo:rerun-if-changed={rel}");
+                }
+            }
+        }
+    }
+    let build_sha = env::var("TACHYON_BUILD_SHA")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .current_dir(&manifest_dir)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=TACHYON_BUILD_SHA={build_sha}");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
