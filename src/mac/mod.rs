@@ -45,6 +45,7 @@ mod renderer;
 mod selection;
 mod settings;
 mod sidebar;
+mod sound;
 mod strip;
 mod suggest;
 mod sysmon;
@@ -109,6 +110,8 @@ thread_local! {
     static QUICK_LOOK: RefCell<Option<Retained<NSURL>>> = const { RefCell::new(None) };
     /// Posts notifications for long commands; `None` outside the app bundle.
     static NOTIFIER: RefCell<Option<notify::Notifier>> = const { RefCell::new(None) };
+    /// Rate-limits and deduplicates optional subtle agent audio cues.
+    static SOUND_GATE: RefCell<sound::SoundCueGate> = RefCell::new(sound::SoundCueGate::default());
     /// All main-thread state. AppKit calls into the views and delegates; each
     /// carries its window's id and forwards here.
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -651,6 +654,11 @@ define_class!(
         #[unsafe(method(tachyonFindRegex:))]
         fn find_regex(&self, _sender: Option<&AnyObject>) {
             with_window(self.id(), TermWindow::find_changed);
+        }
+
+        #[unsafe(method(tachyonCopyMode:))]
+        fn copy_mode(&self, _sender: Option<&AnyObject>) {
+            with_window(self.id(), TermWindow::toggle_copy_mode);
         }
 
         #[unsafe(method(tachyonKeepAwake:))]
@@ -2404,6 +2412,8 @@ struct TermWindow {
     /// Find in scrollback: the bar, and what it found.
     find_bar: Option<FindBar>,
     find: Option<FindState>,
+    /// Vi-style keyboard navigation & visual selection mode over scrollback.
+    copy_mode: Option<crate::term::copy_mode::CopyMode>,
     /// The suggestion showing after the cursor (all of it), for → to take.
     ghost: Option<String>,
     /// The last suggestion looked up: (typed, folder) and its answer.
@@ -2576,6 +2586,20 @@ impl TermWindow {
         let focus_at = visible.iter().position(|&p| p == tab.focus);
         let mut decors = Vec::with_capacity(visible.len());
         let mut selections = Vec::with_capacity(visible.len());
+        let copy_info = self.copy_mode.as_ref().map(|cm| {
+            let term = &guards[focus_at.unwrap_or(0)];
+            let sel = cm
+                .selection_range(term)
+                .map(|(start, end)| selection::Range { start, end });
+            let hl = cm.highlights_on_screen(term);
+            let cur = cm.viewport_cursor(term);
+            let badge = cm.status_label(term);
+            let rgb = match cm.visual {
+                crate::term::copy_mode::VisualMode::None => [0x96, 0xB2, 0xD7],
+                _ => [0xC0, 0x84, 0xFC],
+            };
+            (sel, hl, cur, badge, rgb)
+        });
         for (k, &p) in visible.iter().enumerate() {
             let term = &guards[k];
             let mut decor = command_decor(term, &self.followed);
@@ -2589,22 +2613,33 @@ impl TermWindow {
                         decor.notes.push((term.cursor_state().y, line));
                     }
                 }
-                if let (Some(f), None) = (&self.find, &self.rewound) {
+                if let Some((_, ref hl, _, _, _)) = copy_info {
+                    decor.highlights = hl.clone();
+                } else if let (Some(f), None) = (&self.find, &self.rewound) {
                     decor.highlights = f.on_screen(term);
                 }
-                if self.rewound.is_none() && self.preedit.is_empty() {
+                if self.rewound.is_none() && self.preedit.is_empty() && copy_info.is_none() {
                     decor.ghost = ghost_for(term, &mut self.ghost_cache, &mut self.ghost);
                 } else {
                     self.ghost = None;
                 }
-                self.selection
+                if let Some((copy_sel, _, _, _, _)) = &copy_info {
+                    selections.push(*copy_sel);
+                } else {
+                    selections.push(self.selection.and_then(|s| s.range(term)));
+                }
+                decors.push(decor);
+                continue;
             } else {
                 tab.panes[p].saved.selection
             };
             selections.push(selection.and_then(|s| s.range(term)));
             decors.push(decor);
         }
-        let blink = self.focused && focus_at.is_some_and(|k| guards[k].cursor_state().blinking) && self.rewound.is_none();
+        let blink = self.copy_mode.is_none()
+            && self.focused
+            && focus_at.is_some_and(|k| guards[k].cursor_state().blinking)
+            && self.rewound.is_none();
         let broadcasting = tab.is_broadcasting();
         let empty = Decor::default();
         let frames: Vec<PaneFrame> = visible
@@ -2625,6 +2660,7 @@ impl TermWindow {
                         focused: self.focused,
                         selection: None,
                         cursor_on_layer: false,
+                        copy_cursor: None,
                         decor: &empty,
                         dim: false,
                     },
@@ -2636,6 +2672,11 @@ impl TermWindow {
                         focused: self.focused && (focused || broadcasting),
                         selection: selections[k],
                         cursor_on_layer: focused && blink,
+                        copy_cursor: if focused && self.rewound.is_none() {
+                            copy_info.as_ref().and_then(|c| c.2)
+                        } else {
+                            None
+                        },
                         decor: &decors[k],
                         dim: !self.pane_style.is_cards() && self.focused && !focused && !broadcasting,
                     },
@@ -2709,6 +2750,7 @@ impl TermWindow {
         .map(|b| b.frame().origin.x)
         .fold(f64::INFINITY, f64::min);
         let hints_right = if leftmost.is_finite() { (leftmost * self.scale()) as f32 - 12.0 } else { self.renderer.padding_right_edge() };
+        let mode_badge = copy_info.as_ref().map(|c| (c.3.as_str(), c.4));
         self.renderer.draw_frame(
             &frames,
             strip.as_ref(),
@@ -2718,6 +2760,7 @@ impl TermWindow {
             hints_right,
             host_accent.as_ref(),
             broadcast_panes,
+            mode_badge,
             presented,
         );
         let overlay = match focus_at {
@@ -3542,6 +3585,17 @@ impl TermWindow {
     /// fold), then the everyday ones.
     fn hint_list(&self, term: &Term) -> Vec<(String, String)> {
         let mut out: Vec<(&str, &str)> = Vec::new();
+        if self.copy_mode.is_some() {
+            out.extend([
+                ("hjkl", "move"),
+                ("v/V", "visual"),
+                ("/", "search"),
+                ("n/N", "next match"),
+                ("y", "yank"),
+                ("q/Esc", "exit"),
+            ]);
+            return out.into_iter().map(|(k, w)| (k.to_string(), w.to_string())).collect();
+        }
         if self.is_broadcasting() {
             out.push(("⌘⇧I", "stop broadcast"));
         }
@@ -4617,6 +4671,7 @@ impl TermWindow {
         // What the find bar found belongs to the pane it searched.
         self.close_find();
         self.rewind_exit();
+        self.copy_mode = None;
         let tab = &mut self.tabs[self.active];
         tab.unseen = None;
         let pane = &mut tab.panes[tab.focus];
@@ -4962,8 +5017,23 @@ impl TermWindow {
         }
     }
 
+    /// ⌘⇧X / ⌃⇧Space: toggle Vi Copy Mode for keyboard scrollback navigation.
+    fn toggle_copy_mode(&mut self) {
+        if self.copy_mode.take().is_some() {
+            self.term.lock().scroll_to_bottom();
+        } else {
+            self.close_find();
+            self.rewind_exit();
+            let cm = crate::term::copy_mode::CopyMode::enter(&self.term.lock());
+            self.copy_mode = Some(cm);
+        }
+        self.cursor_shown = None;
+        self.request_redraw();
+    }
+
     /// ⌘F: show the find bar, its text selected, ready to type.
     fn open_find(&mut self) {
+        self.copy_mode = None;
         let Some(mtm) = MainThreadMarker::new() else { return };
         let top = self.title_bar_height();
         let size = self.view.bounds().size;
@@ -5240,6 +5310,44 @@ impl TermWindow {
         // Mid-composition, every key belongs to the input method.
         if !self.preedit.is_empty() {
             return true;
+        }
+        if let Some(mut cm) = self.copy_mode.take() {
+            if let Some(key) = nsevent_to_copy_key(event) {
+                let act = cm.handle_key(&mut self.term.lock(), key);
+                match act {
+                    crate::term::copy_mode::CopyAction::Redraw => {
+                        self.copy_mode = Some(cm);
+                    }
+                    crate::term::copy_mode::CopyAction::YankAndExit(text) => {
+                        if !text.is_empty() {
+                            copy_to_pasteboard(&text);
+                        }
+                        self.term.lock().scroll_to_bottom();
+                        self.cursor_shown = None;
+                    }
+                    crate::term::copy_mode::CopyAction::Exit => {
+                        self.term.lock().scroll_to_bottom();
+                        self.cursor_shown = None;
+                    }
+                    crate::term::copy_mode::CopyAction::Bell => {
+                        self.copy_mode = Some(cm);
+                        objc2_app_kit::NSBeep();
+                    }
+                }
+                self.request_redraw();
+            } else {
+                self.copy_mode = Some(cm);
+            }
+            return false;
+        }
+        // ⌃⇧Space enters Vi Copy Mode directly from the terminal.
+        if flags.contains(NSEventModifierFlags::Control)
+            && flags.contains(NSEventModifierFlags::Shift)
+            && !flags.intersects(NSEventModifierFlags::Command | NSEventModifierFlags::Option)
+            && event.keyCode() == 49
+        {
+            self.toggle_copy_mode();
+            return false;
         }
         // Escape closes floating overlays (Command Palette, Cheatsheet, Training Chart).
         const ESCAPE_KEY: u16 = 53;
@@ -5818,6 +5926,7 @@ impl TermWindow {
     /// over Mux v2 RPC, gracefully falling back to the local log if an older
     /// server doesn't support `block.rewind.*`.
     fn rewind_step(&mut self, back: bool) {
+        self.copy_mode = None;
         let mux_info = {
             let pane = self.tabs[self.active].pane();
             pane.pty
@@ -6197,6 +6306,20 @@ impl TermWindow {
     }
 
     fn copy(&mut self) {
+        if let Some(cm) = self.copy_mode.take() {
+            let text = {
+                let mut t = self.term.lock();
+                let out = cm.yank_text(&t);
+                t.scroll_to_bottom();
+                out
+            };
+            if !text.is_empty() {
+                copy_to_pasteboard(&text);
+            }
+            self.cursor_shown = None;
+            self.request_redraw();
+            return;
+        }
         let text = {
             let term = self.term.lock();
             let Some(r) = self.selection.and_then(|s| s.range(&term)) else {
@@ -6209,9 +6332,7 @@ impl TermWindow {
         if text.is_empty() {
             return;
         }
-        let board = NSPasteboard::generalPasteboard();
-        board.clearContents();
-        board.setString_forType(&NSString::from_str(&text), unsafe { NSPasteboardTypeString });
+        copy_to_pasteboard(&text);
     }
 
     fn select_all(&mut self) {
@@ -6802,6 +6923,7 @@ impl App {
             pane_headers: Vec::new(),
             find_bar: None,
             find: None,
+            copy_mode: None,
             cursor_layer,
             cursor_shown: None,
             _delegate: delegate,
@@ -7342,6 +7464,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // The selected command's output, or the last command's.
     item(&edit, "Copy Output", sel!(tachyonCopyOutput:), "o")
         .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    item(&edit, "Vi Copy Mode", sel!(tachyonCopyMode:), "X");
     edit.addItem(&NSMenuItem::separatorItem(mtm));
     item(&edit, "Find…", sel!(tachyonFind:), "f");
     item(&edit, "Find Next", sel!(tachyonFindNext:), "g");
@@ -7558,7 +7681,27 @@ fn set_attached_inferred(key: &(String, String), st: Option<&ProgramStatus>) -> 
     }
 }
 
+fn notify_local_inferred_sound(pane_id: u64, state: crate::term::ProgramState) {
+    let key = pane_id.to_string();
+    DispatchQueue::main().exec_async(move || {
+        let is_front_focused = MainThreadMarker::new().is_some_and(|mtm| {
+            NSApplication::sharedApplication(mtm).isActive()
+                && with_app(|a| {
+                    a.windows.iter().any(|w| {
+                        w.focused
+                            && w.tabs
+                                .get(w.active)
+                                .is_some_and(|t| t.pane().id == pane_id)
+                    })
+                })
+                .unwrap_or(false)
+        });
+        let _ = maybe_play_agent_sound("local-pty", &key, state, is_front_focused);
+    });
+}
+
 fn evaluate_pane_inferred(
+    pane_id: u64,
     inferred: &PaneInferred,
     mux_key: Option<&(String, String)>,
     snap: &AgentScreenSnap,
@@ -7589,11 +7732,20 @@ fn evaluate_pane_inferred(
     *st_guard = next.clone();
     drop(st_guard);
 
+    if mux_key.is_none() && local_changed {
+        let state = next
+            .as_ref()
+            .map(|s| s.state)
+            .unwrap_or(crate::term::ProgramState::Idle);
+        notify_local_inferred_sound(pane_id, state);
+    }
+
     let map_changed = mux_key.is_some_and(|k| set_attached_inferred(k, next.as_ref()));
     (local_changed || map_changed, settle)
 }
 
 fn schedule_pane_settle(
+    pane_id: u64,
     expected_gen: u64,
     after: Duration,
     term: Arc<Mutex<Term>>,
@@ -7644,13 +7796,14 @@ fn schedule_pane_settle(
                 None
             };
             let (changed, next_settle) =
-                evaluate_pane_inferred(&inferred, mux_key.as_ref(), &snap, fg.as_ref(), Instant::now());
+                evaluate_pane_inferred(pane_id, &inferred, mux_key.as_ref(), &snap, fg.as_ref(), Instant::now());
             if changed {
                 sync_all_sidebars();
             }
             if let Some(dur) = next_settle {
                 if inferred.out_gen.load(Ordering::Acquire) == expected_gen {
                     schedule_pane_settle(
+                        pane_id,
                         expected_gen,
                         dur,
                         Arc::clone(&term),
@@ -7856,12 +8009,13 @@ fn start_session(
                             None
                         };
                         let (changed, settle) =
-                            evaluate_pane_inferred(&inferred, mux_key.as_ref(), &snap, fg.as_ref(), now);
+                            evaluate_pane_inferred(id, &inferred, mux_key.as_ref(), &snap, fg.as_ref(), now);
                         if changed {
                             DispatchQueue::main().exec_async(sync_all_sidebars);
                         }
                         if let Some(dur) = settle {
                             schedule_pane_settle(
+                                id,
                                 out_gen,
                                 dur,
                                 Arc::clone(&reader_term),
@@ -7873,6 +8027,7 @@ fn start_session(
                         }
                     } else {
                         schedule_pane_settle(
+                            id,
                             out_gen,
                             Duration::from_millis(260),
                             Arc::clone(&reader_term),
@@ -8565,6 +8720,87 @@ fn ssh_target_host(cmd: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn copy_to_pasteboard(text: &str) {
+    let board = NSPasteboard::generalPasteboard();
+    board.clearContents();
+    board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
+}
+
+fn nsevent_to_copy_key(event: &NSEvent) -> Option<crate::term::copy_mode::CopyKey> {
+    use crate::term::copy_mode::CopyKey;
+    let flags = event.modifierFlags();
+    match event.keyCode() {
+        0x35 => return Some(CopyKey::Esc),
+        0x24 | 0x4C => return Some(CopyKey::Enter),
+        0x33 => return Some(CopyKey::Backspace),
+        0x7B => return Some(CopyKey::Left),
+        0x7C => return Some(CopyKey::Right),
+        0x7D => return Some(CopyKey::Down),
+        0x7E => return Some(CopyKey::Up),
+        0x73 => return Some(CopyKey::Home),
+        0x77 => return Some(CopyKey::End),
+        0x74 => return Some(CopyKey::PageUp),
+        0x79 => return Some(CopyKey::PageDown),
+        _ => {}
+    }
+    if flags.contains(NSEventModifierFlags::Control) {
+        if let Some(bare) = event.charactersIgnoringModifiers().map(|s| s.to_string()) {
+            if let Some(ch) = bare.chars().next() {
+                if ch.is_ascii_alphabetic() {
+                    return Some(CopyKey::Ctrl(ch.to_ascii_lowercase()));
+                }
+            }
+        }
+    }
+    let chars = event.characters().map(|s| s.to_string())?;
+    chars.chars().next().map(CopyKey::Char)
+}
+
+fn maybe_play_agent_sound(
+    host: &str,
+    block_id: &str,
+    state: crate::term::ProgramState,
+    is_front_focused: bool,
+) -> bool {
+    let cue = SOUND_GATE.with(|g| {
+        g.borrow_mut()
+            .evaluate(host, block_id, state, is_front_focused, Instant::now())
+    });
+    let Some(kind) = cue else {
+        return false;
+    };
+    let Some((true, volume, name)) = with_app(|a| {
+        (
+            a.cfg.macos.sound_cues,
+            a.cfg.macos.sound_volume,
+            sound::sound_name_for(kind, &a.cfg.macos).to_string(),
+        )
+    }) else {
+        return false;
+    };
+    sound::play_cue(&name, volume)
+}
+
+fn preview_agent_sound(sound_name: &str) {
+    let volume = with_app(|a| a.cfg.macos.sound_volume)
+        .unwrap_or_else(|| Config::load_default().macos.sound_volume)
+        .max(0.25);
+    let _ = sound::play_cue(sound_name, volume);
+}
+
+fn toggle_sound_cues() {
+    let next = with_app(|a| {
+        a.cfg.macos.sound_cues = !a.cfg.macos.sound_cues;
+        (a.cfg.macos.sound_cues, a.cfg.macos.sound_blocked.clone())
+    });
+    if let Some((on, sample)) = next {
+        let _ = Config::update_default_key("notify.sound_cues", if on { "true" } else { "false" });
+        if on {
+            preview_agent_sound(&sample);
+        }
+    }
 }
 
 fn send_test_agent_notification() {
@@ -9563,49 +9799,56 @@ fn handle_mux_event(host: String, ev: serde_json::Value) {
                     ProgramState::Blocked | ProgramState::Done | ProgramState::Error
                 );
                 let enabled = with_app(|a| a.cfg.macos.notify_agent_status).unwrap_or(true);
-                if should_alert && enabled {
-                    let is_front_focused = MainThreadMarker::new().is_some_and(|mtm| {
-                        let app_active = NSApplication::sharedApplication(mtm).isActive();
-                        app_active
-                            && with_app(|a| {
-                                a.windows.iter().any(|w| {
-                                    w.focused
-                                        && w.tabs
-                                            .get(w.active)
-                                            .and_then(|t| t.panes.get(t.focus))
-                                            .and_then(|p| p.pty.mux_meta())
-                                            .is_some_and(|m| m.host == host && m.block_id == blk.id)
-                                })
+                let is_front_focused = MainThreadMarker::new().is_some_and(|mtm| {
+                    let app_active = NSApplication::sharedApplication(mtm).isActive();
+                    app_active
+                        && with_app(|a| {
+                            a.windows.iter().any(|w| {
+                                w.focused
+                                    && w.tabs
+                                        .get(w.active)
+                                        .and_then(|t| t.panes.get(t.focus))
+                                        .and_then(|p| p.pty.mux_meta())
+                                        .is_some_and(|m| m.host == host && m.block_id == blk.id)
                             })
-                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                });
+                let played_cue = maybe_play_agent_sound(&host, &blk.id, status.state, is_front_focused);
+                if should_alert && enabled && !is_front_focused {
+                    let app_name = status
+                        .app
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|a| crate::mux::model::agent_identity(a).1)
+                        .unwrap_or_else(|| "Agent".to_string());
+                    let state_word = match status.state {
+                        ProgramState::Blocked => "needs input",
+                        ProgramState::Done => "finished",
+                        ProgramState::Error => "encountered an error",
+                        _ => "updated",
+                    };
+                    let title = format!("{app_name} {state_word}");
+                    let host_label = if host == "local" { "This Mac" } else { host.as_str() };
+                    let subtitle = format!("{} · {}", host_label, blk.display_name());
+                    let body = status
+                        .msg
+                        .as_deref()
+                        .or(status.label.as_deref())
+                        .unwrap_or("Click to focus pane in Tachyon");
+                    NOTIFIER.with(|n| {
+                        if let Some(notifier) = n.borrow().as_ref() {
+                            notifier.post_mux_with_sound(
+                                &host,
+                                &blk.window_id,
+                                &blk.id,
+                                &title,
+                                &subtitle,
+                                body,
+                                !played_cue,
+                            );
+                        }
                     });
-                    if !is_front_focused {
-                        let app_name = status
-                            .app
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .map(|a| crate::mux::model::agent_identity(a).1)
-                            .unwrap_or_else(|| "Agent".to_string());
-                        let state_word = match status.state {
-                            ProgramState::Blocked => "needs input",
-                            ProgramState::Done => "finished",
-                            ProgramState::Error => "encountered an error",
-                            _ => "updated",
-                        };
-                        let title = format!("{app_name} {state_word}");
-                        let host_label = if host == "local" { "This Mac" } else { host.as_str() };
-                        let subtitle = format!("{} · {}", host_label, blk.display_name());
-                        let body = status
-                            .msg
-                            .as_deref()
-                            .or(status.label.as_deref())
-                            .unwrap_or("Click to focus pane in Tachyon");
-                        NOTIFIER.with(|n| {
-                            if let Some(notifier) = n.borrow().as_ref() {
-                                notifier.post_mux(&host, &blk.window_id, &blk.id, &title, &subtitle, body);
-                            }
-                        });
-                    }
                 }
             }
         }

@@ -65,6 +65,20 @@ impl Color {
         }
     }
 
+    /// Direct RGB components, if this colour is a truecolour 24-bit value.
+    #[inline]
+    pub const fn rgb_parts(self) -> Option<[u8; 3]> {
+        if self.0 & 0xFF00_0000 == TAG_RGB {
+            Some([
+                ((self.0 >> 16) & 0xFF) as u8,
+                ((self.0 >> 8) & 0xFF) as u8,
+                (self.0 & 0xFF) as u8,
+            ])
+        } else {
+            None
+        }
+    }
+
     /// Map indices 0-7 onto 8-15. SGR bold historically brightened the eight
     /// ANSI colours; we do it at resolve time so toggling the behaviour off is
     /// a config flag rather than a re-render of stored state.

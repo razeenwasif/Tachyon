@@ -58,6 +58,7 @@ pub enum SheetAction {
     KeepAwake,
     LatencyLedger,
     Find,
+    ToggleCopyMode,
     ResetFont,
     AgentMissionControl,
     WorkspaceSwitcher,
@@ -113,6 +114,7 @@ pub const ENTRIES: &[SheetEntry] = &[
     SheetEntry { category: "Commands, ML & HPC", keys: "⌘↑ / ⌘↓", title: "Previous / next command", detail: "Jump across OSC 133 prompt marks", action: None },
 
     // Editing, Find & Links
+    SheetEntry { category: "Editing, Find & Links", keys: "⌘⇧X / ⌃⇧Space", title: "Vi Copy Mode", detail: "Keyboard scrollback navigation (hjkl, /, v/V, y)", action: Some(SheetAction::ToggleCopyMode) },
     SheetEntry { category: "Editing, Find & Links", keys: "⌘F", title: "Find in scrollback", detail: "Regex & smart-case search (⌘G / ⌘⇧G)", action: Some(SheetAction::Find) },
     SheetEntry { category: "Editing, Find & Links", keys: "Tab / → / ⌥→", title: "Accept suggestion", detail: "Take full inline history suggestion or one word", action: None },
     SheetEntry { category: "Editing, Find & Links", keys: "⌘-click", title: "Open URL, Quick Look, or traceback", detail: "File:line opens in your editor; ⌥⌘-click any file", action: None },
@@ -121,6 +123,7 @@ pub const ENTRIES: &[SheetEntry] = &[
 
     // CLI & Coding Agents
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon ls", detail: "List sessions, windows & blocks (add --json)", action: Some(SheetAction::CopyCli("tachyon ls")) },
+    SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon tui [-a]", detail: "Lightweight narrow-screen interactive pane & agent switcher", action: Some(SheetAction::CopyCli("tachyon tui")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon -S kagutsuchi new work", detail: "Start persistent session on Mac mini host", action: Some(SheetAction::CopyCli("tachyon -S kagutsuchi new work")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon run --wait --capture -- CMD", detail: "Run command in a managed pane & collect output", action: Some(SheetAction::CopyCli("tachyon run --wait --capture -- ")) },
     SheetEntry { category: "CLI & Coding Agents", keys: "CLI", title: "tachyon split --right", detail: "Split current pane from CLI or coding agent", action: Some(SheetAction::CopyCli("tachyon split --right")) },
@@ -642,6 +645,7 @@ fn execute_action(win_id: u64, action: SheetAction) {
         SheetAction::KeepAwake => with_window(win_id, |w| w.toggle_awake()),
         SheetAction::LatencyLedger => with_window(win_id, |w| w.toggle_ledger()),
         SheetAction::Find => with_window(win_id, |w| w.open_find()),
+        SheetAction::ToggleCopyMode => with_window(win_id, |w| w.toggle_copy_mode()),
         SheetAction::ResetFont => with_window(win_id, |w| w.zoom_font(0.0)),
         SheetAction::AgentMissionControl => {
             with_window(win_id, |w| w.open_agents_card());

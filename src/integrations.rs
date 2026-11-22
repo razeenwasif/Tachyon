@@ -333,6 +333,7 @@ tachyon -S kagutsuchi run --wait --capture -- <command>
 # Send input to a running pane or read its rendered screen
 tachyon send -b <block_id> --enter \"<text>\"
 tachyon capture -b <block_id> --lines 80
+tachyon tui [-b <block_id>] [--agents-only]   # interactive SSH/mobile TUI attach
 
 # Report live status to Tachyon's sidebar, pane headers & notifications (OSC 7501)
 tachyon status --state working --app claude --msg \"Running test suite\" --tty

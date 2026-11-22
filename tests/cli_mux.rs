@@ -1437,3 +1437,87 @@ fn cli_agent_handoffs_report_to_parent_and_wait_until_blocked_done_idle() {
     assert_eq!(code, 0, "stderr: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_tui_narrow_and_wide_render_live_sessions_and_blocked_agents() {
+    let dir = temp_dir("tui-e2e");
+    let sock = dir.join("server.sock");
+    let hosts = dir.join("hosts.json");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "start"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &[
+            "new",
+            "alpha-dev",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'ALPHA_PREVIEW_TOKEN\\n'; sleep 30",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    let agent_cmd = format!(
+        "printf 'AGENT_PREVIEW_LINE\\n'; '{}' status --state blocked --app claude --msg 'Approve schema' --tty; sleep 30",
+        bin()
+    );
+    let (code, ag_out, err) = run_cli(
+        &sock,
+        &hosts,
+        &["new", "agent-worker", "--json", "--", "/bin/sh", "-c", &agent_cmd],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let ag_v: Value = serde_json::from_str(&ag_out).unwrap();
+    let ag_bid = ag_v["block"]["id"].as_str().unwrap().to_string();
+
+    let (code, _, err) = run_cli(
+        &sock,
+        &hosts,
+        &["wait", "-b", &ag_bid, "--until", "blocked", "--timeout", "5000"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+
+    for _ in 0..20 {
+        let (c, cap, _) = run_cli(&sock, &hosts, &["capture", "-b", &ag_bid, "--lines", "10"]);
+        if c == 0 && cap.contains("AGENT_PREVIEW_LINE") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // 1. Narrow layout (mobile/narrow SSH: 44 cols) -> single-column, no `│` split.
+    let (code, narrow, err) = run_cli(&sock, &hosts, &["tui", "--once", "--cols", "44", "--rows", "18"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(narrow.contains("LIVE AGENTS (1)"), "narrow: {narrow:?}");
+    assert!(narrow.contains("1 blocked"), "narrow: {narrow:?}");
+    assert!(narrow.contains("SPACES & PANES"), "narrow: {narrow:?}");
+    assert!(narrow.contains("alpha-dev"), "narrow: {narrow:?}");
+    assert!(!narrow.contains('│'), "narrow mode should not draw wide split divider: {narrow:?}");
+
+    // 2. Wide layout (120 cols) -> split sidebar + preview + agent message.
+    let (code, wide, err) = run_cli(&sock, &hosts, &["tui", "--once", "--cols", "120", "--rows", "30"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(wide.contains('│'), "wide mode should draw vertical divider: {wide:?}");
+    assert!(wide.contains("Approve schema"), "wide: {wide:?}");
+    assert!(wide.contains("AGENT_PREVIEW_LINE"), "wide: {wide:?}");
+
+    // 3. Agents-only filter hides non-agent section.
+    let (code, only, err) = run_cli(
+        &sock,
+        &hosts,
+        &["tui", "--once", "--agents-only", "--cols", "60", "--rows", "18"],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(only.contains("[AGENTS]"), "only: {only:?}");
+    assert!(only.contains("agent-worker"), "only: {only:?}");
+    assert!(!only.contains("SPACES & PANES"), "only: {only:?}");
+
+    let (code, _, err) = run_cli(&sock, &hosts, &["server", "stop"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

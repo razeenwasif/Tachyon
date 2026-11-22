@@ -622,6 +622,56 @@ define_class!(
             refresh_if_open();
         }
 
+        #[unsafe(method(toggleSoundCues:))]
+        fn toggle_sound_cues(&self, sender: Option<&AnyObject>) {
+            let on = switch_is_on(sender);
+            let _ = Config::update_default_key("notify.sound_cues", if on { "true" } else { "false" });
+            super::apply_settings_config(move |cfg| cfg.macos.sound_cues = on);
+            if on {
+                let name = Config::load_default().macos.sound_blocked;
+                super::preview_agent_sound(&name);
+            }
+            self.set_note("Saved `notify.sound_cues` to tachyon.conf.");
+            refresh_if_open();
+        }
+
+        #[unsafe(method(selectBlockedSound:))]
+        fn select_blocked_sound(&self, sender: Option<&AnyObject>) {
+            if let Some(name) = selected_sound_name(sender) {
+                let _ = Config::update_default_key("notify.sound_blocked", &name);
+                let n = name.clone();
+                super::apply_settings_config(move |cfg| cfg.macos.sound_blocked = n);
+                super::preview_agent_sound(&name);
+                self.set_note(&format!("Saved `notify.sound_blocked = {name}`."));
+                refresh_if_open();
+            }
+        }
+
+        #[unsafe(method(selectDoneSound:))]
+        fn select_done_sound(&self, sender: Option<&AnyObject>) {
+            if let Some(name) = selected_sound_name(sender) {
+                let _ = Config::update_default_key("notify.sound_done", &name);
+                let n = name.clone();
+                super::apply_settings_config(move |cfg| cfg.macos.sound_done = n);
+                super::preview_agent_sound(&name);
+                self.set_note(&format!("Saved `notify.sound_done = {name}`."));
+                refresh_if_open();
+            }
+        }
+
+        #[unsafe(method(previewSoundCue:))]
+        fn preview_sound_cue(&self, _sender: Option<&AnyObject>) {
+            let cfg = Config::load_default();
+            let name = if cfg.macos.sound_blocked.eq_ignore_ascii_case("none") {
+                cfg.macos.sound_done
+            } else {
+                cfg.macos.sound_blocked
+            };
+            super::preview_agent_sound(&name);
+            self.set_note(&format!("Previewed subtle agent cue (`{name}`)."));
+            refresh_if_open();
+        }
+
         #[unsafe(method(sendTestNotification:))]
         fn send_test_notification(&self, _sender: Option<&AnyObject>) {
             super::send_test_agent_notification();
@@ -745,6 +795,11 @@ fn switch_is_on(sender: Option<&AnyObject>) -> bool {
     sender
         .and_then(|s| s.downcast_ref::<NSSwitch>())
         .is_some_and(|sw| sw.state() == NSControlStateValueOn)
+}
+
+fn selected_sound_name(sender: Option<&AnyObject>) -> Option<String> {
+    let popup = sender?.downcast_ref::<NSPopUpButton>()?;
+    popup.titleOfSelectedItem().map(|s| s.to_string())
 }
 
 fn tagged_string(sender: Option<&AnyObject>, list: &[String]) -> Option<String> {
@@ -1301,7 +1356,7 @@ impl SettingsWindow {
     fn build_notifications(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
         let target: &AnyObject = self.actions.as_ref();
         let cfg = Config::load_default();
-        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 136.0)));
+        let card = SettingsCardView::new(mtm, NSRect::new(NSPoint::new(pad, *y), NSSize::new(w, 266.0)));
 
         let t1 = label(mtm, "Notify on coding agent status (OSC 7501)", 13.0, true, &NSColor::labelColor());
         t1.setFrame(NSRect::new(NSPoint::new(14.0, 14.0), NSSize::new(w - 86.0, 18.0)));
@@ -1316,6 +1371,56 @@ impl SettingsWindow {
         let sw = toggle_switch(mtm, cfg.macos.notify_agent_status, target, sel!(toggleAgentNotify:));
         sw.setFrame(NSRect::new(NSPoint::new(w - 56.0, 18.0), NSSize::new(42.0, 24.0)));
 
+        let t2 = label(mtm, "Subtle audio cues for background agents", 12.5, true, &NSColor::labelColor());
+        t2.setFrame(NSRect::new(NSPoint::new(14.0, 74.0), NSSize::new(w - 86.0, 16.0)));
+        let d_snd = label(
+            mtm,
+            "Play a gentle macOS chime (`notify.sound_cues`, `notify.sound_volume`) on blocked/done/error transitions.",
+            11.0,
+            false,
+            &NSColor::secondaryLabelColor(),
+        );
+        d_snd.setFrame(NSRect::new(NSPoint::new(14.0, 92.0), NSSize::new(w - 86.0, 26.0)));
+        let sw2 = toggle_switch(mtm, cfg.macos.sound_cues, target, sel!(toggleSoundCues:));
+        sw2.setFrame(NSRect::new(NSPoint::new(w - 56.0, 78.0), NSSize::new(42.0, 24.0)));
+
+        for v in [&*t1 as &NSView, &*d1 as &NSView, &*sw as &NSView, &*t2 as &NSView, &*d_snd as &NSView, &*sw2 as &NSView] {
+            card.addSubview(v);
+        }
+
+        let sound_rows: [(&str, &str, objc2::runtime::Sel); 2] = [
+            ("Blocked cue sound", &cfg.macos.sound_blocked, sel!(selectBlockedSound:)),
+            ("Done cue sound", &cfg.macos.sound_done, sel!(selectDoneSound:)),
+        ];
+        for (idx, (lbl, current, action)) in sound_rows.iter().enumerate() {
+            let ry = 126.0 + idx as f64 * 34.0;
+            let s_lbl = label(mtm, lbl, 12.0, false, &NSColor::labelColor());
+            s_lbl.setFrame(NSRect::new(NSPoint::new(14.0, ry + 4.0), NSSize::new(w - 170.0, 18.0)));
+            let popup = NSPopUpButton::initWithFrame_pullsDown(
+                NSPopUpButton::alloc(mtm),
+                NSRect::new(NSPoint::new(w - 150.0, ry), NSSize::new(136.0, 24.0)),
+                false,
+            );
+            let mut selected_idx: Option<isize> = None;
+            for (s_i, &title) in super::sound::SYSTEM_SOUNDS.iter().enumerate() {
+                popup.addItemWithTitle(&NSString::from_str(title));
+                if title.eq_ignore_ascii_case(current) {
+                    selected_idx = Some(s_i as isize);
+                }
+            }
+            if selected_idx.is_none() && !current.trim().is_empty() {
+                popup.addItemWithTitle(&NSString::from_str(current));
+                selected_idx = Some(super::sound::SYSTEM_SOUNDS.len() as isize);
+            }
+            popup.selectItemAtIndex(selected_idx.unwrap_or(0));
+            unsafe {
+                popup.setTarget(Some(target));
+                popup.setAction(Some(*action));
+            }
+            card.addSubview(&s_lbl);
+            card.addSubview(&popup);
+        }
+
         let d2 = label(
             mtm,
             &format!(
@@ -1326,16 +1431,19 @@ impl SettingsWindow {
             false,
             &NSColor::tertiaryLabelColor(),
         );
-        d2.setFrame(NSRect::new(NSPoint::new(14.0, 72.0), NSSize::new(w - 28.0, 16.0)));
+        d2.setFrame(NSRect::new(NSPoint::new(14.0, 198.0), NSSize::new(w - 28.0, 16.0)));
 
         let test_btn = push_button(mtm, "Send Test Notification", target, sel!(sendTestNotification:));
-        test_btn.setFrame(NSRect::new(NSPoint::new(14.0, 96.0), NSSize::new(172.0, 26.0)));
+        test_btn.setFrame(NSRect::new(NSPoint::new(14.0, 224.0), NSSize::new(172.0, 26.0)));
 
-        for v in [&*t1 as &NSView, &*d1 as &NSView, &*sw as &NSView, &*d2 as &NSView, &*test_btn as &NSView] {
+        let preview_btn = push_button(mtm, "Preview Chime", target, sel!(previewSoundCue:));
+        preview_btn.setFrame(NSRect::new(NSPoint::new(196.0, 224.0), NSSize::new(132.0, 26.0)));
+
+        for v in [&*d2 as &NSView, &*test_btn as &NSView, &*preview_btn as &NSView] {
             card.addSubview(v);
         }
         self.detail.addSubview(&card);
-        *y += 150.0;
+        *y += 280.0;
     }
 
     fn build_workspaces(&self, mtm: MainThreadMarker, pad: f64, w: f64, y: &mut f64) {
