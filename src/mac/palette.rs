@@ -66,6 +66,7 @@ pub enum PaletteAction {
     FollowJob,
     SetupAgentIntegrations,
     RefreshHosts,
+    SaveServerSnapshot,
     LaunchWorkspace(String),
     StopWorkspace(String),
     SaveActiveSessionWorkspace,
@@ -317,6 +318,12 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
             subtitle: "Re-sync sessions across This Mac and remote servers".into(),
             shortcut: "",
             action: PaletteAction::RefreshHosts,
+        },
+        PaletteItem {
+            title: "Server: Save Session Snapshot Now".into(),
+            subtitle: "Flush sessions, splits, directories & active agents to state.json".into(),
+            shortcut: "",
+            action: PaletteAction::SaveServerSnapshot,
         },
         PaletteItem {
             title: "Workspace: Save Active Session".into(),
@@ -930,6 +937,7 @@ fn execute_palette_action(win_id: u64, action: PaletteAction) {
             return;
         }
         PaletteAction::RefreshHosts => super::mux_refresh_all(),
+        PaletteAction::SaveServerSnapshot => super::mux_save_server_snapshot(),
         PaletteAction::LaunchWorkspace(name) => super::mux_workspace_up(win_id, &name),
         PaletteAction::StopWorkspace(name) => super::mux_workspace_down(&name),
         PaletteAction::SaveActiveSessionWorkspace => {

@@ -535,6 +535,26 @@ impl Default for AgentsConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct ServerConfig {
+    /// Atomically persist `tachyon server` sessions, windows, splits and cwds
+    /// to disk so workspaces survive daemon restarts and host reboots.
+    pub persist_sessions: bool,
+    /// Automatically re-launch supported coding agents via curated resume
+    /// commands (`claude --continue`, `codex resume --last`, `agy --continue`)
+    /// when restoring persisted panes.
+    pub auto_resume_agents: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            persist_sessions: true,
+            auto_resume_agents: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct MacConfig {
     pub option_as_meta: OptionAsMeta,
     /// A command that ran at least this long, and finished while you were
@@ -588,6 +608,7 @@ pub struct Config {
     pub contrast: Contrast,
     pub shell: ShellConfig,
     pub agents: AgentsConfig,
+    pub server: ServerConfig,
     pub macos: MacConfig,
     /// Per-host accent/danger colour rules (`host.color.<pattern> = <color>`),
     /// matching Mux remote hosts and plain `ssh <host>` sessions.
@@ -610,6 +631,7 @@ impl Default for Config {
             contrast: Contrast::default(),
             shell: ShellConfig::default(),
             agents: AgentsConfig::default(),
+            server: ServerConfig::default(),
             macos: MacConfig::default(),
             host_colors: Vec::new(),
             scrollback: 10_000,
@@ -875,6 +897,8 @@ impl Config {
             "shell.persist" => self.shell.persist = parse_bool(value)?,
             "shell.suggestions" => self.shell.suggestions = parse_bool(value)?,
             "agents.auto_name_sessions" => self.agents.auto_name_sessions = parse_bool(value)?,
+            "server.persist_sessions" => self.server.persist_sessions = parse_bool(value)?,
+            "server.auto_resume_agents" => self.server.auto_resume_agents = parse_bool(value)?,
             "notify.agent_status" => self.macos.notify_agent_status = parse_bool(value)?,
             "window.hints" => self.window.hints = parse_bool(value)?,
             "window.sidebar" => self.window.sidebar = parse_bool(value)?,
@@ -1341,6 +1365,21 @@ mod contrast_tests {
         assert_eq!(edge.window.pane_style, PaneStyle::Seamless);
 
         let bad = Config::parse("window.pane_style = floating\n");
+        assert_eq!(bad.warnings.len(), 1);
+    }
+
+    #[test]
+    fn server_persistence_keys_parse_and_default_true() {
+        let def = Config::default();
+        assert!(def.server.persist_sessions);
+        assert!(def.server.auto_resume_agents);
+
+        let off = Config::parse("server.persist_sessions = false\nserver.auto_resume_agents = no\n");
+        assert!(off.warnings.is_empty(), "{:?}", off.warnings);
+        assert!(!off.server.persist_sessions);
+        assert!(!off.server.auto_resume_agents);
+
+        let bad = Config::parse("server.persist_sessions = maybe\n");
         assert_eq!(bad.warnings.len(), 1);
     }
 }

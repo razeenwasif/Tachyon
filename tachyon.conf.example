@@ -240,6 +240,13 @@ theme.bold_is_bright = false
 # closing a window or tab ends its shells as usual.
 # shell.persist = true
 
+# Portable Mux v2 server (`tachyon server`): atomically persist sessions,
+# windows, split trees and working directories across restarts & host reboots,
+# and auto-resume supported coding agents (`claude --continue`, `codex resume --last`,
+# `agy --continue`, etc.) when their project directory still exists.
+# server.persist_sessions = true
+# server.auto_resume_agents = true
+
 # macOS: as you type at a prompt, the rest of a command you've run before, in
 # grey; Right arrow or End takes it, Option-Right one word. From your shell's
 # history and every command run in Tachyon (~/Library/Application
