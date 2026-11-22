@@ -7,24 +7,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use parking_lot::{Condvar, Mutex};
 use serde_json::{json, Value};
 
 use crate::mux::model::{
-    generate_session_name, BlockInfo, ClientInfo, HostInfo, LayoutNode, ServerSnapshot, SessionInfo,
-    SplitDir, WindowInfo,
+    generate_session_name, BlockInfo, ClientInfo, CommandReceipt, HostInfo, LayoutNode,
+    ServerSnapshot, SessionInfo, SplitDir, WindowInfo,
 };
 use crate::mux::proto::{Frame, PROTOCOL_VERSION};
 use crate::mux::{local_hostname, unix_now};
-use crate::term::{Processor, ProgramState, ProgramStatus, Term, TermMode};
+use crate::term::{CommandEvent, Processor, ProgramState, ProgramStatus, Term, TermMode};
 
 use super::persist::{
     self, PersistedPane, PersistedSession, PersistedState, PersistedWindow, RestoreReport,
 };
 use super::pty::{default_shell, find_integration_dir, integration, HostPty};
+use super::receipts::ServerSampler;
 
 /// Output the server-side VT parser may fall behind by before reading pauses.
 const MAX_PARSE_QUEUED: usize = 32 << 20;
@@ -38,6 +39,9 @@ const DEFAULT_SCROLLBACK: usize = 10_000;
 
 /// Number of recently exited block exit codes remembered for `block.wait`.
 const RECENT_EXITS_CAP: usize = 256;
+
+/// Number of completed command resource receipts retained per block.
+const BLOCK_RECEIPTS_CAP: usize = 64;
 
 /// Ordered, priority-aware outbound queue for one connected client.
 ///
@@ -180,10 +184,11 @@ struct ParsedBlock {
     inferred_status: Option<crate::term::ProgramStatus>,
     last_agent_eval: Option<std::time::Instant>,
     last_input_seq: u64,
+    pending_cmd_events: Vec<(CommandEvent, Option<String>)>,
 }
 
 impl ParsedBlock {
-    fn feed(&mut self, pty: &HostPty, chunk: &[u8]) -> (Vec<u8>, bool, bool) {
+    fn feed(&mut self, pty: &HostPty, chunk: &[u8]) -> (Vec<u8>, bool, bool, Vec<(CommandEvent, Option<String>)>) {
         let ws = pty.size();
         if ws != self.size {
             self.size = ws;
@@ -196,7 +201,15 @@ impl ParsedBlock {
         if self.rewind.wants_snapshot() && self.processor.is_ground() {
             self.rewind.snapshot(self.term.rewind_snapshot());
         }
-        self.term.take_command_events();
+        let mut cmd_events = Vec::new();
+        for ev in self.term.take_command_events() {
+            let cmdline = match ev {
+                CommandEvent::Started(id) | CommandEvent::Finished(id, _) => {
+                    self.term.command(id).and_then(|c| c.cmdline.clone())
+                }
+            };
+            cmd_events.push((ev, cmdline));
+        }
         self.term.take_dirty();
         let rev = self.term.title_revision;
         let meta_changed = rev != self.last_title_rev;
@@ -204,7 +217,7 @@ impl ParsedBlock {
         let srev = self.term.status_revision;
         let status_changed = srev != self.last_status_rev;
         self.last_status_rev = srev;
-        (self.term.take_replies(), meta_changed, status_changed)
+        (self.term.take_replies(), meta_changed, status_changed, cmd_events)
     }
 
     fn evaluate_agent(&mut self, block: &Block, now: std::time::Instant) -> (bool, Option<Duration>) {
@@ -267,6 +280,10 @@ pub struct Block {
     /// Keep block record around after exit (e.g. for `run` blocks inspected shortly after).
     keep_after_exit: bool,
     handoff: Mutex<Option<HandoffState>>,
+    receipt_sampler: Arc<ServerSampler>,
+    receipts: Mutex<VecDeque<CommandReceipt>>,
+    started_at: Instant,
+    has_pending_cmd: AtomicBool,
 }
 
 /// Wait target for `tachyon wait --until ...` / `block.wait` RPC.
@@ -386,7 +403,22 @@ impl Block {
             created_at: self.created_at,
             status,
             status_inferred,
+            last_receipt: self.receipts.lock().back().cloned(),
         }
+    }
+
+    fn record_receipt(&self, r: CommandReceipt) {
+        let mut q = self.receipts.lock();
+        while q.len() >= BLOCK_RECEIPTS_CAP {
+            q.pop_front();
+        }
+        q.push_back(r);
+    }
+
+    fn receipts_list(&self, limit: usize) -> Vec<CommandReceipt> {
+        let q = self.receipts.lock();
+        let take = limit.min(q.len());
+        q.iter().skip(q.len() - take).cloned().collect()
     }
 
     /// Drain all queued output chunks into `parsed.term` (caller holds `parsed` lock).
@@ -398,7 +430,14 @@ impl Block {
         };
         self.space.notify_all();
         for chunk in pending {
-            parsed.feed(&self.pty, &chunk);
+            let (_, _, _, evs) = parsed.feed(&self.pty, &chunk);
+            if !evs.is_empty() {
+                parsed.pending_cmd_events.extend(evs);
+            }
+        }
+        if !parsed.pending_cmd_events.is_empty() {
+            self.has_pending_cmd.store(true, Ordering::Release);
+            self.work.notify_one();
         }
     }
 
@@ -1127,6 +1166,7 @@ impl ServerState {
             "block.detach" => self.rpc_block_detach(outbox, req),
             "block.send" => self.rpc_block_send(req),
             "block.capture" => self.rpc_block_capture(req),
+            "block.receipts" => self.rpc_block_receipts(req),
             "block.rewind.list" => self.rpc_block_rewind_list(req),
             "block.rewind.frame" => self.rpc_block_rewind_frame(req),
             "block.rewind.provenance" => self.rpc_block_rewind_provenance(req),
@@ -1328,8 +1368,22 @@ impl ServerState {
             label: Mutex::new(label),
             created_at: unix_now(),
             is_login_shell,
-            spawn_cmdline,
+            spawn_cmdline: spawn_cmdline.clone(),
             input_seq: AtomicU64::new(0),
+            receipt_sampler: {
+                let sampler = Arc::new(ServerSampler::new(
+                    pty.pid(),
+                    pty.master_fd(),
+                    !is_login_shell,
+                ));
+                if !is_login_shell {
+                    sampler.start(Some(1), spawn_cmdline.clone());
+                }
+                sampler
+            },
+            receipts: Mutex::new(VecDeque::new()),
+            started_at: Instant::now(),
+            has_pending_cmd: AtomicBool::new(false),
             pty: Arc::new(pty),
             subscribers: Mutex::new(Vec::new()),
             attached_count: AtomicUsize::new(0),
@@ -1351,6 +1405,7 @@ impl ServerState {
                 inferred_status: None,
                 last_agent_eval: None,
                 last_input_seq: 0,
+                pending_cmd_events: Vec::new(),
             }),
             alive: AtomicBool::new(true),
             exit_code: Mutex::new(None),
@@ -2022,6 +2077,33 @@ impl ServerState {
         Ok(json!({ "block_id": bid, "text": text }))
     }
 
+    fn rpc_block_receipts(&self, req: &Value) -> Result<Value, String> {
+        let bid = req.get("block_id").and_then(Value::as_str).ok_or("missing block_id")?;
+        let limit = req
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| (n as usize).clamp(1, BLOCK_RECEIPTS_CAP))
+            .unwrap_or(20);
+        let block = self
+            .inner
+            .lock()
+            .blocks
+            .get(bid)
+            .cloned()
+            .ok_or_else(|| format!("no block `{bid}`"))?;
+        let list: Vec<Value> = block
+            .receipts_list(limit)
+            .into_iter()
+            .map(|r| r.to_json())
+            .collect();
+        let last = block.receipts.lock().back().map(CommandReceipt::to_json);
+        Ok(json!({
+            "block_id": bid,
+            "last_receipt": last,
+            "receipts": list,
+        }))
+    }
+
     fn rpc_block_rewind_list(&self, req: &Value) -> Result<Value, String> {
         let bid = req.get("block_id").and_then(Value::as_str).ok_or("missing block_id")?;
         let block = self
@@ -2376,6 +2458,25 @@ impl ServerState {
     fn record_block_exit(&self, block: &Arc<Block>, code: i32) {
         *block.exit_code.lock() = Some(code);
         block.alive.store(false, Ordering::Release);
+
+        if !block.is_login_shell || block.receipt_sampler.is_active() {
+            let wall = block.started_at.elapsed();
+            if let Some(rcpt) = block.receipt_sampler.finish(
+                None,
+                Some(code),
+                block.spawn_cmdline.clone(),
+                (!block.is_login_shell).then_some(wall),
+            ) {
+                block.record_receipt(rcpt.clone());
+                self.broadcast_event(json!({
+                    "event": "block.receipt",
+                    "block_id": block.id,
+                    "session_id": block.session_id,
+                    "window_id": block.window_id,
+                    "receipt": rcpt.to_json(),
+                }));
+            }
+        }
 
         let info = block.info();
         self.notify_block_waiters(&block.id, &info);
@@ -2817,6 +2918,8 @@ fn read_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
     block.queue.lock().2 = true;
     block.work.notify_one();
 
+    // Sample final CPU / peak RSS before `wait_exit` reaps direct child processes.
+    block.receipt_sampler.sample_now();
     let code = block.pty.wait_exit();
     state.record_block_exit(&block, code);
 }
@@ -2830,10 +2933,14 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
         let timed_out = {
             let mut q = block.queue.lock();
             let mut hit_timeout = false;
-            while q.0.is_empty() && !q.2 {
+            while q.0.is_empty() && !q.2 && !block.has_pending_cmd.load(Ordering::Acquire) {
                 if let Some(dur) = settle_wait {
                     let res = block.work.wait_for(&mut q, dur);
-                    if q.0.is_empty() && !q.2 && res.timed_out() {
+                    if q.0.is_empty()
+                        && !q.2
+                        && !block.has_pending_cmd.load(Ordering::Acquire)
+                        && res.timed_out()
+                    {
                         hit_timeout = true;
                         break;
                     }
@@ -2841,7 +2948,7 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
                     block.work.wait(&mut q);
                 }
             }
-            if q.0.is_empty() && !hit_timeout {
+            if q.0.is_empty() && !hit_timeout && !block.has_pending_cmd.load(Ordering::Acquire) {
                 return;
             }
             hit_timeout
@@ -2871,6 +2978,8 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
         }
 
         let mut parsed = block.parsed.lock();
+        let mut cmd_events = std::mem::take(&mut parsed.pending_cmd_events);
+        block.has_pending_cmd.store(false, Ordering::Release);
         let (chunk, queue_empty) = {
             let mut q = block.queue.lock();
             let c = q.0.pop_front();
@@ -2878,30 +2987,72 @@ fn parse_block_loop(state: Arc<ServerState>, block: Arc<Block>) {
             (c, q.0.is_empty())
         };
         block.space.notify_one();
-        let Some(chunk) = chunk else { continue };
-        let (replies, meta_changed, status_changed) = parsed.feed(&block.pty, &chunk);
 
-        let cur_in = block.input_seq.load(Ordering::Acquire);
-        if cur_in != parsed.last_input_seq {
-            parsed.last_input_seq = cur_in;
-            parsed.agent_tracker.note_input(now);
-        }
-        parsed.agent_tracker.note_output(chunk.len(), now);
+        let (replies, meta_changed, status_changed, inferred_changed, processed_chunk) =
+            if let Some(chunk) = chunk {
+                let (replies, meta_changed, status_changed, evs) = parsed.feed(&block.pty, &chunk);
+                cmd_events.extend(evs);
 
-        let should_eval = meta_changed
-            || status_changed
-            || queue_empty
-            || parsed
-                .last_agent_eval
-                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(250));
-        let inferred_changed = if should_eval {
-            let (chg, next_settle) = parsed.evaluate_agent(&block, now);
-            settle_wait = next_settle;
-            chg
-        } else {
-            false
-        };
+                let cur_in = block.input_seq.load(Ordering::Acquire);
+                if cur_in != parsed.last_input_seq {
+                    parsed.last_input_seq = cur_in;
+                    parsed.agent_tracker.note_input(now);
+                }
+                parsed.agent_tracker.note_output(chunk.len(), now);
+
+                let should_eval = meta_changed
+                    || status_changed
+                    || queue_empty
+                    || parsed
+                        .last_agent_eval
+                        .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(250));
+                let inferred_changed = if should_eval {
+                    let (chg, next_settle) = parsed.evaluate_agent(&block, now);
+                    settle_wait = next_settle;
+                    chg
+                } else {
+                    false
+                };
+                (replies, meta_changed, status_changed, inferred_changed, true)
+            } else {
+                (Vec::new(), false, false, false, false)
+            };
         drop(parsed);
+
+        if block.is_login_shell {
+            for (ev, cmdline) in cmd_events {
+                match ev {
+                    CommandEvent::Started(cmd_id) => {
+                        block.receipt_sampler.start(Some(cmd_id), cmdline);
+                    }
+                    CommandEvent::Finished(cmd_id, exit_opt) => {
+                        if let Some(rcpt) = block.receipt_sampler.finish(
+                            Some(cmd_id),
+                            exit_opt,
+                            cmdline,
+                            None,
+                        ) {
+                            block.parsed.lock().term.set_receipt_with_wall(
+                                cmd_id,
+                                rcpt.to_term_receipt(),
+                                Some(rcpt.wall_duration()),
+                            );
+                            block.record_receipt(rcpt.clone());
+                            state.broadcast_event(json!({
+                                "event": "block.receipt",
+                                "block_id": block.id,
+                                "session_id": block.session_id,
+                                "window_id": block.window_id,
+                                "receipt": rcpt.to_json(),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        if !processed_chunk {
+            continue;
+        }
 
         if !replies.is_empty() && block.attached_count.load(Ordering::Acquire) == 0 {
             let _ = block.pty.write(&replies);
@@ -3004,6 +3155,7 @@ mod tests {
                 label: None,
             }),
             status_inferred: false,
+            last_receipt: None,
         }
     }
 

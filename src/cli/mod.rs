@@ -43,7 +43,7 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
             }
             "server" | "bridge" | "hosts" | "workspace" | "ws" | "worktree" | "wt" | "agents"
             | "agent" | "tui" | "ls" | "new" | "session" | "window" | "split" | "run" | "wait"
-            | "send" | "capture" | "rewind" | "events" | "skill" | "status" | "hook"
+            | "send" | "capture" | "rewind" | "receipts" | "events" | "skill" | "status" | "hook"
             | "help" | "--help" | "-h" => {
                 return true;
             }
@@ -126,6 +126,7 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "send" => cmd_send(&opts, tail),
         "capture" => cmd_capture(&opts, tail),
         "rewind" => cmd_rewind(&opts, tail),
+        "receipts" => cmd_receipts(&opts, tail),
         "events" => cmd_events(&opts, tail),
         "skill" => cmd_skill(&opts, tail),
         "status" => cmd_status(tail),
@@ -1689,6 +1690,103 @@ fn cmd_rewind(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+fn cmd_receipts(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
+    let mut block: Option<String> = None;
+    let mut limit: usize = 20;
+    let mut all = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-b" | "--block" => {
+                block = Some(args.get(i + 1).ok_or("-b/--block requires an id")?.clone());
+                i += 2;
+            }
+            "-n" | "--limit" => {
+                let v = args.get(i + 1).ok_or("-n/--limit requires a count")?;
+                limit = v.parse::<usize>().map_err(|_| format!("invalid --limit `{v}`"))?.max(1);
+                i += 2;
+            }
+            "--all" | "-a" => {
+                all = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown receipts option `{other}`")),
+        }
+    }
+
+    let (target, c) = connect(opts, false)?;
+    if all && block.is_none() {
+        let snap = c.state().map_err(|e| e.to_string())?;
+        let mut entries: Vec<_> = snap
+            .blocks
+            .into_iter()
+            .filter_map(|b| b.last_receipt.clone().map(|r| (b, r)))
+            .collect();
+        entries.sort_by_key(|(_, r)| std::cmp::Reverse(r.finished_at));
+        entries.truncate(limit);
+        if opts.json {
+            let arr: Vec<Value> = entries
+                .iter()
+                .map(|(b, r)| {
+                    json!({
+                        "host": target.display_name(),
+                        "block_id": b.id,
+                        "session_id": b.session_id,
+                        "window_id": b.window_id,
+                        "label": b.display_name(),
+                        "receipt": r.to_json(),
+                    })
+                })
+                .collect();
+            print_json(&json!({ "host": target.display_name(), "receipts": arr }));
+        } else if entries.is_empty() {
+            println!("No captured command receipts on {}.", target.display_name());
+        } else {
+            for (b, r) in &entries {
+                let exit = r
+                    .exit_code
+                    .map(|e| format!("exit {e}"))
+                    .unwrap_or_else(|| "exit ?".into());
+                let cmd = r.cmdline.as_deref().unwrap_or("");
+                if cmd.is_empty() {
+                    println!("{} [{}] {} · {}", b.id, b.display_name(), exit, r.summary());
+                } else {
+                    println!("{} [{}] {} · {} · {}", b.id, b.display_name(), exit, r.summary(), cmd);
+                }
+            }
+        }
+        return Ok(0);
+    }
+
+    let bid = resolve_block_id(block, &c)?;
+    let list = c.block_receipts(&bid, Some(limit)).map_err(|e| e.to_string())?;
+    if opts.json {
+        let arr: Vec<Value> = list.iter().map(|r| r.to_json()).collect();
+        print_json(&json!({
+            "host": target.display_name(),
+            "block_id": bid,
+            "receipts": arr,
+        }));
+    } else if list.is_empty() {
+        println!("No captured command receipts for `{bid}`.");
+    } else {
+        for r in &list {
+            let exit = r
+                .exit_code
+                .map(|e| format!("exit {e}"))
+                .unwrap_or_else(|| "exit ?".into());
+            let cmd = r.cmdline.as_deref().unwrap_or("");
+            if cmd.is_empty() {
+                println!("{bid} {exit} · {}", r.summary());
+            } else {
+                println!("{bid} {exit} · {} · {cmd}", r.summary());
+            }
+        }
+    }
+    Ok(0)
+}
+
 fn cmd_events(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
     let mut session_filter: Option<String> = None;
     let mut i = 0;
@@ -1721,6 +1819,7 @@ fn cmd_events(opts: &GlobalOpts, args: &[String]) -> Result<i32, String> {
             let kind = ev.get("event").and_then(Value::as_str).unwrap_or("event");
             println!("{kind}\t{}", serde_json::to_string(&ev).unwrap_or_default());
         }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     Ok(0)
 }
@@ -2870,6 +2969,8 @@ Sessions, Windows & Automation:
   tachyon send [-b B | --all [-w W]] [--enter] <TEXT | ->
   tachyon capture [-b B] [--lines N] [--ansi]
   tachyon rewind [-b B] [--list | --frame N | --seq S] [--provenance C,R] [--ansi]
+  tachyon receipts [-b B | --all] [-n N] [--json]
+                                            inspect server-side CPU, memory & wall-time receipts
   tachyon events [-s SESSION] [--json]
   tachyon tui [-b B] [--agents-only] [--filter Q] [--readonly] [--once]
                                             narrow-screen-responsive SSH/mobile attach UI

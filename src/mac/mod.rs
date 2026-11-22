@@ -2854,6 +2854,16 @@ impl TermWindow {
         }
         self.request_redraw();
 
+        // Remote Mux panes get their completion notification once `block.receipt`
+        // arrives with full server-side CPU & peak memory telemetry.
+        if self.tabs[i].panes[p]
+            .pty
+            .mux_meta()
+            .is_some_and(|m| m.host != "local")
+        {
+            return;
+        }
+
         // Only when you weren't looking at this window.
         let app = NSApplication::sharedApplication(mtm);
         if app.isActive() && self.window.isKeyWindow() {
@@ -7666,6 +7676,48 @@ fn attached_inferred_map() -> &'static Mutex<FxHashMap<(String, String), Program
     MAP.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
+fn pending_receipts_map(
+) -> &'static Mutex<FxHashMap<(String, String), std::collections::VecDeque<crate::mux::model::CommandReceipt>>> {
+    static MAP: OnceLock<
+        Mutex<FxHashMap<(String, String), std::collections::VecDeque<crate::mux::model::CommandReceipt>>>,
+    > = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn push_pending_remote_receipt(key: (String, String), rcpt: crate::mux::model::CommandReceipt) {
+    let mut map = pending_receipts_map().lock();
+    let q = map.entry(key).or_default();
+    while q.len() >= 8 {
+        q.pop_front();
+    }
+    q.push_back(rcpt);
+}
+
+fn take_pending_remote_receipt(
+    key: &(String, String),
+    cmdline: Option<&str>,
+    exit: Option<i32>,
+) -> Option<crate::mux::model::CommandReceipt> {
+    let mut map = pending_receipts_map().lock();
+    let q = map.get_mut(key)?;
+    let pos = q
+        .iter()
+        .position(|r| {
+            let cmd_ok = match (r.cmdline.as_deref(), cmdline) {
+                (Some(a), Some(b)) => a.trim() == b.trim(),
+                _ => true,
+            };
+            let exit_ok = r.exit_code.is_none() || exit.is_none() || r.exit_code == exit;
+            cmd_ok && exit_ok
+        })
+        .or_else(|| (!q.is_empty()).then_some(0))?;
+    let item = q.remove(pos);
+    if q.is_empty() {
+        map.remove(key);
+    }
+    item
+}
+
 fn set_attached_inferred(key: &(String, String), st: Option<&ProgramStatus>) -> bool {
     let mut map = attached_inferred_map().lock();
     match st {
@@ -8107,22 +8159,41 @@ fn start_session(
                 if !replies.is_empty() {
                     let _ = reader_pty.write(&replies);
                 }
+                let is_remote_mux = mux_key.as_ref().is_some_and(|(h, _)| h != "local");
                 for event in events {
                     match event {
                         CommandEvent::Started(cmd) => {
-                            cpu_at_start.insert(cmd, receipts::children_cpu(shell));
-                            sampler.start(shell, reader_pty.master_fd());
+                            if !is_remote_mux {
+                                cpu_at_start.insert(cmd, receipts::children_cpu(shell));
+                                sampler.start(shell, reader_pty.master_fd());
+                            }
                         }
-                        CommandEvent::Finished(cmd, _) => {
+                        CommandEvent::Finished(cmd, exit_opt) => {
                             if dock_percent.take().is_some() {
                                 DispatchQueue::main().exec_async(move || dock::set_progress(id, None));
                             }
-                            let start = cpu_at_start.remove(&cmd).flatten();
-                            let cpu = start
-                                .zip(receipts::children_cpu(shell))
-                                .map(|(a, b)| b.saturating_sub(a));
-                            let receipt = sampler.finish(cpu);
-                            reader_term.lock().set_receipt(cmd, receipt);
+                            if is_remote_mux {
+                                let cmdline = reader_term
+                                    .lock()
+                                    .command(cmd)
+                                    .and_then(|c| c.cmdline.clone());
+                                if let Some(ref k) = mux_key {
+                                    if let Some(rcpt) = take_pending_remote_receipt(k, cmdline.as_deref(), exit_opt) {
+                                        reader_term.lock().set_receipt_with_wall(
+                                            cmd,
+                                            rcpt.to_term_receipt(),
+                                            Some(rcpt.wall_duration()),
+                                        );
+                                    }
+                                }
+                            } else {
+                                let start = cpu_at_start.remove(&cmd).flatten();
+                                let cpu = start
+                                    .zip(receipts::children_cpu(shell))
+                                    .map(|(a, b)| b.saturating_sub(a));
+                                let receipt = sampler.finish(cpu);
+                                reader_term.lock().set_receipt(cmd, receipt);
+                            }
                             DispatchQueue::main().exec_async(move || with_tab(id, |w, i| w.command_finished(i, id, cmd)));
                         }
                     }
@@ -9790,6 +9861,110 @@ fn mux_kill_window(win_id: u64, host: &str, window_id: &str) {
 ///   directly into the live window layout.
 fn handle_mux_event(host: String, ev: serde_json::Value) {
     let event_name = ev.get("event").and_then(serde_json::Value::as_str).unwrap_or("");
+    if event_name == "block.receipt" {
+        let Some(block_id) = ev.get("block_id").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let window_id = ev.get("window_id").and_then(serde_json::Value::as_str).unwrap_or("");
+        let Some(rcpt) = crate::mux::model::CommandReceipt::from_json(
+            ev.get("receipt").unwrap_or(&serde_json::Value::Null),
+        ) else {
+            return;
+        };
+
+        let mut matched = false;
+        let is_remote = host != "local";
+        let notify_after_secs = with_app(|a| {
+            for w in &mut a.windows {
+                let mut touched_win = false;
+                for t in &w.tabs {
+                    for p in &t.panes {
+                        if p.pty
+                            .mux_meta()
+                            .is_some_and(|m| m.host == host && m.block_id == block_id)
+                        {
+                            let should_apply = is_remote
+                                || p.term
+                                    .lock()
+                                    .last_finished()
+                                    .is_none_or(|c| c.receipt.is_none());
+                            if should_apply {
+                                let ok = p.term.lock().apply_remote_receipt(
+                                    rcpt.cmd_seq,
+                                    rcpt.cmdline.as_deref(),
+                                    rcpt.exit_code,
+                                    rcpt.wall_duration(),
+                                    rcpt.to_term_receipt(),
+                                );
+                                if ok {
+                                    matched = true;
+                                    touched_win = true;
+                                }
+                            } else {
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+                if touched_win {
+                    w.request_redraw();
+                }
+            }
+            a.cfg.macos.notify_after_secs
+        })
+        .unwrap_or(10);
+
+        if is_remote && !matched {
+            push_pending_remote_receipt((host.clone(), block_id.to_string()), rcpt.clone());
+        }
+
+        if is_remote && notify_after_secs > 0 && rcpt.wall_duration() >= Duration::from_secs(notify_after_secs) {
+            let is_front_focused = MainThreadMarker::new().is_some_and(|mtm| {
+                let app_active = NSApplication::sharedApplication(mtm).isActive();
+                app_active
+                    && with_app(|a| {
+                        a.windows.iter().any(|w| {
+                            w.focused
+                                && w.tabs
+                                    .get(w.active)
+                                    .and_then(|t| t.panes.get(t.focus))
+                                    .and_then(|p| p.pty.mux_meta())
+                                    .is_some_and(|m| m.host == host && m.block_id == block_id)
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if !is_front_focused {
+                let title = rcpt
+                    .cmdline
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Command finished");
+                let body = receipts::describe(
+                    rcpt.wall_duration(),
+                    rcpt.exit_code,
+                    false,
+                    Some(&rcpt.to_term_receipt()),
+                )
+                .unwrap_or_else(|| rcpt.summary());
+                NOTIFIER.with(|n| {
+                    if let Some(notifier) = n.borrow().as_ref() {
+                        notifier.post_mux_with_sound(
+                            &host,
+                            window_id,
+                            block_id,
+                            title,
+                            &host,
+                            &body,
+                            true,
+                        );
+                    }
+                });
+            }
+        }
+        return;
+    }
+
     if event_name == "block.status" {
         if let Some(blk) = crate::mux::model::BlockInfo::from_json(ev.get("block").unwrap_or(&serde_json::Value::Null)) {
             if let Some(status) = blk.status.as_ref() {
