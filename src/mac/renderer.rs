@@ -247,18 +247,7 @@ pub fn chrome_tokens(style: ChromeStyle, theme_bg: [u8; 3]) -> ChromeTokens {
             dashed_dividers: false,
             opaque_surface: false,
         },
-        ChromeStyle::Herdr => ChromeTokens {
-            chrome_bg: [0x10, 0x11, 0x14],
-            canvas_bg: [0x13, 0x15, 0x18],
-            pane_bg_override: None,
-            hairline_rgb: [255, 255, 255],
-            hairline_alpha: 0.094,
-            divider_rgb: [255, 255, 255],
-            divider_alpha: 0.094,
-            dashed_dividers: false,
-            opaque_surface: true,
-        },
-        ChromeStyle::Terminals => ChromeTokens {
+        ChromeStyle::Herdr | ChromeStyle::Terminals => ChromeTokens {
             chrome_bg: [0x0C, 0x0D, 0x0F],
             canvas_bg: [0x0C, 0x0D, 0x0F],
             pane_bg_override: Some([0x11, 0x12, 0x14]),
@@ -2075,18 +2064,17 @@ mod tests {
 
         let herdr = chrome_tokens(ChromeStyle::Herdr, [0x17, 0x19, 0x1D]);
         assert!(herdr.opaque_surface);
-        assert_eq!(herdr.chrome_bg, [0x10, 0x11, 0x14]);
-        assert_eq!(herdr.canvas_bg, [0x13, 0x15, 0x18]);
-        assert_eq!(herdr.pane_bg_override, None);
+        assert_eq!(herdr.chrome_bg, [0x0C, 0x0D, 0x0F]);
+        assert_eq!(herdr.canvas_bg, [0x0C, 0x0D, 0x0F]);
+        assert_eq!(herdr.pane_bg_override, Some([0x11, 0x12, 0x14]));
         assert_eq!(herdr.hairline_rgb, [255, 255, 255]);
         assert!((herdr.hairline_alpha - 0.094).abs() < 1e-4);
         assert!(!herdr.dashed_dividers);
 
         let terminals = chrome_tokens(ChromeStyle::Terminals, [0x17, 0x19, 0x1D]);
-        assert!(terminals.opaque_surface);
-        assert_eq!(terminals.chrome_bg, [0x0C, 0x0D, 0x0F]);
-        assert_eq!(terminals.canvas_bg, [0x0C, 0x0D, 0x0F]);
-        assert_eq!(terminals.pane_bg_override, Some([0x11, 0x12, 0x14]));
+        assert_eq!(herdr.chrome_bg, terminals.chrome_bg);
+        assert_eq!(herdr.canvas_bg, terminals.canvas_bg);
+        assert_eq!(herdr.pane_bg_override, terminals.pane_bg_override);
         assert!(!terminals.dashed_dividers);
 
         let core = chrome_tokens(ChromeStyle::Core, [0x17, 0x19, 0x1D]);

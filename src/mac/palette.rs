@@ -234,7 +234,7 @@ pub fn build_items(hosts: &[HostView]) -> Vec<PaletteItem> {
         },
         PaletteItem {
             title: "Appearance: Herdr Dark Minimal".into(),
-            subtitle: "Neutral charcoal #101114 / #17191d, calm ANSI, sidebar & inset cards".into(),
+            subtitle: "Neutral charcoal #0C0D0F / #111214, calm ANSI, sidebar & inset cards".into(),
             shortcut: "",
             action: PaletteAction::SetAppearanceBundle {
                 preset: ThemePreset::Obsidian,

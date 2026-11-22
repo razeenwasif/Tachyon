@@ -28,6 +28,7 @@ use objc2_foundation::{
 };
 
 use super::host_mgr::{HostStatus, HostView};
+use super::renderer::chrome_tokens;
 use super::with_window;
 use crate::config::ChromeStyle;
 use crate::mux::model::{git_branch_for_dir, resolve_host_color, space_monogram, HostColor};
@@ -1010,7 +1011,7 @@ impl WorkspacesCard {
         self.list.setNeedsDisplay(true);
         if let Some(glass) = &self.glass {
             let tint = if style.is_minimal() {
-                srgb_alpha([0x13, 0x15, 0x18], 0.96)
+                srgb_alpha(chrome_tokens(style, [0x11, 0x12, 0x14]).chrome_bg, 0.96)
             } else {
                 NSColor::windowBackgroundColor().colorWithAlphaComponent(0.90)
             };

@@ -132,7 +132,7 @@ pub enum ChromeStyle {
     /// Liquid Glass translucency (default on macOS).
     #[default]
     Glass,
-    /// Herdr-inspired dark clean minimal charcoal (`#101114` chrome, `#17191d` pane, `28pt` bottom status strip).
+    /// Herdr-inspired dark clean minimal charcoal (`#0C0D0F` chrome/canvas, `#111214` pane, `28pt` bottom status strip).
     Herdr,
     /// Minimal dark chrome (`#0C0D0F` top/track, `#111214` pane) with pill tabs and no sidebar clutter.
     Terminals,
