@@ -291,7 +291,73 @@ pub fn resolve_listen_addr(spec: &str) -> io::Result<String> {
     normalize_tcp_addr(trimmed)
 }
 
-/// Detect the local machine's Tailscale IPv4 address (`tailscale ip -4`).
+/// True when `ip` lies in Tailscale's RFC 6598 CGNAT range (`100.64.0.0/10`).
+pub fn is_tailscale_cgnat(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0xC0) == 64
+}
+
+/// Fallback Tailscale IPv4 detection by inspecting active Unix network interfaces
+/// for a non-loopback `100.64.0.0/10` address (preferring `utun*` / `tailscale*`).
+/// Needed in macOS LaunchAgents where `Tailscale.app` CLI refuses to talk to the GUI.
+#[cfg(unix)]
+fn detect_tailscale_ipv4_from_interfaces() -> Option<String> {
+    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    // Safety: `getifaddrs` allocates a linked list freed by `freeifaddrs` below.
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 || addrs.is_null() {
+        return None;
+    }
+
+    let mut preferred: Option<String> = None;
+    let mut fallback: Option<String> = None;
+    let mut cur = addrs;
+    while !cur.is_null() {
+        // Safety: `cur` is a valid non-null node in the list returned by `getifaddrs`.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+
+        let flags = ifa.ifa_flags as libc::c_int;
+        if ifa.ifa_addr.is_null()
+            || (flags & libc::IFF_UP) == 0
+            || (flags & libc::IFF_LOOPBACK) != 0
+        {
+            continue;
+        }
+        // Safety: `ifa_addr` is non-null; `sa_family` is always initialized.
+        if unsafe { (*ifa.ifa_addr).sa_family as libc::c_int } != libc::AF_INET {
+            continue;
+        }
+        // Safety: `sa_family == AF_INET` guarantees `ifa_addr` points to a `sockaddr_in`.
+        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+        let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        if !is_tailscale_cgnat(ip) {
+            continue;
+        }
+        let name = if ifa.ifa_name.is_null() {
+            ""
+        } else {
+            // Safety: `ifa_name` is a NUL-terminated C string when non-null.
+            unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                .to_str()
+                .unwrap_or("")
+        };
+        if name.starts_with("utun") || name.starts_with("tailscale") {
+            preferred = Some(ip.to_string());
+            break;
+        }
+        if fallback.is_none() {
+            fallback = Some(ip.to_string());
+        }
+    }
+
+    // Safety: `addrs` was allocated by `getifaddrs` above.
+    unsafe { libc::freeifaddrs(addrs) };
+    preferred.or(fallback)
+}
+
+/// Detect the local machine's Tailscale IPv4 address (`tailscale ip -4`),
+/// falling back to active Unix network interfaces (`100.64.0.0/10`) when the
+/// GUI CLI helper is unavailable (e.g. inside macOS LaunchAgents).
 pub fn detect_tailscale_ipv4() -> io::Result<String> {
     let candidates: &[&str] = &[
         "tailscale",
@@ -318,6 +384,10 @@ pub fn detect_tailscale_ipv4() -> io::Result<String> {
                 return Ok(ip.to_string());
             }
         }
+    }
+    #[cfg(unix)]
+    if let Some(ip) = detect_tailscale_ipv4_from_interfaces() {
+        return Ok(ip);
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
@@ -677,5 +747,26 @@ mod tests {
         assert!(ct_eq(t1.as_bytes(), t2.as_bytes()));
         assert!(!ct_eq(t1.as_bytes(), b"wrong"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tailscale_cgnat_range_check() {
+        use std::net::Ipv4Addr;
+
+        for good in ["100.64.0.0", "100.64.0.1", "100.123.2.114", "100.127.255.254"] {
+            assert!(is_tailscale_cgnat(good.parse::<Ipv4Addr>().unwrap()), "{good}");
+        }
+        for bad in ["100.63.255.255", "100.128.0.0", "192.168.1.1", "127.0.0.1"] {
+            assert!(!is_tailscale_cgnat(bad.parse::<Ipv4Addr>().unwrap()), "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_tailscale_interface_fallback_returns_valid_cgnat_if_present() {
+        if let Some(ip_str) = detect_tailscale_ipv4_from_interfaces() {
+            let ip: std::net::Ipv4Addr = ip_str.parse().expect("valid IPv4 string");
+            assert!(is_tailscale_cgnat(ip), "expected 100.64.0.0/10, got {ip}");
+        }
     }
 }
