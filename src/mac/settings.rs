@@ -508,7 +508,7 @@ define_class!(
 
         #[unsafe(method(hostReconnect:))]
         fn host_reconnect(&self, sender: Option<&AnyObject>) {
-            if let Some(alias) = tagged_string(sender, &self.ivars().host_aliases.borrow()) {
+            if let Some(alias) = tagged_item(sender, &self.ivars().host_aliases) {
                 super::mux_reconnect_host(&alias);
                 self.set_note(&format!("Reconnecting `{alias}`…"));
                 refresh_if_open();
@@ -522,7 +522,7 @@ define_class!(
 
         #[unsafe(method(hostUpgrade:))]
         fn host_upgrade(&self, sender: Option<&AnyObject>) {
-            if let Some(alias) = tagged_string(sender, &self.ivars().host_aliases.borrow()) {
+            if let Some(alias) = tagged_item(sender, &self.ivars().host_aliases) {
                 self.set_note(&format!("Upgrading `{alias}` (snapshot + deploy + restart)…"));
                 refresh_if_open();
                 std::thread::spawn(move || {
@@ -549,7 +549,7 @@ define_class!(
 
         #[unsafe(method(hostRemove:))]
         fn host_remove(&self, sender: Option<&AnyObject>) {
-            if let Some(alias) = tagged_string(sender, &self.ivars().host_aliases.borrow()) {
+            if let Some(alias) = tagged_item(sender, &self.ivars().host_aliases) {
                 super::mux_remove_host(&alias);
                 self.set_note(&format!("Removed remote host `{alias}`"));
                 refresh_if_open();
@@ -585,7 +585,7 @@ define_class!(
 
         #[unsafe(method(hostAddSsh:))]
         fn host_add_ssh(&self, sender: Option<&AnyObject>) {
-            if let Some(name) = tagged_string(sender, &self.ivars().ssh_candidates.borrow()) {
+            if let Some(name) = tagged_item(sender, &self.ivars().ssh_candidates) {
                 super::mux_add_host(name.clone(), format!("ssh://{name}"));
                 self.set_note(&format!("Added `ssh://{name}` — connecting…"));
                 refresh_if_open();
@@ -859,7 +859,7 @@ define_class!(
 
         #[unsafe(method(wsLaunch:))]
         fn ws_launch(&self, sender: Option<&AnyObject>) {
-            if let Some(name) = tagged_string(sender, &self.ivars().workspace_names.borrow()) {
+            if let Some(name) = tagged_item(sender, &self.ivars().workspace_names) {
                 super::mux_workspace_up(0, &name);
                 self.set_note(&format!("Launching workspace `{name}`…"));
                 refresh_if_open();
@@ -868,7 +868,7 @@ define_class!(
 
         #[unsafe(method(wsStop:))]
         fn ws_stop(&self, sender: Option<&AnyObject>) {
-            if let Some(name) = tagged_string(sender, &self.ivars().workspace_names.borrow()) {
+            if let Some(name) = tagged_item(sender, &self.ivars().workspace_names) {
                 super::mux_workspace_down(&name);
                 self.set_note(&format!("Stopping workspace `{name}`…"));
                 refresh_if_open();
@@ -877,21 +877,16 @@ define_class!(
 
         #[unsafe(method(wsEdit:))]
         fn ws_edit(&self, sender: Option<&AnyObject>) {
-            let idx = sender
-                .and_then(|s| s.downcast_ref::<NSButton>())
-                .map(|b| b.tag());
-            if let Some(i) = idx.filter(|&i| i >= 0) {
-                if let Some(path) = self.ivars().workspace_paths.borrow().get(i as usize).cloned() {
-                    super::open_workspace_file(&path);
-                    self.set_note(&format!("Opened {}", crate::mux::workspace::display_path(&path)));
-                    refresh_if_open();
-                }
+            if let Some(path) = tagged_item(sender, &self.ivars().workspace_paths) {
+                super::open_workspace_file(&path);
+                self.set_note(&format!("Opened {}", crate::mux::workspace::display_path(&path)));
+                refresh_if_open();
             }
         }
 
         #[unsafe(method(wsDelete:))]
         fn ws_delete(&self, sender: Option<&AnyObject>) {
-            if let Some(name) = tagged_string(sender, &self.ivars().workspace_names.borrow()) {
+            if let Some(name) = tagged_item(sender, &self.ivars().workspace_names) {
                 match crate::mux::workspace::remove_workspace(&name) {
                     Ok(_) => self.set_note(&format!("Removed workspace `{name}`.")),
                     Err(e) => self.set_note(&format!("Remove failed: {e}")),
@@ -1202,13 +1197,15 @@ fn selected_sound_name(sender: Option<&AnyObject>) -> Option<String> {
     popup.titleOfSelectedItem().map(|s| s.to_string())
 }
 
-fn tagged_string(sender: Option<&AnyObject>, list: &[String]) -> Option<String> {
+/// Clone the item indexed by `sender`'s `NSButton::tag()`, dropping the
+/// `RefCell` borrow before returning so callers can safely refresh Settings UI.
+fn tagged_item<T: Clone>(sender: Option<&AnyObject>, list: &RefCell<Vec<T>>) -> Option<T> {
     let btn = sender?.downcast_ref::<NSButton>()?;
     let idx = btn.tag();
     if idx < 0 {
         return None;
     }
-    list.get(idx as usize).cloned()
+    list.borrow().get(idx as usize).cloned()
 }
 
 struct SettingsWindow {
